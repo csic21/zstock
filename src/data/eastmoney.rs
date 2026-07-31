@@ -310,6 +310,141 @@ fn urlencoding_minimal(s: &str) -> String {
     out
 }
 
+/// 沪深 A 股榜单行（用于扩大寻宝候选池）。
+#[derive(Debug, Clone)]
+pub struct UniverseRow {
+    pub code: String,
+    pub name: String,
+    /// 总市值（元），接口字段 f20。
+    pub market_cap: f64,
+    /// 成交额（元），接口字段 f6；休市时常为 0。
+    pub amount: f64,
+}
+
+/// 按总市值降序拉取沪深 A 股（含创业板/科创板），过滤 ST / 代码异常。
+///
+/// 使用东财 `clist/get`（与 AKShare 同源公开接口）。`limit` 为过滤后最多返回只数。
+pub fn fetch_liquid_a_shares(limit: usize) -> Result<Vec<UniverseRow>> {
+    let limit = limit.clamp(20, 2000);
+    let page_size = 100usize;
+    let mut out: Vec<UniverseRow> = Vec::with_capacity(limit);
+    let mut page = 1u32;
+    // 深A + 创业板 + 沪A + 科创板
+    let fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23";
+    // 按总市值 f20 排序（休市时成交额 f6 常为空，市值更稳）
+    let fields = "f12,f14,f2,f3,f6,f20,f21";
+
+    while out.len() < limit && page <= 40 {
+        let path = format!(
+            "/api/qt/clist/get?pn={page}&pz={page_size}&po=1&np=1\
+             &ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2\
+             &fid=f20&fs={fs}&fields={fields}"
+        );
+        let mut page_rows: Option<Vec<UniverseRow>> = None;
+        let mut last_err = anyhow!("no host");
+        for host in PUSH2_HOSTS.iter().chain(std::iter::once(&"push2delay.eastmoney.com")) {
+            let url = format!("https://{host}{path}");
+            match get_json(&url) {
+                Ok(v) => {
+                    page_rows = Some(parse_clist_universe(&v)?);
+                    break;
+                }
+                Err(e) => last_err = e,
+            }
+        }
+        let rows = page_rows.ok_or_else(|| anyhow!("A股列表失败: {last_err}"))?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            if !is_scan_eligible(&row.code, &row.name) {
+                continue;
+            }
+            // 过小市值噪音多（默认约 30 亿以上）
+            if row.market_cap > 0.0 && row.market_cap < 3.0e9 {
+                continue;
+            }
+            if out.iter().any(|x| x.code == row.code) {
+                continue;
+            }
+            out.push(row);
+            if out.len() >= limit {
+                break;
+            }
+        }
+        page += 1;
+    }
+
+    if out.is_empty() {
+        return Err(anyhow!("A股列表为空"));
+    }
+    Ok(out)
+}
+
+fn parse_clist_universe(v: &Value) -> Result<Vec<UniverseRow>> {
+    let diff = v
+        .pointer("/data/diff")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| anyhow!("clist 无 diff"))?;
+    let mut out = Vec::with_capacity(diff.len());
+    for item in diff {
+        let code = item
+            .get("f12")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let name = item
+            .get("f14")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        out.push(UniverseRow {
+            code,
+            name,
+            market_cap: num_f64(item.get("f20")),
+            amount: num_f64(item.get("f6")),
+        });
+    }
+    Ok(out)
+}
+
+fn is_scan_eligible(code: &str, name: &str) -> bool {
+    if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let u = name.to_ascii_uppercase();
+    // ST / *ST / SST / 退市整理
+    if u.contains("ST") || name.contains("退") {
+        return false;
+    }
+    // 未开板次新等前缀
+    if name.starts_with('C') || name.starts_with('N') || name.starts_with('c') {
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod universe_list_tests {
+    use super::*;
+
+    #[test]
+    fn liquid_a_shares_smoke() {
+        let rows = fetch_liquid_a_shares(30).expect("clist");
+        assert!(rows.len() >= 10, "n={}", rows.len());
+        assert!(rows.iter().all(|r| r.code.len() == 6));
+        eprintln!(
+            "universe sample: {} {} mv={:.0}",
+            rows[0].code, rows[0].name, rows[0].market_cap
+        );
+    }
+}
+
 /// Build Symbol list from codes using quote API (fills name/last).
 pub fn hydrate_symbols(codes: &[String]) -> Result<Vec<Symbol>> {
     let quotes = fetch_quotes(codes)?;

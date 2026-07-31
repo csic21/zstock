@@ -1,4 +1,4 @@
-//! Local persistence for watchlist and UI preferences.
+//! Local persistence for watchlist, UI preferences, and treasure scan cache.
 
 use std::fs;
 use std::path::PathBuf;
@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::data::treasure::TreasureCache;
 use crate::model::default_watchlist_codes;
 
 /// Candlestick / quote color convention.
@@ -69,17 +70,25 @@ impl Default for AppConfig {
             show_ma10: true,
             show_ma20: true,
             left_width: 280.0,
-            bottom_height: 160.0,
+            bottom_height: 200.0,
             color_scheme: ColorScheme::Cn,
         }
     }
 }
 
-pub fn config_path() -> PathBuf {
+fn app_data_dir() -> PathBuf {
     let base = dirs::data_dir()
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("stock-analysis").join("config.json")
+    base.join("stock-analysis")
+}
+
+pub fn config_path() -> PathBuf {
+    app_data_dir().join("config.json")
+}
+
+pub fn treasure_cache_path() -> PathBuf {
+    app_data_dir().join("treasure_cache.json")
 }
 
 pub fn load_config() -> AppConfig {
@@ -97,6 +106,25 @@ pub fn save_config(cfg: &AppConfig) -> Result<()> {
             .with_context(|| format!("create {}", parent.display()))?;
     }
     let s = serde_json::to_string_pretty(cfg)?;
+    fs::write(&path, s).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+pub fn load_treasure_cache() -> TreasureCache {
+    let path = treasure_cache_path();
+    match fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => TreasureCache::default(),
+    }
+}
+
+pub fn save_treasure_cache(cache: &TreasureCache) -> Result<()> {
+    let path = treasure_cache_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create {}", parent.display()))?;
+    }
+    let s = serde_json::to_string_pretty(cache)?;
     fs::write(&path, s).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }

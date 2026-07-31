@@ -13,22 +13,28 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     resizable::{h_resizable, resizable_panel, v_resizable},
-    v_flex, ActiveTheme, PixelsExt, Root, Sizable, StyledExt, Theme, ThemeMode, TitleBar,
+    v_flex, ActiveTheme, Disableable, PixelsExt, Root, Sizable, StyledExt, Theme, ThemeMode,
+    TitleBar,
 };
 
 use crate::chart::{index_from_x, paint_chart, ChartPaintData};
+use crate::data::treasure::{self, fmt_dd, fmt_pos, TreasureHit, TREASURE_KLINE_LIMIT};
+use crate::data::universe::{self, TREASURE_SCAN_CAP, TREASURE_TOP_N};
 use crate::data::{indicators::MaSeries, market};
 use crate::model::{
     board_for_code, format_pct, format_price, format_volume, shared, Candle, QuoteSnapshot, Symbol,
 };
 use crate::storage::{self, AppConfig, ColorScheme};
 
-actions!(stock, [ToggleCommandPalette, RefreshData, Quit]);
+actions!(stock, [ToggleCommandPalette, RefreshData, ToggleTreasure, Quit]);
 
 const QUOTE_INTERVAL_OK: Duration = Duration::from_secs(8);
 const QUOTE_INTERVAL_ERR_MAX: Duration = Duration::from_secs(45);
 /// Minimum candles visible when zoomed in.
 const CHART_MIN_VISIBLE: usize = 15;
+/// 寻宝扫描相邻请求间隔，降低限流概率。
+/// 扩大扫描时相邻请求间隔（约 400 只 × 150ms ≈ 1 分钟级）。
+const TREASURE_SCAN_GAP: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -37,6 +43,10 @@ enum ChartRange {
     M3 = 1,
     M6 = 2,
     Y1 = 3,
+    /// ~3 年，用于对照多年高低位。
+    Y3 = 4,
+    /// 数据源上限附近（约 4 年）。
+    Max = 5,
 }
 
 impl ChartRange {
@@ -46,6 +56,8 @@ impl ChartRange {
             Self::M3 => "3M",
             Self::M6 => "6M",
             Self::Y1 => "1Y",
+            Self::Y3 => "3Y",
+            Self::Max => "MAX",
         }
     }
 
@@ -55,11 +67,13 @@ impl ChartRange {
             Self::M3 => 66,
             Self::M6 => 130,
             Self::Y1 => 252,
+            Self::Y3 => 750,
+            Self::Max => TREASURE_KLINE_LIMIT,
         }
     }
 
-    fn all() -> [Self; 4] {
-        [Self::M1, Self::M3, Self::M6, Self::Y1]
+    fn all() -> [Self; 6] {
+        [Self::M1, Self::M3, Self::M6, Self::Y1, Self::Y3, Self::Max]
     }
 
     fn from_label(s: &str) -> Self {
@@ -67,9 +81,19 @@ impl ChartRange {
             "1M" => Self::M1,
             "6M" => Self::M6,
             "1Y" => Self::Y1,
+            "3Y" => Self::Y3,
+            "MAX" | "All" | "ALL" => Self::Max,
             _ => Self::M3,
         }
     }
+}
+
+/// 左侧栏：自选 vs 寻宝鼠。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum LeftTab {
+    #[default]
+    Watchlist,
+    Treasure,
 }
 
 pub struct StockApp {
@@ -106,6 +130,16 @@ pub struct StockApp {
     /// 涨跌配色：中国红涨绿跌 / 美国绿涨红跌
     color_scheme: ColorScheme,
     quote_fail_streak: u32,
+    /// 左侧：自选 / 寻宝鼠
+    left_tab: LeftTab,
+    /// 寻宝扫描结果（按 score 降序）。
+    treasure_hits: Vec<TreasureHit>,
+    treasure_scanning: bool,
+    treasure_done: usize,
+    treasure_total: usize,
+    treasure_status: SharedString,
+    /// 取消过期扫描。
+    treasure_gen: u64,
     _subscriptions: Vec<gpui::Subscription>,
 }
 
@@ -152,6 +186,22 @@ impl StockApp {
             }
         })];
 
+        let treasure_cache = storage::load_treasure_cache();
+        let treasure_hits = treasure_cache.hits;
+        let treasure_status = if treasure_hits.is_empty() {
+            shared("点「开始寻宝」扫描自选+扩展池的多年低位")
+        } else {
+            shared(format!(
+                "缓存 {} 只 · {}",
+                treasure_hits.len(),
+                if treasure_cache.updated_at.is_empty() {
+                    "—".into()
+                } else {
+                    treasure_cache.updated_at
+                }
+            ))
+        };
+
         let mut app = Self {
             symbols,
             selected,
@@ -180,6 +230,13 @@ impl StockApp {
             bottom_height: cfg.bottom_height,
             color_scheme: cfg.color_scheme,
             quote_fail_streak: 0,
+            left_tab: LeftTab::Watchlist,
+            treasure_hits,
+            treasure_scanning: false,
+            treasure_done: 0,
+            treasure_total: 0,
+            treasure_status,
+            treasure_gen: 0,
             _subscriptions,
         };
 
@@ -190,6 +247,8 @@ impl StockApp {
     fn bootstrap(&mut self, cx: &mut Context<Self>) {
         // Initial hydrate + klines
         self.refresh_all(cx);
+        // 旧缓存可能只有代码没有中文名
+        self.enrich_treasure_names_if_needed(cx);
 
         // macOS trackpad pinch (NSEvent magnify) — GPUI does not forward this itself
         #[cfg(target_os = "macos")]
@@ -239,13 +298,23 @@ impl StockApp {
                             for t in sourced.data {
                                 if let Some(sym) = app.symbols.iter_mut().find(|s| s.code == t.code)
                                 {
-                                    if !t.name.is_empty() && t.name != "--" {
-                                        sym.name = shared(t.name);
+                                    if is_real_name(&t.name, &t.code) {
+                                        sym.name = shared(t.name.clone());
                                     }
                                     if t.last > 0.0 {
                                         sym.last = t.last;
                                         sym.change_pct = t.change_pct;
                                         sym.volume = t.volume;
+                                    }
+                                }
+                                // 顺带补寻宝列表中文名
+                                if is_real_name(&t.name, &t.code) {
+                                    if let Some(hit) =
+                                        app.treasure_hits.iter_mut().find(|h| h.code == t.code)
+                                    {
+                                        if hit.name != t.name {
+                                            hit.name = t.name.clone();
+                                        }
                                     }
                                 }
                             }
@@ -361,7 +430,8 @@ impl StockApp {
 
     fn apply_klines(&mut self, code: &str, name: String, candles: Vec<Candle>) {
         if let Some(sym) = self.symbols.iter_mut().find(|s| s.code == code) {
-            if !name.is_empty() {
+            // 仅写入真实中文名；空名 / 代码占位不覆盖已有名称
+            if is_real_name(&name, code) {
                 sym.name = shared(name);
             }
             if let Some(last) = candles.last() {
@@ -641,6 +711,311 @@ impl StockApp {
         self.reload_klines(cx);
     }
 
+    /// 从寻宝列表点选：必要时临时加入自选，并切到 3Y 以便对照多年高低。
+    fn select_treasure_hit(&mut self, hit: &TreasureHit, cx: &mut Context<Self>) {
+        let code = hit.code.clone();
+        let display = display_name_str(&hit.name, &code);
+        if !self.symbols.iter().any(|s| s.code == code) {
+            self.symbols.push(Symbol {
+                code: code.clone(),
+                name: shared(display.clone()),
+                last: hit.close,
+                change_pct: 0.0,
+                volume: 0,
+                board: board_for_code(&code),
+            });
+            self.filtered_local = (0..self.symbols.len()).collect();
+        } else if let Some(sym) = self.symbols.iter_mut().find(|s| s.code == code) {
+            // 自选里若还是代码占位，用 hit 里更好的名字
+            if !is_real_name(sym.name.as_ref(), &code) && is_real_name(&hit.name, &code) {
+                sym.name = shared(hit.name.clone());
+            }
+        }
+        // 多年对照：自动用 3Y（若已是 Max 则保留）
+        if !matches!(self.range, ChartRange::Y3 | ChartRange::Max) {
+            self.range = ChartRange::Y3;
+        }
+        self.left_tab = LeftTab::Treasure;
+        self.persist();
+        self.select_symbol(shared(code.clone()), cx);
+
+        // 名称仍是代码时，立刻拉一笔报价补中文名
+        if !is_real_name(&hit.name, &code) {
+            self.fill_names_for_codes(vec![code], cx);
+        }
+    }
+
+    /// 用批量行情补全自选 / 寻宝结果中的中文名称。
+    fn fill_names_for_codes(&mut self, codes: Vec<String>, cx: &mut Context<Self>) {
+        if codes.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let codes2 = codes.clone();
+            let result = smol::unblock(move || market::fetch_quotes(&codes2)).await;
+            let Ok(sourced) = result else {
+                return;
+            };
+            let _ = this.update(cx, |app, cx| {
+                let mut hit_changed = false;
+                for t in &sourced.data {
+                    if !is_real_name(&t.name, &t.code) {
+                        continue;
+                    }
+                    if let Some(sym) = app.symbols.iter_mut().find(|s| s.code == t.code) {
+                        if !is_real_name(sym.name.as_ref(), &t.code) || sym.name.as_ref() != t.name {
+                            sym.name = shared(t.name.clone());
+                        }
+                        if t.last > 0.0 {
+                            sym.last = t.last;
+                            sym.change_pct = t.change_pct;
+                            sym.volume = t.volume;
+                        }
+                    }
+                    if let Some(hit) = app.treasure_hits.iter_mut().find(|h| h.code == t.code) {
+                        if hit.name != t.name {
+                            hit.name = t.name.clone();
+                            hit_changed = true;
+                        }
+                    }
+                }
+                if hit_changed {
+                    let cache = treasure::TreasureCache {
+                        updated_at: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
+                        universe: "watchlist+extended".into(),
+                        hits: app.treasure_hits.clone(),
+                    };
+                    let _ = storage::save_treasure_cache(&cache);
+                }
+                app.persist();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 启动时若缓存名称是代码，后台补一次名称。
+    fn enrich_treasure_names_if_needed(&mut self, cx: &mut Context<Self>) {
+        let need: Vec<String> = self
+            .treasure_hits
+            .iter()
+            .filter(|h| !is_real_name(&h.name, &h.code))
+            .map(|h| h.code.clone())
+            .collect();
+        if !need.is_empty() {
+            self.fill_names_for_codes(need, cx);
+        }
+    }
+
+    fn set_left_tab(&mut self, tab: LeftTab, cx: &mut Context<Self>) {
+        self.left_tab = tab;
+        cx.notify();
+    }
+
+    fn toggle_treasure_tab(&mut self, cx: &mut Context<Self>) {
+        self.left_tab = match self.left_tab {
+            LeftTab::Watchlist => LeftTab::Treasure,
+            LeftTab::Treasure => LeftTab::Watchlist,
+        };
+        cx.notify();
+    }
+
+    /// 后台扫描：自选 ∪ 东财扩大池（市值前列）→ 深评 → Top100。
+    fn start_treasure_scan(&mut self, cx: &mut Context<Self>) {
+        if self.treasure_scanning {
+            self.status = shared("寻宝扫描进行中…");
+            cx.notify();
+            return;
+        }
+        let watchlist: Vec<String> = self.symbols.iter().map(|s| s.code.clone()).collect();
+
+        self.treasure_gen = self.treasure_gen.wrapping_add(1);
+        let scan_id = self.treasure_gen;
+        self.treasure_scanning = true;
+        self.treasure_done = 0;
+        self.treasure_total = 0;
+        self.treasure_hits.clear();
+        self.treasure_status = shared(format!(
+            "拉取扩大池（最多 {TREASURE_SCAN_CAP}）· 将取 Top {TREASURE_TOP_N}…"
+        ));
+        self.status = shared(format!(
+            "🐭 扩大搜索 · 市值池≤{TREASURE_SCAN_CAP} · 入榜{TREASURE_TOP_N}"
+        ));
+        self.left_tab = LeftTab::Treasure;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            // 网络拉扩大候选（失败则内置表）
+            let (codes, pool_src) = smol::unblock(move || {
+                universe::build_scan_universe_expanded(&watchlist)
+            })
+            .await;
+
+            if codes.is_empty() {
+                let _ = this.update(cx, |app, cx| {
+                    if app.treasure_gen != scan_id {
+                        return;
+                    }
+                    app.treasure_scanning = false;
+                    app.treasure_status = shared("没有可扫描代码");
+                    app.status = shared("寻宝失败：候选池为空");
+                    cx.notify();
+                });
+                return;
+            }
+
+            let total = codes.len();
+            let _ = this.update(cx, |app, cx| {
+                if app.treasure_gen != scan_id {
+                    return;
+                }
+                app.treasure_total = total;
+                app.treasure_status = shared(format!(
+                    "池 {total} 只（{pool_src}）· 深评中 0/{total} · 将取 Top {TREASURE_TOP_N}"
+                ));
+                app.status = shared(format!("🐭 深评 {total} 只 · 源 {pool_src}"));
+                cx.notify();
+            });
+
+            let mut hits: Vec<TreasureHit> = Vec::new();
+            for (i, code) in codes.into_iter().enumerate() {
+                // 协作式取消
+                let cancelled = this
+                    .read_with(cx, |app, _| app.treasure_gen != scan_id)
+                    .unwrap_or(true);
+                if cancelled {
+                    return;
+                }
+
+                let code_fetch = code.clone();
+                let result = smol::unblock(move || {
+                    market::fetch_klines_adjusted(&code_fetch, TREASURE_KLINE_LIMIT)
+                })
+                .await;
+
+                if let Ok(sourced) = result {
+                    let (_c, name, candles) = sourced.data;
+                    // 空名保持空串，结束后用行情批量补中文名（勿用 code 冒充）
+                    if let Some(hit) = treasure::analyze(&code, &name, &candles, sourced.source) {
+                        hits.push(hit);
+                    }
+                }
+
+                let done = i + 1;
+                let _ = this.update(cx, |app, cx| {
+                    if app.treasure_gen != scan_id {
+                        return;
+                    }
+                    app.treasure_done = done;
+                    app.treasure_total = total;
+                    // 边扫边排，便于观察
+                    let mut partial = hits.clone();
+                    partial.sort_by(|a, b| {
+                        b.score
+                            .partial_cmp(&a.score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    // 扫描中只展示暂定 Top N，避免列表过长卡顿
+                    if partial.len() > TREASURE_TOP_N {
+                        partial.truncate(TREASURE_TOP_N);
+                    }
+                    app.treasure_hits = partial;
+                    app.treasure_status = shared(format!(
+                        "深评 {done}/{total} · 暂定 Top {} · {pool_src}",
+                        app.treasure_hits.len()
+                    ));
+                    if done == total || done % 10 == 0 {
+                        app.status = shared(format!("🐭 深评 {done}/{total}"));
+                    }
+                    cx.notify();
+                });
+
+                if done < total {
+                    Timer::after(TREASURE_SCAN_GAP).await;
+                }
+            }
+
+            hits.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            // 最终只保留 Top N
+            if hits.len() > TREASURE_TOP_N {
+                hits.truncate(TREASURE_TOP_N);
+            }
+
+            // 批量行情补全名称（K 线源常无中文名；分批避免单次过长）
+            let name_codes: Vec<String> = hits.iter().map(|h| h.code.clone()).collect();
+            for chunk in name_codes.chunks(40) {
+                let chunk = chunk.to_vec();
+                if let Ok(sourced) = smol::unblock(move || market::fetch_quotes(&chunk)).await {
+                    for t in sourced.data {
+                        if !is_real_name(&t.name, &t.code) {
+                            continue;
+                        }
+                        if let Some(hit) = hits.iter_mut().find(|h| h.code == t.code) {
+                            hit.name = t.name;
+                        }
+                    }
+                }
+            }
+
+            let updated_at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+            let cache = treasure::TreasureCache {
+                updated_at: updated_at.clone(),
+                universe: format!("{pool_src}/scan{total}/top{TREASURE_TOP_N}"),
+                hits: hits.clone(),
+            };
+            let _ = storage::save_treasure_cache(&cache);
+
+            let _ = this.update(cx, |app, cx| {
+                if app.treasure_gen != scan_id {
+                    return;
+                }
+                app.treasure_scanning = false;
+                app.treasure_hits = hits;
+                app.treasure_done = total;
+                // 同步名称到已在自选里的同代码
+                for hit in &app.treasure_hits {
+                    if !is_real_name(&hit.name, &hit.code) {
+                        continue;
+                    }
+                    if let Some(sym) = app.symbols.iter_mut().find(|s| s.code == hit.code) {
+                        if !is_real_name(sym.name.as_ref(), &hit.code) {
+                            sym.name = shared(hit.name.clone());
+                        }
+                    }
+                }
+                app.treasure_status = shared(format!(
+                    "完成 · 深评 {total} · 入榜 {} · {pool_src} · {updated_at}",
+                    app.treasure_hits.len(),
+                ));
+                app.status = shared(format!(
+                    "🐭 寻宝完成 · Top {} / 扫描 {total}（多窗口·上行中继降权）",
+                    app.treasure_hits.len(),
+                ));
+                app.persist();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn cancel_treasure_scan(&mut self, cx: &mut Context<Self>) {
+        if !self.treasure_scanning {
+            return;
+        }
+        self.treasure_gen = self.treasure_gen.wrapping_add(1);
+        self.treasure_scanning = false;
+        self.treasure_status = shared(format!(
+            "已取消 · 保留 {} 条中间结果",
+            self.treasure_hits.len()
+        ));
+        self.status = shared("寻宝扫描已取消");
+        cx.notify();
+    }
+
     fn add_symbol(&mut self, code: String, name: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.symbols.iter().any(|s| s.code == code) {
             self.select_symbol(shared(code), cx);
@@ -872,6 +1247,16 @@ impl StockApp {
                                 })),
                         )
                         .child(
+                            Button::new("treasure-btn")
+                                .ghost()
+                                .xsmall()
+                                .label("🐭 寻宝")
+                                .tooltip("多窗口历史低位 · ⌘T")
+                                .on_click(cx.listener(|this, _, _w, cx| {
+                                    this.set_left_tab(LeftTab::Treasure, cx);
+                                })),
+                        )
+                        .child(
                             Button::new("cmd-palette-btn")
                                 .ghost()
                                 .xsmall()
@@ -884,33 +1269,66 @@ impl StockApp {
         )
     }
 
-    fn render_watchlist(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected = self.selected.clone();
+    fn render_left_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .size_full()
             .bg(cx.theme().sidebar)
             .child(
                 h_flex()
                     .h(px(36.))
-                    .px_3()
+                    .px_2()
                     .items_center()
-                    .justify_between()
+                    .gap_1()
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(
-                        div()
-                            .text_xs()
-                            .font_semibold()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("自选股"),
+                        Button::new("tab-watch")
+                            .xsmall()
+                            .when(self.left_tab == LeftTab::Watchlist, |b| b.primary())
+                            .when(self.left_tab != LeftTab::Watchlist, |b| b.ghost())
+                            .label("自选")
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.set_left_tab(LeftTab::Watchlist, cx);
+                            })),
                     )
+                    .child(
+                        Button::new("tab-treasure")
+                            .xsmall()
+                            .when(self.left_tab == LeftTab::Treasure, |b| b.primary())
+                            .when(self.left_tab != LeftTab::Treasure, |b| b.ghost())
+                            .label("🐭 寻宝")
+                            .tooltip("多窗口历史低位扫描（1Y/3Y/全样本）")
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.set_left_tab(LeftTab::Treasure, cx);
+                            })),
+                    )
+                    .child(div().flex_1())
                     .child(
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(format!("{} 只", self.symbols.len())),
+                            .child(match self.left_tab {
+                                LeftTab::Watchlist => format!("{} 只", self.symbols.len()),
+                                LeftTab::Treasure => {
+                                    if self.treasure_scanning {
+                                        format!("{}/{}", self.treasure_done, self.treasure_total)
+                                    } else {
+                                        format!("{} 只", self.treasure_hits.len())
+                                    }
+                                }
+                            }),
                     ),
             )
+            .child(match self.left_tab {
+                LeftTab::Watchlist => self.render_watchlist_body(cx).into_any_element(),
+                LeftTab::Treasure => self.render_treasure_body(cx).into_any_element(),
+            })
+    }
+
+    fn render_watchlist_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.selected.clone();
+        v_flex()
+            .size_full()
             .child(
                 h_flex()
                     .h(px(28.))
@@ -1038,6 +1456,214 @@ impl StockApp {
             )
     }
 
+    fn render_treasure_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.selected.clone();
+        v_flex()
+            .size_full()
+            .child(
+                v_flex()
+                    .px_2()
+                    .py_2()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                Button::new("treasure-scan")
+                                    .xsmall()
+                                    .primary()
+                                    .label(if self.treasure_scanning {
+                                        "扫描中…"
+                                    } else {
+                                        "开始寻宝"
+                                    })
+                                    .disabled(self.treasure_scanning)
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.start_treasure_scan(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("treasure-cancel")
+                                    .xsmall()
+                                    .ghost()
+                                    .label("取消")
+                                    .disabled(!self.treasure_scanning)
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.cancel_treasure_scan(cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(self.treasure_status.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground.opacity(0.85))
+                            .child(format!(
+                                "市值池≤{TREASURE_SCAN_CAP} · Top{TREASURE_TOP_N} · 1Y/3Y/全 · 前复权"
+                            )),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .h(px(26.))
+                    .px_3()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("标的 / 位置"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("分"),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .id("treasure-scroll")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .when(self.treasure_hits.is_empty() && !self.treasure_scanning, |el| {
+                        el.child(
+                            div()
+                                .p_4()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!(
+                                    "尚无结果。将从东财按市值扩大候选（最多 {TREASURE_SCAN_CAP} 只，含自选），\
+                                     多窗口评分后取 Top {TREASURE_TOP_N}。\
+                                     「上行中继回撤」表示一年低但多年仍高。"
+                                )),
+                        )
+                    })
+                    .children(self.treasure_hits.iter().enumerate().map(|(ix, hit)| {
+                        let is_selected = hit.code == selected.as_ref();
+                        let hit_owned = hit.clone();
+                        let code_label = hit.code.clone();
+                        let name = display_name_str(&hit.name, &hit.code);
+                        let show_name = is_real_name(&name, &hit.code);
+                        let score = format!("{:.0}", hit.score);
+                        let pos_line = format!(
+                            "1Y {} · 3Y {} · 全 {}",
+                            fmt_pos(hit.pos_1y),
+                            fmt_pos(hit.pos_3y),
+                            fmt_pos(hit.pos_all)
+                        );
+                        let dd_line = format!("回撤全 {}", fmt_dd(hit.dd_all));
+                        let tags: String = hit
+                            .tags
+                            .iter()
+                            .take(3)
+                            .map(|t| t.label())
+                            .collect::<Vec<_>>()
+                            .join(" · ");
+                        let is_pullback = hit
+                            .tags
+                            .iter()
+                            .any(|t| matches!(t, treasure::TreasureTag::UptrendPullback));
+
+                        div()
+                            .id(("treasure-row", ix as u64))
+                            .px_3()
+                            .py_2()
+                            .flex()
+                            .items_start()
+                            .gap_2()
+                            .cursor_pointer()
+                            .border_b_1()
+                            .border_color(cx.theme().border.opacity(0.35))
+                            .when(is_selected, |this| {
+                                this.bg(cx.theme().accent.opacity(0.18))
+                            })
+                            .hover(|this| this.bg(cx.theme().accent.opacity(0.10)))
+                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                this.select_treasure_hit(&hit_owned, cx);
+                            }))
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_1()
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_semibold()
+                                                    .text_color(cx.theme().foreground)
+                                                    .child(code_label),
+                                            )
+                                            .when(show_name, |row| {
+                                                row.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .truncate()
+                                                        .child(name),
+                                                )
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(pos_line),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(dd_line),
+                                            )
+                                            .when(!tags.is_empty(), |row| {
+                                                row.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(if is_pullback {
+                                                            cx.theme().yellow
+                                                        } else {
+                                                            cx.theme().blue
+                                                        })
+                                                        .truncate()
+                                                        .child(tags),
+                                                )
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .text_color(if is_pullback {
+                                        cx.theme().muted_foreground
+                                    } else {
+                                        cx.theme().yellow
+                                    })
+                                    .child(score),
+                            )
+                    })),
+            )
+    }
+
     fn render_chart_area(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let sym = self.current_symbol();
         // Only use candle snapshot when it belongs to the selected symbol
@@ -1058,10 +1684,13 @@ impl StockApp {
         let chg_color = self.chg_color(up, cx);
         let paint = self.chart_paint_data(cx);
 
-        let name = sym
-            .map(|s| s.name.clone())
-            .unwrap_or_else(|| shared("--"));
         let code = self.selected.clone();
+        let name_raw = sym.map(|s| s.name.as_ref().to_string()).unwrap_or_default();
+        let name_show = if is_real_name(&name_raw, code.as_ref()) {
+            Some(shared(name_raw))
+        } else {
+            None
+        };
         let board = sym
             .map(|s| s.board.clone())
             .unwrap_or_else(|| shared(""));
@@ -1099,12 +1728,14 @@ impl StockApp {
                                     .text_color(cx.theme().foreground)
                                     .child(code),
                             )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(name),
-                            )
+                            .when_some(name_show, |row, n| {
+                                row.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(n),
+                                )
+                            })
                             .child(
                                 div()
                                     .text_xs()
@@ -1365,7 +1996,13 @@ impl StockApp {
         } else {
             None
         };
-        let path = storage::config_path();
+        let code = self.selected.as_ref();
+        let name_raw = sym.map(|s| s.name.as_ref()).unwrap_or("");
+        let title = if is_real_name(name_raw, code) {
+            format!("{code} {name_raw}")
+        } else {
+            code.to_string()
+        };
 
         v_flex()
             .size_full()
@@ -1387,22 +2024,19 @@ impl StockApp {
             )
             .child(
                 h_flex()
+                    .id("detail-scroll")
                     .flex_1()
+                    .min_h_0()
+                    .overflow_x_scroll()
+                    .overflow_y_scroll()
                     .p_3()
-                    .gap_6()
+                    .gap_5()
+                    .items_start()
                     .child(
                         v_flex()
                             .gap_1()
-                            .min_w(px(200.))
-                            .child(detail_row(
-                                "标的",
-                                &format!(
-                                    "{} {}",
-                                    self.selected,
-                                    sym.map(|s| s.name.as_ref()).unwrap_or("")
-                                ),
-                                cx,
-                            ))
+                            .min_w(px(180.))
+                            .child(detail_row("标的", &title, cx))
                             .child(detail_row(
                                 "板块",
                                 sym.map(|s| s.board.as_ref()).unwrap_or("--"),
@@ -1410,19 +2044,20 @@ impl StockApp {
                             ))
                             .child(detail_row(
                                 "周期",
-                                &format!("{} ({} bars)", self.range.label(), self.candles.len()),
+                                &format!("{} · {} 根", self.range.label(), self.candles.len()),
                                 cx,
                             ))
                             .child(detail_row(
                                 "昨收",
                                 &format_price(snap.as_ref().map(|s| s.prev_close).unwrap_or(0.0)),
                                 cx,
-                            )),
+                            ))
+                            .child(detail_row("配色", self.color_scheme.label(), cx)),
                     )
                     .child(
                         v_flex()
                             .gap_1()
-                            .min_w(px(220.))
+                            .min_w(px(120.))
                             .child(detail_row(
                                 "MA5",
                                 &if candles_match {
@@ -1464,17 +2099,13 @@ impl StockApp {
                                     "--".into()
                                 },
                                 cx,
-                            ))
-                            .child(detail_row("配置", &path.display().to_string(), cx))
-                            .child(detail_row(
-                                "涨跌色",
-                                self.color_scheme.label(),
-                                cx,
                             )),
                     )
+                    .child(self.render_treasure_detail_col(cx))
                     .child(
                         v_flex()
                             .flex_1()
+                            .min_w(px(160.))
                             .gap_1()
                             .child(
                                 div()
@@ -1490,17 +2121,86 @@ impl StockApp {
                             )
                             .child(
                                 div()
-                                    .mt_2()
+                                    .mt_1()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(
-                                        "数据源说明：东方财富公开 HTTP（无 Key）。\
-                                         免费、适合个人研究；无官方 SLA，请控制频率。\
-                                         仅供学习，不构成投资建议。",
+                                        "1Y/3Y/全样本评分；「上行中继回撤」= 一年低但多年仍高。仅供学习，非投资建议。",
                                     ),
                             ),
                     ),
             )
+    }
+
+    fn render_treasure_detail_col(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let hit = self
+            .treasure_hits
+            .iter()
+            .find(|h| h.code == self.selected.as_ref())
+            .cloned();
+
+        let mut col = v_flex().gap_1().min_w(px(220.)).child(
+            div()
+                .text_xs()
+                .font_semibold()
+                .text_color(cx.theme().muted_foreground)
+                .child("寻宝鼠 · 多窗口"),
+        );
+
+        if let Some(h) = hit {
+            let tags = h
+                .tags
+                .iter()
+                .map(|t| t.label())
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let tags_disp = if tags.is_empty() {
+                "—".to_string()
+            } else {
+                tags
+            };
+            col = col
+                .child(detail_row("分数", &format!("{:.1}", h.score), cx))
+                .child(detail_row(
+                    "位置",
+                    &format!(
+                        "1Y {} · 3Y {} · 全 {}",
+                        fmt_pos(h.pos_1y),
+                        fmt_pos(h.pos_3y),
+                        fmt_pos(h.pos_all)
+                    ),
+                    cx,
+                ))
+                .child(detail_row(
+                    "分位",
+                    &format!(
+                        "1Y {} · 3Y {} · 全 {}",
+                        fmt_pos(h.pctile_1y),
+                        fmt_pos(h.pctile_3y),
+                        fmt_pos(h.pctile_all)
+                    ),
+                    cx,
+                ))
+                .child(detail_row(
+                    "回撤",
+                    &format!("1Y {} · 全 {}", fmt_dd(h.dd_1y), fmt_dd(h.dd_all)),
+                    cx,
+                ))
+                .child(detail_row("标签", &tags_disp, cx))
+                .child(detail_row(
+                    "样本",
+                    &format!("{} 根 · {}", h.bars, h.source),
+                    cx,
+                ));
+        } else {
+            col = col.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("当前标的不在最近寻宝结果中。可打开左侧「寻宝」扫描。"),
+            );
+        }
+        col
     }
 
     fn render_palette(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1729,21 +2429,37 @@ fn palette_row(
 fn detail_row(label: &str, value: &str, cx: &App) -> impl IntoElement {
     h_flex()
         .gap_2()
-        .items_center()
+        .items_start()
         .child(
             div()
-                .w(px(48.))
+                .w(px(36.))
+                .flex_shrink_0()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
                 .child(label.to_string()),
         )
         .child(
             div()
+                .flex_1()
+                .min_w_0()
                 .text_xs()
                 .text_color(cx.theme().foreground)
-                .truncate()
                 .child(value.to_string()),
         )
+}
+
+/// 是否为可用的中文/展示名称（排除空、占位、与代码相同）。
+fn is_real_name(name: &str, code: &str) -> bool {
+    let n = name.trim();
+    !n.is_empty() && n != "--" && n != code && n != code.trim_start_matches('0')
+}
+
+fn display_name_str(name: &str, code: &str) -> String {
+    if is_real_name(name, code) {
+        name.trim().to_string()
+    } else {
+        String::new()
+    }
 }
 
 impl Render for StockApp {
@@ -1764,6 +2480,9 @@ impl Render for StockApp {
             .on_action(cx.listener(|this, _: &RefreshData, _w, cx| {
                 this.refresh_all(cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleTreasure, _w, cx| {
+                this.toggle_treasure_tab(cx);
+            }))
             .child(self.render_title_bar(cx))
             .child(
                 div().flex_1().min_h_0().w_full().child(
@@ -1771,8 +2490,8 @@ impl Render for StockApp {
                         .child(
                             resizable_panel()
                                 .size(px(left_w))
-                                .size_range(px(200.)..px(420.))
-                                .child(self.render_watchlist(cx)),
+                                .size_range(px(200.)..px(440.))
+                                .child(self.render_left_panel(cx)),
                         )
                         .child(
                             resizable_panel().child(
@@ -1780,8 +2499,8 @@ impl Render for StockApp {
                                     .child(resizable_panel().child(self.render_chart_area(cx)))
                                     .child(
                                         resizable_panel()
-                                            .size(px(bottom_h))
-                                            .size_range(px(100.)..px(320.))
+                                            .size(px(bottom_h.max(160.0)))
+                                            .size_range(px(140.)..px(420.))
                                             .child(self.render_detail_panel(cx)),
                                     ),
                             ),
@@ -1812,6 +2531,10 @@ pub fn run() {
             KeyBinding::new("cmd-r", RefreshData, None),
             #[cfg(not(target_os = "macos"))]
             KeyBinding::new("ctrl-r", RefreshData, None),
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-t", ToggleTreasure, None),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-t", ToggleTreasure, None),
             #[cfg(target_os = "macos")]
             KeyBinding::new("cmd-q", Quit, None),
             #[cfg(not(target_os = "macos"))]

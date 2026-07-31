@@ -1,29 +1,27 @@
 //! Multi-source market data with automatic failover.
 //!
-//! Quotes: Eastmoney → Sina  
-//! Daily K: Eastmoney (前复权) → Sina → BaoStock (前复权)  
-//! Search: Eastmoney (6-digit Sina fallback)
+//! Quotes: Eastmoney → Tencent  
+//! Daily K: Eastmoney (前复权) → Tencent (前复权, ≤~640)  
+//! Search: Eastmoney → Tencent SmartBox
 
 use anyhow::{anyhow, Result};
 
 use crate::model::{board_for_code, shared, Candle, Symbol};
 
-use super::baostock;
 use super::eastmoney::{self, QuoteTick};
-use super::sina;
+use super::tencent;
 
 /// Successful fetch tagged with which backend served it.
 #[derive(Debug, Clone)]
 pub struct Sourced<T> {
     pub data: T,
-    /// Short label for UI, e.g. `东方财富` / `新浪财经` / `BaoStock`.
+    /// Short label for UI, e.g. `东方财富` / `腾讯财经`.
     pub source: &'static str,
 }
 
 pub const SRC_EASTMONEY: &str = "东方财富";
-pub const SRC_SINA: &str = "新浪财经";
-pub const SRC_BAOSTOCK: &str = "BaoStock";
-pub const SRC_LABEL: &str = "东财 / 新浪 / BaoStock · 自动切换";
+pub const SRC_TENCENT: &str = "腾讯财经";
+pub const SRC_LABEL: &str = "东财 / 腾讯 · 自动切换";
 
 fn quotes_usable(ticks: &[QuoteTick], requested: usize) -> bool {
     if requested == 0 {
@@ -32,7 +30,7 @@ fn quotes_usable(ticks: &[QuoteTick], requested: usize) -> bool {
     ticks.iter().any(|t| t.last > 0.0 || !t.name.is_empty())
 }
 
-/// Batch quotes: Eastmoney → Sina.
+/// Batch quotes: Eastmoney → Tencent.
 pub fn fetch_quotes(codes: &[String]) -> Result<Sourced<Vec<QuoteTick>>> {
     let n = codes.len();
     match eastmoney::fetch_quotes(codes) {
@@ -40,16 +38,16 @@ pub fn fetch_quotes(codes: &[String]) -> Result<Sourced<Vec<QuoteTick>>> {
             data,
             source: SRC_EASTMONEY,
         }),
-        Ok(empty) => match sina::fetch_quotes(codes) {
+        Ok(empty) => match tencent::fetch_quotes(codes) {
             Ok(data) if quotes_usable(&data, n) => Ok(Sourced {
                 data,
-                source: SRC_SINA,
+                source: SRC_TENCENT,
             }),
             Ok(_) if !empty.is_empty() => Ok(Sourced {
                 data: empty,
                 source: SRC_EASTMONEY,
             }),
-            Ok(_) => Err(anyhow!("行情为空（东财与新浪均无有效数据）")),
+            Ok(_) => Err(anyhow!("行情为空（东财与腾讯均无有效数据）")),
             Err(e2) => {
                 if !empty.is_empty() {
                     Ok(Sourced {
@@ -57,17 +55,17 @@ pub fn fetch_quotes(codes: &[String]) -> Result<Sourced<Vec<QuoteTick>>> {
                         source: SRC_EASTMONEY,
                     })
                 } else {
-                    Err(anyhow!("行情失败: 东财无数据; 新浪: {e2}"))
+                    Err(anyhow!("行情失败: 东财无数据; 腾讯: {e2}"))
                 }
             }
         },
-        Err(e1) => match sina::fetch_quotes(codes) {
+        Err(e1) => match tencent::fetch_quotes(codes) {
             Ok(data) if quotes_usable(&data, n) => Ok(Sourced {
                 data,
-                source: SRC_SINA,
+                source: SRC_TENCENT,
             }),
-            Ok(_) => Err(anyhow!("行情失败: 东财: {e1}; 新浪无有效数据")),
-            Err(e2) => Err(anyhow!("行情失败: 东财: {e1}; 新浪: {e2}")),
+            Ok(_) => Err(anyhow!("行情失败: 东财: {e1}; 腾讯无有效数据")),
+            Err(e2) => Err(anyhow!("行情失败: 东财: {e1}; 腾讯: {e2}")),
         },
     }
 }
@@ -88,40 +86,40 @@ fn try_klines_chain(
         Err(e) => errors.push(format!("东财: {e}")),
     }
 
-    match sina::fetch_klines(code, limit) {
-        Ok(data) if !data.2.is_empty() => {
-            return Ok(Sourced {
-                data,
-                source: SRC_SINA,
-            });
-        }
-        Ok(_) => errors.push("新浪无数据".into()),
-        Err(e) => errors.push(format!("新浪: {e}")),
-    }
-
-    match baostock::fetch_klines(code, limit) {
+    match tencent::fetch_klines(code, limit) {
         Ok(data) if !data.2.is_empty() => Ok(Sourced {
             data,
-            source: SRC_BAOSTOCK,
+            source: SRC_TENCENT,
         }),
         Ok(_) => {
-            errors.push("BaoStock无数据".into());
+            errors.push("腾讯无数据".into());
             Err(anyhow!("K线失败: {}", errors.join("; ")))
         }
         Err(e) => {
-            errors.push(format!("BaoStock: {e}"));
+            errors.push(format!("腾讯: {e}"));
             Err(anyhow!("K线失败: {}", errors.join("; ")))
         }
     }
 }
 
-/// Daily K: Eastmoney (前复权) → Sina → BaoStock (前复权).
+/// Daily K: Eastmoney (前复权) → Tencent (前复权).
 pub fn fetch_klines(code: &str, limit: usize) -> Result<Sourced<(String, String, Vec<Candle>)>> {
     let mut errors = Vec::new();
     try_klines_chain(code, limit, &mut errors)
 }
 
-/// Symbol search: Eastmoney first; 6-digit fallback via Sina helper.
+/// 历史低位比较专用：只走**前复权**源（东财 → 腾讯）。
+///
+/// 腾讯日 K 上限约 640 根；东财可到约 1000。寻宝鼠优先东财长窗。
+pub fn fetch_klines_adjusted(
+    code: &str,
+    limit: usize,
+) -> Result<Sourced<(String, String, Vec<Candle>)>> {
+    // Both providers return 前复权; reuse the same chain.
+    fetch_klines(code, limit)
+}
+
+/// Symbol search: Eastmoney first; Tencent SmartBox failover.
 pub fn search_symbols(query: &str, limit: usize) -> Result<Sourced<Vec<Symbol>>> {
     match eastmoney::search_symbols(query, limit) {
         Ok(data) if !data.is_empty() => Ok(Sourced {
@@ -129,7 +127,7 @@ pub fn search_symbols(query: &str, limit: usize) -> Result<Sourced<Vec<Symbol>>>
             source: SRC_EASTMONEY,
         }),
         Ok(_) | Err(_) => {
-            let data = sina::search_symbols(query, limit)?;
+            let data = tencent::search_symbols(query, limit)?;
             if data.is_empty() {
                 Ok(Sourced {
                     data: Vec::new(),
@@ -138,7 +136,7 @@ pub fn search_symbols(query: &str, limit: usize) -> Result<Sourced<Vec<Symbol>>>
             } else {
                 Ok(Sourced {
                     data,
-                    source: SRC_SINA,
+                    source: SRC_TENCENT,
                 })
             }
         }
@@ -202,9 +200,13 @@ mod tests {
     }
 
     #[test]
-    fn baostock_direct_works() {
-        let r = baostock::fetch_klines("600519", 15).expect("baostock");
+    fn tencent_direct_works() {
+        let r = tencent::fetch_klines("600519", 15).expect("tencent");
         assert!(r.2.len() >= 5);
-        eprintln!("baostock direct n={} close={}", r.2.len(), r.2.last().unwrap().close);
+        eprintln!(
+            "tencent direct n={} close={}",
+            r.2.len(),
+            r.2.last().unwrap().close
+        );
     }
 }
