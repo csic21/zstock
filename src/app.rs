@@ -12,6 +12,7 @@ use gpui::{
 use gpui_component::{
     button::{Button, ButtonVariants},
     h_flex,
+    IconName,
     input::{Input, InputEvent, InputState},
     resizable::{h_resizable, resizable_panel, v_resizable, ResizableState},
     v_flex, ActiveTheme, Disableable, PixelsExt, Root, Sizable, StyledExt, Theme, ThemeMode,
@@ -40,6 +41,7 @@ actions!(
         DismissOverlay,
         SelectPrevSymbol,
         SelectNextSymbol,
+        RemoveSelectedSymbol,
         ResetChartZoom,
         Quit
     ]
@@ -1326,20 +1328,42 @@ impl StockApp {
         });
     }
 
-    fn remove_selected_from_watchlist(&mut self, cx: &mut Context<Self>) {
+    /// 从自选里删除指定代码；删除的是当前选中标的时，自动选中相邻标的。
+    fn remove_symbol(&mut self, code: &str, cx: &mut Context<Self>) {
         if self.symbols.len() <= 1 {
-            self.status = shared("至少保留一只自选");
+            self.status = shared(if self.work_mode {
+                "At least one symbol"
+            } else {
+                "至少保留一只自选"
+            });
             cx.notify();
             return;
         }
-        let code = self.selected.to_string();
-        self.symbols.retain(|s| s.code != code);
+        let Some(pos) = self.symbols.iter().position(|s| s.code == code) else {
+            return;
+        };
+        let was_selected = self.selected.as_ref() == code;
+        self.symbols.remove(pos);
         self.filtered_local = (0..self.symbols.len()).collect();
-        if let Some(first) = self.symbols.first() {
-            self.selected = shared(first.code.clone());
-            self.persist();
+        if was_selected {
+            self.selected = shared(
+                self.symbols
+                    .get(pos)
+                    .or_else(|| self.symbols.last())
+                    .map(|s| s.code.clone())
+                    .unwrap_or_default(),
+            );
+        }
+        self.persist();
+        if was_selected {
             self.reload_klines(cx);
         }
+        cx.notify();
+    }
+
+    fn remove_selected_from_watchlist(&mut self, cx: &mut Context<Self>) {
+        let code = self.selected.to_string();
+        self.remove_symbol(&code, cx);
     }
 
     fn set_range(&mut self, range: ChartRange, cx: &mut Context<Self>) {
@@ -2757,6 +2781,9 @@ impl StockApp {
                         } else {
                             sym.name.clone()
                         };
+                        let code_rm = code.clone();
+                        let name_rm = name_show.clone();
+                        let code_tip = code_show.clone();
                         let last = format_price(sym.last);
                         let chg = self.format_change(sym.change_pct);
                         let chg_color = self.chg_color(sym.is_up(), cx);
@@ -2826,6 +2853,20 @@ impl StockApp {
                                     .child(
                                         div().text_xs().text_color(chg_color).child(chg),
                                     ),
+                            )
+                            .child(
+                                Button::new(("wl-rm", ix))
+                                    .icon(IconName::Delete)
+                                    .ghost()
+                                    .xsmall()
+                                    .tooltip(if work {
+                                        format!("Remove {code_tip}")
+                                    } else {
+                                        format!("删除 {name_rm}")
+                                    })
+                                    .on_click(cx.listener(move |this, _, _w, cx| {
+                                        this.remove_symbol(&code_rm, cx);
+                                    })),
                             )
                     })),
             )
@@ -4252,6 +4293,14 @@ impl Render for StockApp {
                     this.select_adjacent_symbol(1, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &RemoveSelectedSymbol, _w, cx| {
+                if !this.palette_open
+                    && !this.settings_open
+                    && this.left_tab == LeftTab::Watchlist
+                {
+                    this.remove_selected_from_watchlist(cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &ResetChartZoom, _w, cx| {
                 this.reset_chart_view();
                 this.hover_ix = None;
@@ -4357,6 +4406,8 @@ pub fn run() {
             KeyBinding::new("down", SelectNextSymbol, None),
             KeyBinding::new("k", SelectPrevSymbol, None),
             KeyBinding::new("j", SelectNextSymbol, None),
+            KeyBinding::new("backspace", RemoveSelectedSymbol, None),
+            KeyBinding::new("delete", RemoveSelectedSymbol, None),
             KeyBinding::new("0", ResetChartZoom, None),
             #[cfg(target_os = "macos")]
             KeyBinding::new("cmd-q", Quit, None),
