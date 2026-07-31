@@ -7,10 +7,10 @@
 //!
 //! These are free for personal tooling but have no SLA; rate-limit politely.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 
-use crate::model::{board_for_code, secid_for_code, shared, Candle, Symbol};
+use crate::model::{Candle, Symbol, board_for_code, secid_for_code, shared};
 
 const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
@@ -78,11 +78,7 @@ pub fn short_http_err(msg: &str) -> String {
         return format!("{prefix}");
     }
     let s = msg.chars().take(80).collect::<String>();
-    if msg.len() > 80 {
-        format!("{s}…")
-    } else {
-        s
-    }
+    if msg.len() > 80 { format!("{s}…") } else { s }
 }
 
 /// Batch quotes for a list of pure codes (`600519`, `000001`, …).
@@ -91,6 +87,14 @@ pub fn fetch_quotes(codes: &[String]) -> Result<Vec<QuoteTick>> {
         return Ok(vec![]);
     }
     let secids: Vec<String> = codes.iter().map(|c| secid_for_code(c)).collect();
+    fetch_quotes_by_secids(&secids)
+}
+
+/// Quotes by raw Eastmoney `secid` list (e.g. `1.000001` 上证指数).
+pub fn fetch_quotes_by_secids(secids: &[String]) -> Result<Vec<QuoteTick>> {
+    if secids.is_empty() {
+        return Ok(vec![]);
+    }
     let secids = secids.join(",");
     let path = format!(
         "/api/qt/ulist.np/get?\
@@ -112,6 +116,16 @@ pub fn fetch_quotes(codes: &[String]) -> Result<Vec<QuoteTick>> {
         }
     }
     Err(anyhow!("行情接口不可用: {last_err}"))
+}
+
+/// 上证综指 / 沪深300 / 创业板指.
+pub fn fetch_major_indices() -> Result<Vec<QuoteTick>> {
+    let secids = vec![
+        "1.000001".into(), // 上证综指
+        "1.000300".into(), // 沪深300
+        "0.399006".into(), // 创业板指
+    ];
+    fetch_quotes_by_secids(&secids)
 }
 
 fn parse_quote_diff(v: Value) -> Result<Vec<QuoteTick>> {
@@ -161,7 +175,8 @@ pub fn fetch_klines(code: &str, limit: usize) -> Result<(String, String, Vec<Can
          &fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61\
          &klt=101&fqt=1&end=20500101&lmt={limit}"
     );
-    let v = get_json(&url).map_err(|e| anyhow!("K线请求失败: {}", short_http_err(&e.to_string())))?;
+    let v =
+        get_json(&url).map_err(|e| anyhow!("K线请求失败: {}", short_http_err(&e.to_string())))?;
     let name = v
         .pointer("/data/name")
         .and_then(|x| x.as_str())
@@ -230,7 +245,10 @@ pub fn search_symbols(query: &str, limit: usize) -> Result<Vec<Symbol>> {
     let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
     let mut out = Vec::new();
 
-    if let Some(arr) = v.pointer("/QuotationCodeTable/Data").and_then(|x| x.as_array()) {
+    if let Some(arr) = v
+        .pointer("/QuotationCodeTable/Data")
+        .and_then(|x| x.as_array())
+    {
         for it in arr {
             let code = it
                 .get("Code")
@@ -342,7 +360,10 @@ pub fn fetch_liquid_a_shares(limit: usize) -> Result<Vec<UniverseRow>> {
         );
         let mut page_rows: Option<Vec<UniverseRow>> = None;
         let mut last_err = anyhow!("no host");
-        for host in PUSH2_HOSTS.iter().chain(std::iter::once(&"push2delay.eastmoney.com")) {
+        for host in PUSH2_HOSTS
+            .iter()
+            .chain(std::iter::once(&"push2delay.eastmoney.com"))
+        {
             let url = format!("https://{host}{path}");
             match get_json(&url) {
                 Ok(v) => {
@@ -434,6 +455,7 @@ mod universe_list_tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires public market-data network"]
     fn liquid_a_shares_smoke() {
         let rows = fetch_liquid_a_shares(30).expect("clist");
         assert!(rows.len() >= 10, "n={}", rows.len());

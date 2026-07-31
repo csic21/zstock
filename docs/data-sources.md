@@ -24,7 +24,7 @@
 
 优点：零成本、厂商少、备源也是前复权。  
 缺点：非官方 SLA；腾讯 K 窗短于东财。  
-限频：本应用约 8s 刷一次行情。
+限频：本应用约 1s 刷一次行情。
 
 > 仅供学习研究，不构成投资建议；商业产品请换有授权的数据商。
 
@@ -83,7 +83,7 @@
 ## 本应用中的数据流
 
 ```
-Watchlist codes ──► market::fetch_quotes (东财→腾讯, 8s)      ──► 左侧列表报价
+Watchlist codes ──► market::fetch_quotes (东财→腾讯, 1s)      ──► 左侧列表报价
 Selected code  ──► market::fetch_klines (东财→腾讯)          ──► 日 K + MA
 ⌘K 搜索       ──► market::search (东财→腾讯 SmartBox)        ──► 添加自选
 寻宝鼠扫描    ──► market::fetch_klines_adjusted (东财→腾讯)  ──► treasure 评分

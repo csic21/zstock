@@ -7,10 +7,10 @@
 //! Used as failover when Eastmoney is unavailable. No SLA; rate-limit politely.
 //! K-line window is capped (~640 bars on this endpoint).
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 
-use crate::model::{board_for_code, shared, Candle, Symbol};
+use crate::model::{Candle, Symbol, board_for_code, shared};
 
 use super::eastmoney::QuoteTick;
 
@@ -378,11 +378,15 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires public market-data network"]
     fn quotes_smoke() {
         let codes = vec!["600519".into(), "000001".into()];
         let r = fetch_quotes(&codes).expect("tencent quotes");
         assert!(r.iter().any(|t| t.last > 0.0));
-        assert!(r.iter().any(|t| t.name.contains('茅') || t.code == "000001"));
+        assert!(
+            r.iter()
+                .any(|t| t.name.contains('茅') || t.code == "000001")
+        );
         eprintln!(
             "tencent quotes: {:?}",
             r.iter()
@@ -392,13 +396,20 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires public market-data network"]
     fn klines_smoke() {
         let r = fetch_klines("600519", 20).expect("tencent klines");
         assert!(r.2.len() >= 5);
-        eprintln!("tencent klines n={} name={} last={}", r.2.len(), r.1, r.2.last().unwrap().close);
+        eprintln!(
+            "tencent klines n={} name={} last={}",
+            r.2.len(),
+            r.1,
+            r.2.last().unwrap().close
+        );
     }
 
     #[test]
+    #[ignore = "requires public market-data network"]
     fn search_smoke() {
         let r = search_symbols("茅台", 8).expect("search");
         assert!(r.iter().any(|s| s.code == "600519"), "{r:?}");

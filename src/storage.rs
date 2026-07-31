@@ -39,6 +39,41 @@ impl ColorScheme {
     }
 }
 
+/// Watchlist row order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+#[repr(u32)]
+pub enum WatchlistSort {
+    /// Insertion / user order as stored in `watchlist`.
+    #[default]
+    Manual,
+    /// Highest gain first.
+    ChangeDesc,
+    /// Deepest loss first.
+    ChangeAsc,
+    /// Code ascending.
+    CodeAsc,
+}
+
+impl WatchlistSort {
+    pub fn label(self, work: bool) -> &'static str {
+        match (self, work) {
+            (Self::Manual, true) => "Order",
+            (Self::Manual, false) => "默认",
+            (Self::ChangeDesc, true) => "Δ↓",
+            (Self::ChangeDesc, false) => "涨幅↓",
+            (Self::ChangeAsc, true) => "Δ↑",
+            (Self::ChangeAsc, false) => "跌幅↑",
+            (Self::CodeAsc, true) => "ID",
+            (Self::CodeAsc, false) => "代码",
+        }
+    }
+
+    pub fn all() -> [Self; 4] {
+        [Self::Manual, Self::ChangeDesc, Self::ChangeAsc, Self::CodeAsc]
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     /// Pure A-share codes in watchlist order.
@@ -49,6 +84,11 @@ pub struct AppConfig {
     pub show_ma5: bool,
     pub show_ma10: bool,
     pub show_ma20: bool,
+    #[serde(default = "default_true")]
+    pub show_ma60: bool,
+    /// Draw volume bars under the price chart.
+    #[serde(default = "default_true")]
+    pub show_volume: bool,
     /// Left panel width hint (px).
     pub left_width: f32,
     /// Bottom panel height hint (px).
@@ -56,6 +96,28 @@ pub struct AppConfig {
     /// Up/down color convention: `cn` (红涨绿跌) or `us` (绿涨红跌).
     #[serde(default)]
     pub color_scheme: ColorScheme,
+    /// Work mode: neutral copy + muted up/down colors (in-app toggle).
+    #[serde(default)]
+    pub work_mode: bool,
+    /// Quote poll interval in seconds (clamped 1..=120). Default 1.
+    #[serde(default = "default_quote_interval_secs")]
+    pub quote_interval_secs: u64,
+    /// How the watchlist is ordered in the sidebar.
+    #[serde(default)]
+    pub watchlist_sort: WatchlistSort,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_quote_interval_secs() -> u64 {
+    1
+}
+
+/// Clamp user-facing quote interval.
+pub fn clamp_quote_interval_secs(secs: u64) -> u64 {
+    secs.clamp(1, 120)
 }
 
 impl Default for AppConfig {
@@ -69,9 +131,14 @@ impl Default for AppConfig {
             show_ma5: true,
             show_ma10: true,
             show_ma20: true,
+            show_ma60: true,
+            show_volume: true,
             left_width: 280.0,
             bottom_height: 200.0,
             color_scheme: ColorScheme::Cn,
+            work_mode: false,
+            quote_interval_secs: default_quote_interval_secs(),
+            watchlist_sort: WatchlistSort::Manual,
         }
     }
 }

@@ -3,6 +3,7 @@
 pub mod eastmoney;
 pub mod indicators;
 pub mod market;
+pub mod signals;
 pub mod tencent;
 pub mod treasure;
 pub mod universe;

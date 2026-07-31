@@ -179,14 +179,7 @@ pub fn analyze(code: &str, name: &str, candles: &[Candle], source: &str) -> Opti
     }
 
     let score = composite_score(
-        pos_1y,
-        pos_3y,
-        pos_all,
-        pctile_1y,
-        pctile_3y,
-        pctile_all,
-        dd_all,
-        &tags,
+        pos_1y, pos_3y, pos_all, pctile_1y, pctile_3y, pctile_all, dd_all, &tags,
     );
 
     Some(TreasureHit {

@@ -4,31 +4,53 @@ use std::time::Duration;
 
 use gpui::{
     actions, canvas, div, px, size, App, AppContext, Context, Entity, FocusHandle,
-    InteractiveElement, IntoElement, KeyBinding, MouseMoveEvent, ParentElement, Pixels, Point,
-    Render, ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Timer,
-    Window, WindowBounds, WindowOptions, prelude::FluentBuilder,
+    InteractiveElement, IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
+    ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString,
+    StatefulInteractiveElement, Styled, Timer, Window, WindowBounds, WindowOptions,
+    prelude::FluentBuilder,
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
     h_flex,
     input::{Input, InputEvent, InputState},
-    resizable::{h_resizable, resizable_panel, v_resizable},
+    resizable::{h_resizable, resizable_panel, v_resizable, ResizableState},
     v_flex, ActiveTheme, Disableable, PixelsExt, Root, Sizable, StyledExt, Theme, ThemeMode,
-    TitleBar,
+    TitleBar, TITLE_BAR_HEIGHT,
 };
+use gpui_component::tooltip::Tooltip;
 
-use crate::chart::{index_from_x, paint_chart, ChartPaintData};
+use crate::chart::{index_from_x, paint_chart, paint_sparkline, ChartPaintData, ChartStyle};
 use crate::data::treasure::{self, fmt_dd, fmt_pos, TreasureHit, TREASURE_KLINE_LIMIT};
 use crate::data::universe::{self, TREASURE_SCAN_CAP, TREASURE_TOP_N};
-use crate::data::{indicators::MaSeries, market};
+use crate::data::{indicators::MaSeries, market, signals};
 use crate::model::{
-    board_for_code, format_pct, format_price, format_volume, shared, Candle, QuoteSnapshot, Symbol,
+    board_for_code, disguise_index, disguise_label, format_index, format_pct, format_price,
+    format_volume, shared, Candle, IndexSnap, QuoteSnapshot, Symbol,
 };
-use crate::storage::{self, AppConfig, ColorScheme};
+use crate::storage::{self, clamp_quote_interval_secs, AppConfig, ColorScheme, WatchlistSort};
 
-actions!(stock, [ToggleCommandPalette, RefreshData, ToggleTreasure, Quit]);
+actions!(
+    stock,
+    [
+        ToggleCommandPalette,
+        RefreshData,
+        ToggleTreasure,
+        ToggleWorkMode,
+        ToggleSettings,
+        DismissOverlay,
+        SelectPrevSymbol,
+        SelectNextSymbol,
+        ResetChartZoom,
+        Quit
+    ]
+);
 
-const QUOTE_INTERVAL_OK: Duration = Duration::from_secs(8);
+/// Window title in normal vs work mode.
+const TITLE_NORMAL: &str = "Stock Analysis · A股";
+const TITLE_WORK: &str = "Notes";
+
+/// Preset quote poll intervals offered in Settings (seconds).
+const QUOTE_INTERVAL_PRESETS: &[u64] = &[1, 2, 3, 5, 8, 15, 30, 60];
 const QUOTE_INTERVAL_ERR_MAX: Duration = Duration::from_secs(45);
 /// Minimum candles visible when zoomed in.
 const CHART_MIN_VISIBLE: usize = 15;
@@ -109,6 +131,8 @@ pub struct StockApp {
     show_ma5: bool,
     show_ma10: bool,
     show_ma20: bool,
+    show_ma60: bool,
+    show_volume: bool,
     hover_ix: Option<usize>,
     /// Visible window into `candles` for zoom/pan (inclusive start).
     chart_view_start: usize,
@@ -120,6 +144,10 @@ pub struct StockApp {
     loading: bool,
     data_source: SharedString,
     palette_open: bool,
+    /// Settings overlay.
+    settings_open: bool,
+    /// Quote poll interval (seconds), from config.
+    quote_interval_secs: u64,
     palette_query: Entity<InputState>,
     palette_focus: FocusHandle,
     /// Search results for palette (remote + local).
@@ -129,6 +157,12 @@ pub struct StockApp {
     bottom_height: f32,
     /// 涨跌配色：中国红涨绿跌 / 美国绿涨红跌
     color_scheme: ColorScheme,
+    /// 工作模式：中性文案 + 去红绿
+    work_mode: bool,
+    /// Temporary owner map in work mode; intentionally never persisted.
+    work_identity_reveal: bool,
+    /// Sidebar row order.
+    watchlist_sort: WatchlistSort,
     quote_fail_streak: u32,
     /// 左侧：自选 / 寻宝鼠
     left_tab: LeftTab,
@@ -140,6 +174,12 @@ pub struct StockApp {
     treasure_status: SharedString,
     /// 取消过期扫描。
     treasure_gen: u64,
+    /// 上证综指（work 模式 cpu）。
+    index_sh: Option<IndexSnap>,
+    /// 沪深300（work 模式 mem）。
+    index_hs300: Option<IndexSnap>,
+    /// 创业板指（work 模式 disk）。
+    index_cyb: Option<IndexSnap>,
     _subscriptions: Vec<gpui::Subscription>,
 }
 
@@ -213,6 +253,8 @@ impl StockApp {
             show_ma5: cfg.show_ma5,
             show_ma10: cfg.show_ma10,
             show_ma20: cfg.show_ma20,
+            show_ma60: cfg.show_ma60,
+            show_volume: cfg.show_volume,
             hover_ix: None,
             chart_view_start: 0,
             chart_view_count: 0,
@@ -222,6 +264,8 @@ impl StockApp {
             loading: true,
             data_source: shared(market::SRC_LABEL),
             palette_open: false,
+            settings_open: false,
+            quote_interval_secs: clamp_quote_interval_secs(cfg.quote_interval_secs),
             palette_query,
             palette_focus,
             palette_hits: Vec::new(),
@@ -229,6 +273,9 @@ impl StockApp {
             left_width: cfg.left_width,
             bottom_height: cfg.bottom_height,
             color_scheme: cfg.color_scheme,
+            work_mode: cfg.work_mode,
+            work_identity_reveal: false,
+            watchlist_sort: cfg.watchlist_sort,
             quote_fail_streak: 0,
             left_tab: LeftTab::Watchlist,
             treasure_hits,
@@ -237,11 +284,23 @@ impl StockApp {
             treasure_total: 0,
             treasure_status,
             treasure_gen: 0,
+            index_sh: None,
+            index_hs300: None,
+            index_cyb: None,
             _subscriptions,
         };
 
+        window.set_window_title(app.window_title());
         app.bootstrap(cx);
         app
+    }
+
+    fn window_title(&self) -> &'static str {
+        if self.work_mode {
+            TITLE_WORK
+        } else {
+            TITLE_NORMAL
+        }
     }
 
     fn bootstrap(&mut self, cx: &mut Context<Self>) {
@@ -249,6 +308,23 @@ impl StockApp {
         self.refresh_all(cx);
         // 旧缓存可能只有代码没有中文名
         self.enrich_treasure_names_if_needed(cx);
+        // Major indices for work-mode host gauges
+        cx.spawn(async move |this, cx| {
+            let idx = smol::unblock(market::fetch_major_indices).await;
+            this.update(cx, |app, cx| {
+                if let Ok(sourced) = idx {
+                    let rows: Vec<_> = sourced
+                        .data
+                        .iter()
+                        .map(|t| (t.code.clone(), t.name.clone(), t.last, t.change_pct))
+                        .collect();
+                    app.apply_index_ticks(&rows);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
 
         // macOS trackpad pinch (NSEvent magnify) — GPUI does not forward this itself
         #[cfg(target_os = "macos")]
@@ -276,9 +352,9 @@ impl StockApp {
             .detach();
         }
 
-        // Quote polling loop with backoff on failure
+        // Quote polling loop with backoff on failure (interval from settings).
         cx.spawn(async move |this, cx| {
-            let mut delay = QUOTE_INTERVAL_OK;
+            let mut delay = Duration::from_secs(1);
             loop {
                 Timer::after(delay).await;
                 let codes = match this.read_with(cx, |app, _| {
@@ -288,16 +364,40 @@ impl StockApp {
                     Err(_) => break,
                 };
                 if codes.is_empty() {
+                    // Still respect configured interval while empty.
+                    if let Ok(secs) = this.read_with(cx, |app, _| app.quote_interval_secs) {
+                        delay = Duration::from_secs(secs);
+                    }
                     continue;
                 }
+                let need_idx = this
+                    .read_with(cx, |app, _| app.work_mode)
+                    .unwrap_or(false);
                 let result = smol::unblock(move || market::fetch_quotes(&codes)).await;
+                let idx_result = if need_idx {
+                    Some(smol::unblock(market::fetch_major_indices).await)
+                } else {
+                    None
+                };
                 let ok = this.update(cx, |app, cx| {
                     match result {
                         Ok(sourced) => {
                             app.quote_fail_streak = 0;
+                            let symbol_ix: std::collections::HashMap<String, usize> = app
+                                .symbols
+                                .iter()
+                                .enumerate()
+                                .map(|(ix, s)| (s.code.clone(), ix))
+                                .collect();
+                            let treasure_ix: std::collections::HashMap<String, usize> = app
+                                .treasure_hits
+                                .iter()
+                                .enumerate()
+                                .map(|(ix, h)| (h.code.clone(), ix))
+                                .collect();
                             for t in sourced.data {
-                                if let Some(sym) = app.symbols.iter_mut().find(|s| s.code == t.code)
-                                {
+                                if let Some(&ix) = symbol_ix.get(&t.code) {
+                                    let sym = &mut app.symbols[ix];
                                     if is_real_name(&t.name, &t.code) {
                                         sym.name = shared(t.name.clone());
                                     }
@@ -309,14 +409,23 @@ impl StockApp {
                                 }
                                 // 顺带补寻宝列表中文名
                                 if is_real_name(&t.name, &t.code) {
-                                    if let Some(hit) =
-                                        app.treasure_hits.iter_mut().find(|h| h.code == t.code)
-                                    {
+                                    if let Some(&ix) = treasure_ix.get(&t.code) {
+                                        let hit = &mut app.treasure_hits[ix];
                                         if hit.name != t.name {
                                             hit.name = t.name.clone();
                                         }
                                     }
                                 }
+                            }
+                            if let Some(Ok(idx)) = &idx_result {
+                                let rows: Vec<_> = idx
+                                    .data
+                                    .iter()
+                                    .map(|t| {
+                                        (t.code.clone(), t.name.clone(), t.last, t.change_pct)
+                                    })
+                                    .collect();
+                                app.apply_index_ticks(&rows);
                             }
                             // Don't clobber an in-flight kline status unless idle
                             if !app.loading {
@@ -327,16 +436,27 @@ impl StockApp {
                                 ));
                             }
                             cx.notify();
-                            QUOTE_INTERVAL_OK
+                            Duration::from_secs(app.quote_interval_secs)
                         }
                         Err(e) => {
                             app.quote_fail_streak = app.quote_fail_streak.saturating_add(1);
-                            let backoff_secs = (8u64 * 2u64.pow(app.quote_fail_streak.min(3)))
+                            let base = app.quote_interval_secs.max(1);
+                            let backoff_secs = (base * 2u64.pow(app.quote_fail_streak.min(5)))
                                 .min(QUOTE_INTERVAL_ERR_MAX.as_secs());
                             app.status = shared(format!(
                                 "行情刷新失败: {e} · {}s 后重试",
                                 backoff_secs
                             ));
+                            if let Some(Ok(idx)) = &idx_result {
+                                let rows: Vec<_> = idx
+                                    .data
+                                    .iter()
+                                    .map(|t| {
+                                        (t.code.clone(), t.name.clone(), t.last, t.change_pct)
+                                    })
+                                    .collect();
+                                app.apply_index_ticks(&rows);
+                            }
                             cx.notify();
                             Duration::from_secs(backoff_secs)
                         }
@@ -357,12 +477,8 @@ impl StockApp {
         let bars = self.range.bars();
         self.kline_gen = self.kline_gen.wrapping_add(1);
         let req_gen = self.kline_gen;
-        // Clear stale chart immediately so header won't show previous symbol's OHLC
-        self.candles.clear();
-        self.ma = MaSeries::default();
-        self.candles_code = None;
+        // Keep previous candles painted until the new series arrives (no blank flash).
         self.hover_ix = None;
-        self.reset_chart_view();
         self.loading = true;
         self.status = shared("加载中…");
         cx.notify();
@@ -378,13 +494,18 @@ impl StockApp {
                 match quotes {
                     Ok(sourced) => {
                         quote_src = Some(sourced.source);
+                        let quotes: std::collections::HashMap<&str, &Symbol> = sourced
+                            .data
+                            .iter()
+                            .map(|symbol| (symbol.code.as_str(), symbol))
+                            .collect();
                         for s in &mut app.symbols {
-                            if let Some(n) = sourced.data.iter().find(|x| x.code == s.code) {
+                            if let Some(n) = quotes.get(s.code.as_str()) {
                                 // Keep existing last if hydrate returned zeros
                                 let keep_last = s.last;
                                 let keep_chg = s.change_pct;
                                 let keep_vol = s.volume;
-                                *s = n.clone();
+                                *s = (*n).clone();
                                 if s.last <= 0.0 && keep_last > 0.0 {
                                     s.last = keep_last;
                                     s.change_pct = keep_chg;
@@ -613,12 +734,8 @@ impl StockApp {
         let bars = self.range.bars();
         self.kline_gen = self.kline_gen.wrapping_add(1);
         let req_gen = self.kline_gen;
-        // Immediately drop previous symbol's series to avoid price/chart mismatch
-        self.candles.clear();
-        self.ma = MaSeries::default();
-        self.candles_code = None;
+        // Keep last series visible while loading (header uses live quote + loading flag).
         self.hover_ix = None;
-        self.reset_chart_view();
         self.loading = true;
         self.status = shared(format!("加载 {selected} K线…"));
         cx.notify();
@@ -663,11 +780,109 @@ impl StockApp {
             show_ma5: self.show_ma5,
             show_ma10: self.show_ma10,
             show_ma20: self.show_ma20,
+            show_ma60: self.show_ma60,
+            show_volume: self.show_volume,
             left_width: self.left_width,
             bottom_height: self.bottom_height,
             color_scheme: self.color_scheme,
+            work_mode: self.work_mode,
+            quote_interval_secs: self.quote_interval_secs,
+            watchlist_sort: self.watchlist_sort,
         };
         let _ = storage::save_config(&cfg);
+    }
+
+    fn dismiss_overlay(&mut self, cx: &mut Context<Self>) {
+        if self.palette_open || self.settings_open {
+            self.palette_open = false;
+            self.settings_open = false;
+            cx.notify();
+        }
+    }
+
+    fn select_adjacent_symbol(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let order = self.watchlist_display_order();
+        if order.is_empty() {
+            return;
+        }
+        let cur = order
+            .iter()
+            .position(|&ix| self.symbols[ix].code == self.selected.as_ref())
+            .unwrap_or(0);
+        let n = order.len() as i32;
+        let next = ((cur as i32 + delta).rem_euclid(n)) as usize;
+        let code = shared(self.symbols[order[next]].code.clone());
+        self.select_symbol(code, cx);
+    }
+
+    /// Indices into `symbols` in the current sidebar order.
+    fn watchlist_display_order(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.symbols.len()).collect();
+        match self.watchlist_sort {
+            WatchlistSort::Manual => {}
+            WatchlistSort::ChangeDesc => {
+                order.sort_by(|&a, &b| {
+                    self.symbols[b]
+                        .change_pct
+                        .partial_cmp(&self.symbols[a].change_pct)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| self.symbols[a].code.cmp(&self.symbols[b].code))
+                });
+            }
+            WatchlistSort::ChangeAsc => {
+                order.sort_by(|&a, &b| {
+                    self.symbols[a]
+                        .change_pct
+                        .partial_cmp(&self.symbols[b].change_pct)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| self.symbols[a].code.cmp(&self.symbols[b].code))
+                });
+            }
+            WatchlistSort::CodeAsc => {
+                order.sort_by(|&a, &b| self.symbols[a].code.cmp(&self.symbols[b].code));
+            }
+        }
+        order
+    }
+
+    fn set_watchlist_sort(&mut self, sort: WatchlistSort, cx: &mut Context<Self>) {
+        if self.watchlist_sort == sort {
+            return;
+        }
+        self.watchlist_sort = sort;
+        self.persist();
+        cx.notify();
+    }
+
+    fn on_main_h_resize(
+        &mut self,
+        state: &Entity<ResizableState>,
+        cx: &mut Context<Self>,
+    ) {
+        let sizes = state.read(cx).sizes().clone();
+        if let Some(w) = sizes.first() {
+            let w = w.as_f32();
+            if (w - self.left_width).abs() > 0.5 {
+                self.left_width = w;
+                self.persist();
+            }
+        }
+    }
+
+    fn on_main_v_resize(
+        &mut self,
+        state: &Entity<ResizableState>,
+        cx: &mut Context<Self>,
+    ) {
+        let sizes = state.read(cx).sizes().clone();
+        // Vertical group: [chart, detail] — persist detail (bottom) height.
+        if let Some(h) = sizes.get(1) {
+            let h = h.as_f32();
+            if (h - self.bottom_height).abs() > 0.5 {
+                self.bottom_height = h;
+                self.persist();
+            }
+        }
     }
 
     fn set_color_scheme(&mut self, scheme: ColorScheme, cx: &mut Context<Self>) {
@@ -679,8 +894,68 @@ impl StockApp {
         cx.notify();
     }
 
+    fn set_work_mode(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.work_mode == on {
+            return;
+        }
+        self.work_mode = on;
+        self.work_identity_reveal = false;
+        self.palette_query.update(cx, |input, cx| {
+            input.set_placeholder(
+                if on {
+                    "Find service or id…"
+                } else {
+                    "搜索代码 / 名称，回车添加自选…"
+                },
+                window,
+                cx,
+            );
+        });
+        window.set_window_title(self.window_title());
+        self.persist();
+        cx.notify();
+    }
+
+    fn toggle_work_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_work_mode(!self.work_mode, window, cx);
+    }
+
+    fn toggle_work_identity(&mut self, cx: &mut Context<Self>) {
+        if !self.work_mode {
+            return;
+        }
+        self.work_identity_reveal = !self.work_identity_reveal;
+        cx.notify();
+    }
+
+    fn set_quote_interval_secs(&mut self, secs: u64, cx: &mut Context<Self>) {
+        let secs = clamp_quote_interval_secs(secs);
+        if self.quote_interval_secs == secs {
+            return;
+        }
+        self.quote_interval_secs = secs;
+        self.persist();
+        cx.notify();
+    }
+
+    fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_open = !self.settings_open;
+        if self.settings_open {
+            self.palette_open = false;
+        }
+        cx.notify();
+    }
+
     /// Color for a rising (`up`) or falling move under the active convention.
+    /// In work mode, always use muted tones so red/green do not stand out.
     fn chg_color(&self, up: bool, cx: &App) -> gpui::Hsla {
+        if self.work_mode {
+            return if up {
+                cx.theme().muted_foreground
+            } else {
+                cx.theme().muted_foreground.opacity(0.65)
+            };
+        }
         match self.color_scheme {
             ColorScheme::Cn => {
                 if up {
@@ -758,11 +1033,24 @@ impl StockApp {
             };
             let _ = this.update(cx, |app, cx| {
                 let mut hit_changed = false;
+                let symbol_ix: std::collections::HashMap<String, usize> = app
+                    .symbols
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, s)| (s.code.clone(), ix))
+                    .collect();
+                let treasure_ix: std::collections::HashMap<String, usize> = app
+                    .treasure_hits
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, h)| (h.code.clone(), ix))
+                    .collect();
                 for t in &sourced.data {
                     if !is_real_name(&t.name, &t.code) {
                         continue;
                     }
-                    if let Some(sym) = app.symbols.iter_mut().find(|s| s.code == t.code) {
+                    if let Some(&ix) = symbol_ix.get(&t.code) {
+                        let sym = &mut app.symbols[ix];
                         if !is_real_name(sym.name.as_ref(), &t.code) || sym.name.as_ref() != t.name {
                             sym.name = shared(t.name.clone());
                         }
@@ -772,7 +1060,8 @@ impl StockApp {
                             sym.volume = t.volume;
                         }
                     }
-                    if let Some(hit) = app.treasure_hits.iter_mut().find(|h| h.code == t.code) {
+                    if let Some(&ix) = treasure_ix.get(&t.code) {
+                        let hit = &mut app.treasure_hits[ix];
                         if hit.name != t.name {
                             hit.name = t.name.clone();
                             hit_changed = true;
@@ -1124,17 +1413,19 @@ impl StockApp {
             .candles_code
             .as_ref()
             .is_some_and(|c| c == self.selected.as_ref());
-        let (start, end) = if matched {
+        // While loading a new series, keep painting the previous candles to avoid a blank flash.
+        let show_series = matched || (self.loading && !self.candles.is_empty());
+        let (start, end) = if show_series {
             self.chart_visible_range()
         } else {
             (0, 0)
         };
-        let candles = if matched && end > start {
+        let candles = if show_series && end > start {
             self.candles[start..end].to_vec()
         } else {
             Vec::new()
         };
-        let ma = if matched && end > start {
+        let ma = if show_series && end > start {
             self.ma.slice(start, end)
         } else {
             MaSeries::default()
@@ -1150,26 +1441,838 @@ impl StockApp {
         } else {
             None
         };
+        let work = self.work_mode;
         ChartPaintData {
             candles,
             ma,
             show_ma5: self.show_ma5,
             show_ma10: self.show_ma10,
             show_ma20: self.show_ma20,
+            show_ma60: self.show_ma60,
+            show_volume: self.show_volume && !work,
             hover_ix,
+            style: if work {
+                ChartStyle::Area
+            } else {
+                ChartStyle::Candles
+            },
             bullish: self.chg_color(true, cx),
             bearish: self.chg_color(false, cx),
+            line_color: if work {
+                theme.blue
+            } else {
+                theme.foreground
+            },
+            area_fill: theme.blue.opacity(0.18),
             border: theme.border,
-            ma5_color: theme.yellow,
-            ma10_color: theme.blue,
-            ma20_color: theme.magenta,
+            ma5_color: if work {
+                theme.muted_foreground.opacity(0.85)
+            } else {
+                theme.yellow
+            },
+            ma10_color: if work {
+                theme.muted_foreground.opacity(0.65)
+            } else {
+                theme.blue
+            },
+            ma20_color: if work {
+                theme.muted_foreground.opacity(0.45)
+            } else {
+                theme.magenta
+            },
+            ma60_color: if work {
+                theme.muted_foreground.opacity(0.35)
+            } else {
+                theme.cyan
+            },
             crosshair: theme.muted_foreground.opacity(0.7),
+            axis_color: theme.muted_foreground,
         }
+    }
+
+    /// Display id: real code, or stable camouflage label in work mode.
+    fn display_code(&self, code: &str) -> String {
+        if self.work_mode {
+            let name = self
+                .symbols
+                .iter()
+                .find(|s| s.code == code)
+                .map(|s| s.name.as_ref())
+                .unwrap_or("");
+            if self.work_identity_reveal {
+                if is_real_name(name, code) {
+                    format!("{name} · {code}")
+                } else {
+                    code.to_string()
+                }
+            } else {
+                disguise_label(code, name)
+            }
+        } else {
+            code.to_string()
+        }
+    }
+
+    fn apply_index_ticks(&mut self, ticks: &[(String, String, f64, f64)]) {
+        for (code, name, last, change_pct) in ticks {
+            let snap = IndexSnap {
+                last: *last,
+                change_pct: *change_pct,
+            };
+            let n = name.as_str();
+            if n.contains("上证") || (*code == "000001" && n.contains("指数")) {
+                self.index_sh = Some(snap);
+            } else if n.contains("沪深300") || code == "000300" {
+                self.index_hs300 = Some(snap);
+            } else if n.contains("创业板") || code == "399006" {
+                self.index_cyb = Some(snap);
+            } else if code == "000001" && *last > 1000.0 {
+                // 上证点位通常 >1000；个股平安银行不会这么高
+                self.index_sh = Some(snap);
+            }
+        }
+    }
+
+    /// Price base for index rebased display (first visible close, else last).
+    fn price_base(&self) -> f64 {
+        let matched = self
+            .candles_code
+            .as_ref()
+            .is_some_and(|c| c == self.selected.as_ref());
+        if matched {
+            let (start, end) = self.chart_visible_range();
+            if end > start {
+                if let Some(c) = self.candles.get(start) {
+                    if c.close > 0.0 {
+                        return c.close;
+                    }
+                }
+            }
+            if let Some(c) = self.candles.last() {
+                if c.close > 0.0 {
+                    return c.close;
+                }
+            }
+        }
+        self.current_symbol()
+            .map(|s| s.last)
+            .filter(|v| *v > 0.0)
+            .unwrap_or(1.0)
+    }
+
+    fn format_value(&self, price: f64) -> String {
+        if self.work_mode {
+            format_index(disguise_index(price, self.price_base()))
+        } else {
+            format_price(price)
+        }
+    }
+
+    fn format_change(&self, pct: f64) -> String {
+        if self.work_mode {
+            // Show as index points vs 100, not a stock-style %.
+            format!("{pct:+.2}")
+        } else {
+            format_pct(pct)
+        }
+    }
+
+    /// Work-mode status never mentions quotes / vendors / Chinese stock jargon.
+    fn work_status_line(&self) -> String {
+        if self.loading {
+            return "loading series…".into();
+        }
+        if self.treasure_scanning {
+            return format!("job {}/{}", self.treasure_done, self.treasure_total);
+        }
+        let t = chrono::Local::now().format("%H:%M:%S");
+        if self.quote_fail_streak > 0 {
+            return format!("sync retry · {t}");
+        }
+        format!("sync ok · src-a · {t}")
+    }
+
+    fn max_watchlist_volume(&self) -> u64 {
+        self.symbols.iter().map(|s| s.volume).max().unwrap_or(0)
+    }
+
+    /// 0..1 volume share vs busiest row (looks like load, not 手/万).
+    fn load_factor(volume: u64, max_vol: u64) -> f64 {
+        if max_vol == 0 {
+            0.0
+        } else {
+            (volume as f64 / max_vol as f64).clamp(0.0, 1.0)
+        }
+    }
+
+    /// |涨跌幅| → CPU%（波动大 = 更忙）。约 0%→8%，5%→48%，10%→88%。
+    fn sys_cpu_pct(change_pct: f64) -> f64 {
+        (8.0 + change_pct.abs() * 8.0).clamp(3.0, 96.0)
+    }
+
+    /// 成交量 → 假网速 MB/s（看起来像网络吞吐）。
+    fn sys_net_mbs(volume: u64, max_vol: u64) -> f64 {
+        let load = Self::load_factor(volume, max_vol);
+        (0.4 + load * 24.0 + (volume % 97) as f64 * 0.02).clamp(0.2, 48.0)
+    }
+
+    /// RSS MB from volume + stable code salt.
+    fn sys_rss_mb(code: &str, volume: u64, max_vol: u64) -> u32 {
+        let salt = code.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
+        let base = 48 + (salt % 180);
+        let vol = (Self::load_factor(volume, max_vol) * 720.0) as u32;
+        base + vol
+    }
+
+    fn current_signal(&self) -> Option<signals::SignalSnapshot> {
+        self.candles_code
+            .as_ref()
+            .is_some_and(|code| code == self.selected.as_ref())
+            .then(|| signals::analyze(&self.candles))
+            .flatten()
+    }
+
+    fn spark_closes(&self) -> Vec<f64> {
+        let matched = self
+            .candles_code
+            .as_ref()
+            .is_some_and(|c| c == self.selected.as_ref());
+        if !matched || self.candles.is_empty() {
+            return Vec::new();
+        }
+        let (start, end) = self.chart_visible_range();
+        let slice = if end > start {
+            &self.candles[start..end]
+        } else {
+            self.candles.as_slice()
+        };
+        // Cap points so the spark stays readable.
+        let n = slice.len();
+        let step = (n / 80).max(1);
+        slice
+            .iter()
+            .step_by(step)
+            .map(|c| c.close)
+            .collect()
     }
 
     // ---------- UI pieces ----------
 
+    /// Full-page service metrics + host panel (work mode only).
+    ///
+    /// Right-hand CPU/mem/disk/net/process stats are **derived from real quotes**,
+    /// remapped so they read as system telemetry (see `sys_*` helpers).
+    fn render_work_dashboard(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.selected.clone();
+        let max_vol = self.max_watchlist_volume();
+        let spark = self.spark_closes();
+        let sel_alias = self.display_code(selected.as_ref());
+        let sel_sym = self.current_symbol();
+        let p50 = sel_sym
+            .filter(|s| s.last > 0.0)
+            .map(|s| format!("{}ms", format_price(s.last)))
+            .unwrap_or_else(|| "--".into());
+        let sel_identity = sel_sym
+            .map(|s| format!("{} · {} · 现价 {}", s.code, s.name, format_price(s.last)))
+            .unwrap_or_else(|| "identity unavailable".into());
+        let delta = sel_sym
+            .map(|s| format!("{:+.2}%", s.change_pct))
+            .unwrap_or_else(|| "--".into());
+        let load = sel_sym
+            .map(|s| format!("{:.2}", Self::load_factor(s.volume, max_vol)))
+            .unwrap_or_else(|| "--".into());
+        let status = self.work_status_line();
+        let range_label = self.range.label();
+        let pts = if spark.is_empty() {
+            self.candles.len()
+        } else {
+            spark.len()
+        };
+        let line = cx.theme().blue;
+        let fill = cx.theme().blue.opacity(0.16);
+        let border = cx.theme().border;
+        let signal = self.current_signal();
+        let health = signal
+            .as_ref()
+            .map(|s| format!("{:.0}%", s.score))
+            .unwrap_or_else(|| "--".into());
+        let service_state = signal
+            .as_ref()
+            .map(|s| s.regime.service_state())
+            .unwrap_or("warming");
+
+        v_flex()
+            .w_full()
+            .h_full()
+            .min_h_0()
+            .overflow_hidden()
+            .bg(cx.theme().background)
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_hidden()
+                    // ── left: service table ──
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w(px(360.))
+                            .min_h_0()
+                            .h_full()
+                            .overflow_hidden()
+                            .child(
+                                h_flex()
+                                    .h(px(32.))
+                                    .flex_shrink_0()
+                                    .px_3()
+                                    .items_center()
+                                    .border_b_1()
+                                    .border_color(cx.theme().border)
+                                    .bg(cx.theme().sidebar)
+                                    .child(
+                                        div()
+                                            .w(px(210.))
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child("service"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("work-p50-header")
+                                            .w(px(90.))
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child("p50")
+                                            .tooltip(|window, cx| {
+                                                Tooltip::new(
+                                                    "owner key · p50=现价 · drift=涨跌幅 · health=策略评分",
+                                                )
+                                                .build(window, cx)
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(74.))
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child("drift"),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(58.))
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child("load"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!("{} workers", self.symbols.len())),
+                                    ),
+                            )
+                            // Scroll on a plain div (more reliable than v_flex + overflow).
+                            .child(
+                                div()
+                                    .id("work-metrics-scroll")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .w_full()
+                                    .overflow_y_scroll()
+                                    .children(self.symbols.iter().enumerate().map(|(ix, sym)| {
+                                        let is_selected = sym.code == selected.as_ref();
+                                        let code = shared(sym.code.clone());
+                                        let alias = self.display_code(&sym.code);
+                                        let p50 = if sym.last > 0.0 {
+                                            format!("{}ms", format_price(sym.last))
+                                        } else {
+                                            "--".into()
+                                        };
+                                        let delta = format!("{:+.2}%", sym.change_pct);
+                                        let load =
+                                            format!("{:.2}", Self::load_factor(sym.volume, max_vol));
+                                        let identity = format!(
+                                            "{} · {} · 现价 {}",
+                                            sym.code,
+                                            sym.name,
+                                            format_price(sym.last)
+                                        );
+
+                                        div()
+                                            .id(("work-row", ix))
+                                            .h(px(34.))
+                                            .w_full()
+                                            .px_3()
+                                            .flex()
+                                            .items_center()
+                                            .flex_shrink_0()
+                                            .cursor_pointer()
+                                            .border_b_1()
+                                            .border_color(cx.theme().border.opacity(0.3))
+                                            .when(is_selected, |this| {
+                                                this.bg(cx.theme().accent.opacity(0.14))
+                                            })
+                                            .hover(|this| this.bg(cx.theme().accent.opacity(0.08)))
+                                            .tooltip(move |window, cx| {
+                                                Tooltip::new(identity.clone()).build(window, cx)
+                                            })
+                                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                                this.select_symbol(code.clone(), cx);
+                                            }))
+                                            .child(
+                                                div()
+                                                    .w(px(210.))
+                                                    .text_sm()
+                                                    .font_semibold()
+                                                    .text_color(cx.theme().foreground)
+                                                    .truncate()
+                                                    .child(alias),
+                                            )
+                                            .child(
+                                                div()
+                                                    .w(px(90.))
+                                                    .text_sm()
+                                                    .font_medium()
+                                                    .text_color(cx.theme().foreground)
+                                                    .child(p50),
+                                            )
+                                            .child(
+                                                div()
+                                                    .w(px(74.))
+                                                    .text_sm()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(delta),
+                                            )
+                                            .child(
+                                                div()
+                                                    .w(px(58.))
+                                                    .text_sm()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(load),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(if is_selected { "run" } else { "·" }),
+                                            )
+                                    })),
+                            ),
+                    )
+                    // ── right: host / process panel (real data, system skin) ──
+                    .child(self.render_work_system_panel(cx)),
+            )
+            // footer: selected + sparkline
+            .child(
+                v_flex()
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().sidebar)
+                    .child(
+                        h_flex()
+                            .h(px(32.))
+                            .flex_shrink_0()
+                            .px_3()
+                            .items_center()
+                            .justify_between()
+                            .border_b_1()
+                            .border_color(cx.theme().border.opacity(0.5))
+                            .child(
+                                h_flex()
+                                    .gap_3()
+                                    .items_baseline()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child("selected"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("work-selected-alias")
+                                            .text_sm()
+                                            .font_semibold()
+                                            .text_color(cx.theme().foreground)
+                                            .child(sel_alias)
+                                            .tooltip(move |window, cx| {
+                                                Tooltip::new(sel_identity.clone()).build(window, cx)
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!("p50 {p50}")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!("Δ {delta}")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!("load {load}")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!("health {health} · {service_state}")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!("window {range_label} · {pts} pts")),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .items_center()
+                                    .children(ChartRange::all().map(|range| {
+                                        let active = self.range == range;
+                                        Button::new(("work-range", range as u32))
+                                            .xsmall()
+                                            .when(active, |b| b.primary())
+                                            .when(!active, |b| b.ghost())
+                                            .label(range.label())
+                                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                                this.set_range(range, cx);
+                                            }))
+                                    }))
+                                    .child(
+                                        div()
+                                            .ml_2()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(status),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("work-spark")
+                            .h(px(72.))
+                            .w_full()
+                            .px_2()
+                            .pb_2()
+                            .child(
+                                div()
+                                    .id("work-spark-surface")
+                                    .size_full()
+                                    .rounded(cx.theme().radius)
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .bg(cx.theme().background)
+                                    .overflow_hidden()
+                                    .child({
+                                        let closes = spark.clone();
+                                        canvas(
+                                            move |bounds, _, _| bounds,
+                                            move |bounds, _, window, _cx| {
+                                                paint_sparkline(
+                                                    bounds, &closes, line, fill, border, window,
+                                                );
+                                            },
+                                        )
+                                        .size_full()
+                                    }),
+                            ),
+                    ),
+            )
+    }
+
+    /// Right column: host gauges (major indices) + process table + journal.
+    fn render_work_system_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let max_vol = self.max_watchlist_volume();
+        let sel = self.current_symbol();
+        let host_name = sel
+            .map(|s| self.display_code(&s.code))
+            .unwrap_or_else(|| "host".into());
+        let (net_in, net_out) = if let Some(s) = sel {
+            (
+                Self::sys_net_mbs(s.volume, max_vol),
+                Self::sys_net_mbs(s.volume.saturating_mul(3) / 4, max_vol),
+            )
+        } else {
+            (1.2, 0.8)
+        };
+
+        // Major-index direction is encoded around a neutral 50% telemetry baseline.
+        let sh = self.index_sh;
+        let hs300 = self.index_hs300;
+        let cyb = self.index_cyb;
+        let telemetry = |pct: f64| (50.0 + pct * 12.0).clamp(5.0, 95.0);
+
+        // Sort processes by abs change for top talkers.
+        let mut procs: Vec<&Symbol> = self.symbols.iter().collect();
+        procs.sort_by(|a, b| {
+            b.change_pct
+                .abs()
+                .partial_cmp(&a.change_pct.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let top_procs: Vec<&Symbol> = procs.into_iter().take(12).collect();
+
+        let t = chrono::Local::now().format("%H:%M:%S").to_string();
+        let sh_load = sh.map(|s| telemetry(s.change_pct));
+        let hs300_load = hs300.map(|s| telemetry(s.change_pct));
+        let cyb_load = cyb.map(|s| telemetry(s.change_pct));
+        let sh_pct = sh_load.map(|v| format!("{v:.0}%")).unwrap_or_else(|| "--".into());
+        let hs300_pct = hs300_load
+            .map(|v| format!("{v:.0}%"))
+            .unwrap_or_else(|| "--".into());
+        let cyb_pct = cyb_load.map(|v| format!("{v:.0}%")).unwrap_or_else(|| "--".into());
+        let gauge_value = |snap: Option<IndexSnap>, unit: &str| match snap {
+            Some(s) if self.work_identity_reveal => {
+                format!("{} {}", s.point_label(), s.pct_label())
+            }
+            Some(s) => format!("{}{unit}", s.point_label()),
+            None => "--".into(),
+        };
+        let gauge_tip = |name: &str, snap: Option<IndexSnap>| match snap {
+            Some(s) => format!("{name} · {} · {}", s.point_label(), s.pct_label()),
+            None => format!("{name} · unavailable"),
+        };
+        let market_changes: Vec<f64> = [sh, hs300, cyb]
+            .into_iter()
+            .flatten()
+            .map(|s| s.change_pct)
+            .collect();
+        let market_avg = if market_changes.is_empty() {
+            None
+        } else {
+            Some(market_changes.iter().sum::<f64>() / market_changes.len() as f64)
+        };
+        let journal = [
+            format!("{t}  scheduler tick · node={host_name}"),
+            format!("{t}  sample cpu={sh_pct} mem={hs300_pct} disk={cyb_pct}"),
+            format!("{t}  net rx={net_in:.1} tx={net_out:.1} MB/s"),
+            format!(
+                "{t}  cluster nodes={}",
+                self.symbols.len()
+            ),
+            format!("{t}  gc pause ok · heap stable"),
+            format!("{t}  worker pool active"),
+        ];
+
+        v_flex()
+            .w(px(340.))
+            .min_w(px(300.))
+            .max_w(px(380.))
+            .h_full()
+            .min_h_0()
+            .flex_shrink_0()
+            .overflow_hidden()
+            .border_l_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().sidebar)
+            .child(
+                h_flex()
+                    .h(px(32.))
+                    .flex_shrink_0()
+                    .px_3()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if self.work_identity_reveal { "大盘" } else { "host" }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .truncate()
+                            .child(if self.work_identity_reveal {
+                                "沪深核心指数".to_string()
+                            } else {
+                                host_name.clone()
+                            }),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .flex_shrink_0()
+                    .p_3()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(sys_gauge(
+                        1,
+                        if self.work_identity_reveal { "上证" } else { "cpu" },
+                        gauge_value(sh, "MHz"),
+                        sh_load.unwrap_or(20.0),
+                        gauge_tip("上证综指", sh),
+                        cx,
+                    ))
+                    .child(sys_gauge(
+                        2,
+                        if self.work_identity_reveal { "沪深" } else { "mem" },
+                        gauge_value(hs300, "MB"),
+                        hs300_load.unwrap_or(20.0),
+                        gauge_tip("沪深300", hs300),
+                        cx,
+                    ))
+                    .child(sys_gauge(
+                        3,
+                        if self.work_identity_reveal { "创业" } else { "disk" },
+                        gauge_value(cyb, "IOPS"),
+                        cyb_load.unwrap_or(20.0),
+                        gauge_tip("创业板指", cyb),
+                        cx,
+                    ))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if self.work_identity_reveal { "大盘" } else { "net" }),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().foreground)
+                                    .child(if self.work_identity_reveal {
+                                        market_avg
+                                            .map(|v| format!("平均 {v:+.2}%"))
+                                            .unwrap_or_else(|| "--".into())
+                                    } else {
+                                        format!("↓{net_in:.1}  ↑{net_out:.1} MB/s")
+                                    }),
+                            ),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .h(px(28.))
+                    .flex_shrink_0()
+                    .px_3()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .w(px(160.))
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("process"),
+                    )
+                    .child(
+                        div()
+                            .w(px(48.))
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("cpu"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("rss"),
+                    ),
+            )
+            .child(
+                div()
+                    .id("work-proc-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_y_scroll()
+                    .children(top_procs.into_iter().enumerate().map(|(ix, sym)| {
+                        let is_selected = sym.code == self.selected.as_ref();
+                        let code = shared(sym.code.clone());
+                        let name = self.display_code(&sym.code);
+                        let proc_cpu = Self::sys_cpu_pct(sym.change_pct);
+                        let rss = Self::sys_rss_mb(&sym.code, sym.volume, max_vol);
+
+                        div()
+                            .id(("work-proc", ix))
+                            .h(px(28.))
+                            .w_full()
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .flex_shrink_0()
+                            .cursor_pointer()
+                            .border_b_1()
+                            .border_color(cx.theme().border.opacity(0.25))
+                            .when(is_selected, |this| {
+                                this.bg(cx.theme().accent.opacity(0.14))
+                            })
+                            .hover(|this| this.bg(cx.theme().accent.opacity(0.08)))
+                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                this.select_symbol(code.clone(), cx);
+                            }))
+                            .child(
+                                div()
+                                    .w(px(160.))
+                                    .text_xs()
+                                    .font_medium()
+                                    .text_color(cx.theme().foreground)
+                                    .truncate()
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .w(px(48.))
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("{proc_cpu:.0}%")),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("{rss}M")),
+                            )
+                    })),
+            )
+            .child(
+                v_flex()
+                    .h(px(120.))
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .p_2()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .mb_1()
+                            .child("journal"),
+                    )
+                    .children(journal.into_iter().map(|line| {
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground.opacity(0.9))
+                            .truncate()
+                            .child(line)
+                    })),
+            )
+    }
+
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let work = self.work_mode;
         TitleBar::new().child(
             h_flex()
                 .w_full()
@@ -1180,46 +2283,79 @@ impl StockApp {
                     h_flex()
                         .gap_2()
                         .items_center()
+                        .when(work, |row| {
+                            row.child(
+                                Button::new("work-identity-map")
+                                    .ghost()
+                                    .xsmall()
+                                    .label(if self.work_identity_reveal { "Hide" } else { "Map" })
+                                    .tooltip(if self.work_identity_reveal {
+                                        "Hide stock identity mapping"
+                                    } else {
+                                        "Temporarily map services to stock names and codes"
+                                    })
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.toggle_work_identity(cx);
+                                    })),
+                            )
+                        })
                         .child(
                             div()
                                 .text_sm()
                                 .font_semibold()
                                 .text_color(cx.theme().foreground)
-                                .child("Stock"),
+                                .child(if work { "Workspace" } else { "Stock" }),
                         )
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child("A股分析"),
+                                .child(if work { "local" } else { "A股分析" }),
                         )
-                        .child(
-                            div()
-                                .text_xs()
-                                .px_2()
-                                .py_0p5()
-                                .rounded_full()
-                                .bg(cx.theme().muted)
-                                .text_color(cx.theme().muted_foreground)
-                                .child(self.data_source.clone()),
-                        ),
+                        .when(!work, |row| {
+                            row.child(
+                                div()
+                                    .text_xs()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_full()
+                                    .bg(cx.theme().muted)
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(self.data_source.clone()),
+                            )
+                        }),
                 )
                 .child(
                     h_flex()
                         .gap_2()
                         .items_center()
                         .child(
-                            h_flex()
-                                .gap_1()
-                                .items_center()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child("涨跌色"),
-                                )
-                                .children(
-                                    [ColorScheme::Cn, ColorScheme::Us].map(|scheme| {
+                            Button::new("work-mode")
+                                .xsmall()
+                                .when(work, |b| b.primary())
+                                .when(!work, |b| b.ghost())
+                                .label(if work { "Focus" } else { "工作" })
+                                .tooltip(if work {
+                                    "Exit focus layout · ⌘⇧W"
+                                } else {
+                                    "工作模式：中性配色与文案 · ⌘⇧W"
+                                })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_work_mode(window, cx);
+                                })),
+                        )
+                        .when(!work, |row| {
+                            row.child(
+                                h_flex()
+                                    .gap_1()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child("涨跌色"),
+                                    )
+                                    .children([ColorScheme::Cn, ColorScheme::Us].map(|scheme| {
                                         let active = self.color_scheme == scheme;
                                         let id = match scheme {
                                             ColorScheme::Cn => "color-scheme-cn",
@@ -1234,42 +2370,269 @@ impl StockApp {
                                             .on_click(cx.listener(move |this, _, _w, cx| {
                                                 this.set_color_scheme(scheme, cx);
                                             }))
-                                    }),
-                                ),
-                        )
+                                    })),
+                            )
+                        })
                         .child(
                             Button::new("refresh")
                                 .ghost()
                                 .xsmall()
-                                .label("刷新")
+                                .label(if work { "Sync" } else { "刷新" })
                                 .on_click(cx.listener(|this, _, _w, cx| {
                                     this.refresh_all(cx);
                                 })),
                         )
-                        .child(
-                            Button::new("treasure-btn")
-                                .ghost()
-                                .xsmall()
-                                .label("🐭 寻宝")
-                                .tooltip("多窗口历史低位 · ⌘T")
-                                .on_click(cx.listener(|this, _, _w, cx| {
-                                    this.set_left_tab(LeftTab::Treasure, cx);
-                                })),
-                        )
+                        .when(!work, |row| {
+                            row.child(
+                                Button::new("treasure-btn")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("🐭 寻宝")
+                                    .tooltip("多窗口历史低位 · ⌘T")
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.set_left_tab(LeftTab::Treasure, cx);
+                                    })),
+                            )
+                        })
                         .child(
                             Button::new("cmd-palette-btn")
                                 .ghost()
                                 .xsmall()
-                                .label("⌘K 搜索")
+                                .label(if work { "Find" } else { "⌘K 搜索" })
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.toggle_palette(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("settings-btn")
+                                .ghost()
+                                .xsmall()
+                                .label(if work { "Prefs" } else { "设置" })
+                                .tooltip(if work {
+                                    "Preferences · ⌘,"
+                                } else {
+                                    "设置 · ⌘,"
+                                })
+                                .on_click(cx.listener(|this, _, _w, cx| {
+                                    this.toggle_settings(cx);
                                 })),
                         ),
                 ),
         )
     }
 
+    fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let work = self.work_mode;
+        let interval = self.quote_interval_secs;
+        let scheme = self.color_scheme;
+
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_start()
+            .justify_center()
+            .pt(px(72.))
+            .bg(gpui::hsla(0., 0., 0., 0.55))
+            .child(
+                v_flex()
+                    .id("settings-panel")
+                    .w(px(440.))
+                    .max_h(px(520.))
+                    .rounded(cx.theme().radius_lg)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().popover)
+                    .overflow_hidden()
+                    .on_mouse_down_out(cx.listener(|this, _, _w, cx| {
+                        this.settings_open = false;
+                        cx.notify();
+                    }))
+                    .child(
+                        h_flex()
+                            .h(px(44.))
+                            .px_4()
+                            .items_center()
+                            .justify_between()
+                            .border_b_1()
+                            .border_color(cx.theme().border)
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .text_color(cx.theme().foreground)
+                                    .child(if work { "Preferences" } else { "设置" }),
+                            )
+                            .child(
+                                Button::new("settings-close")
+                                    .ghost()
+                                    .xsmall()
+                                    .label(if work { "Close" } else { "关闭" })
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.settings_open = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .id("settings-body")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .p_4()
+                            .gap_4()
+                            // —— Quote interval ——
+                            .child(
+                                v_flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_semibold()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(if work {
+                                                "Poll interval"
+                                            } else {
+                                                "行情刷新间隔"
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground.opacity(0.9))
+                                            .child(if work {
+                                                "How often quotes refresh. Faster may hit rate limits."
+                                            } else {
+                                                "自选报价自动刷新频率。过快可能被数据源限流。"
+                                            }),
+                                    )
+                                    .child(
+                                        h_flex().gap_1().flex_wrap().children(
+                                            QUOTE_INTERVAL_PRESETS.iter().map(|&secs| {
+                                                let active = interval == secs;
+                                                Button::new(("qi", secs as u32))
+                                                    .xsmall()
+                                                    .when(active, |b| b.primary())
+                                                    .when(!active, |b| b.ghost())
+                                                    .label(format!("{secs}s"))
+                                                    .on_click(cx.listener(move |this, _, _w, cx| {
+                                                        this.set_quote_interval_secs(secs, cx);
+                                                    }))
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!(
+                                                "{}: {interval}s",
+                                                if work { "Current" } else { "当前" }
+                                            )),
+                                    ),
+                            )
+                            // —— Color scheme ——
+                            .child(
+                                v_flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_semibold()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(if work {
+                                                "Color scheme"
+                                            } else {
+                                                "涨跌配色"
+                                            }),
+                                    )
+                                    .child(
+                                        h_flex().gap_1().children(
+                                            [ColorScheme::Cn, ColorScheme::Us].map(|s| {
+                                                let active = scheme == s;
+                                                let id = match s {
+                                                    ColorScheme::Cn => "set-scheme-cn",
+                                                    ColorScheme::Us => "set-scheme-us",
+                                                };
+                                                Button::new(id)
+                                                    .xsmall()
+                                                    .when(active, |b| b.primary())
+                                                    .when(!active, |b| b.ghost())
+                                                    .label(s.label())
+                                                    .on_click(cx.listener(move |this, _, _w, cx| {
+                                                        this.set_color_scheme(s, cx);
+                                                    }))
+                                            }),
+                                        ),
+                                    ),
+                            )
+                            // —— Work mode ——
+                            .child(
+                                v_flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_semibold()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(if work {
+                                                "Focus layout"
+                                            } else {
+                                                "工作模式"
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground.opacity(0.9))
+                                            .child(if work {
+                                                "Metrics dashboard + neutral chrome. Toggle with ⌘⇧W."
+                                            } else {
+                                                "服务指标台 + 中性文案。快捷键 ⌘⇧W。"
+                                            }),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_1()
+                                            .child(
+                                                Button::new("set-work-off")
+                                                    .xsmall()
+                                                    .when(!work, |b| b.primary())
+                                                    .when(work, |b| b.ghost())
+                                                    .label(if work { "Off" } else { "关闭" })
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.set_work_mode(false, window, cx);
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new("set-work-on")
+                                                    .xsmall()
+                                                    .when(work, |b| b.primary())
+                                                    .when(!work, |b| b.ghost())
+                                                    .label(if work { "On" } else { "开启" })
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.set_work_mode(true, window, cx);
+                                                    })),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground.opacity(0.75))
+                                    .child(if work {
+                                        "Prefs are saved locally and apply immediately."
+                                    } else {
+                                        "设置会写入本地配置，立即生效。"
+                                    }),
+                            ),
+                    ),
+            )
+    }
+
     fn render_left_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let work = self.work_mode;
         v_flex()
             .size_full()
             .bg(cx.theme().sidebar)
@@ -1286,7 +2649,7 @@ impl StockApp {
                             .xsmall()
                             .when(self.left_tab == LeftTab::Watchlist, |b| b.primary())
                             .when(self.left_tab != LeftTab::Watchlist, |b| b.ghost())
-                            .label("自选")
+                            .label(if work { "List" } else { "自选" })
                             .on_click(cx.listener(|this, _, _w, cx| {
                                 this.set_left_tab(LeftTab::Watchlist, cx);
                             })),
@@ -1296,8 +2659,12 @@ impl StockApp {
                             .xsmall()
                             .when(self.left_tab == LeftTab::Treasure, |b| b.primary())
                             .when(self.left_tab != LeftTab::Treasure, |b| b.ghost())
-                            .label("🐭 寻宝")
-                            .tooltip("多窗口历史低位扫描（1Y/3Y/全样本）")
+                            .label(if work { "Scan" } else { "🐭 寻宝" })
+                            .tooltip(if work {
+                                "Multi-window scan · ⌘T"
+                            } else {
+                                "多窗口历史低位扫描（1Y/3Y/全样本）"
+                            })
                             .on_click(cx.listener(|this, _, _w, cx| {
                                 this.set_left_tab(LeftTab::Treasure, cx);
                             })),
@@ -1327,42 +2694,77 @@ impl StockApp {
 
     fn render_watchlist_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.selected.clone();
+        let work = self.work_mode;
+        let sort = self.watchlist_sort;
+        let display_order = self.watchlist_display_order();
         v_flex()
             .size_full()
             .child(
                 h_flex()
                     .h(px(28.))
-                    .px_3()
+                    .px_2()
                     .items_center()
+                    .gap_1()
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child("代码 / 名称"),
+                            .child(if work { "ID / Name" } else { "代码 / 名称" }),
                     )
                     .child(
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child("最新"),
+                            .child(if work { "Value" } else { "最新" }),
                     ),
+            )
+            .child(
+                h_flex()
+                    .h(px(26.))
+                    .px_1()
+                    .items_center()
+                    .gap_0p5()
+                    .border_b_1()
+                    .border_color(cx.theme().border.opacity(0.6))
+                    .children(WatchlistSort::all().map(|s| {
+                        let active = sort == s;
+                        Button::new(("wl-sort", s as u32))
+                            .ghost()
+                            .xsmall()
+                            .when(active, |b| b.primary())
+                            .label(s.label(work))
+                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                this.set_watchlist_sort(s, cx);
+                            }))
+                    })),
             )
             .child(
                 v_flex()
                     .id("watchlist-scroll")
                     .flex_1()
                     .overflow_y_scroll()
-                    .children(self.symbols.iter().enumerate().map(|(ix, sym)| {
+                    .children(display_order.into_iter().map(|ix| {
+                        let sym = &self.symbols[ix];
                         let is_selected = sym.code == selected.as_ref();
                         let code = shared(sym.code.clone());
-                        let name = sym.name.clone();
+                        let code_show = self.display_code(&sym.code);
+                        let name_show = if work {
+                            shared("series")
+                        } else {
+                            sym.name.clone()
+                        };
                         let last = format_price(sym.last);
-                        let chg = format_pct(sym.change_pct);
+                        let chg = self.format_change(sym.change_pct);
                         let chg_color = self.chg_color(sym.is_up(), cx);
-                        let board = sym.board.clone();
+                        let board = if work {
+                            shared("svc")
+                        } else {
+                            sym.board.clone()
+                        };
 
                         div()
                             .id(("watch-row", ix))
@@ -1394,7 +2796,7 @@ impl StockApp {
                                                     .text_sm()
                                                     .font_semibold()
                                                     .text_color(cx.theme().foreground)
-                                                    .child(sym.code.clone()),
+                                                    .child(code_show),
                                             )
                                             .child(
                                                 div()
@@ -1408,7 +2810,7 @@ impl StockApp {
                                             .text_xs()
                                             .text_color(cx.theme().muted_foreground)
                                             .truncate()
-                                            .child(name),
+                                            .child(name_show),
                                     ),
                             )
                             .child(
@@ -1439,7 +2841,7 @@ impl StockApp {
                         Button::new("add-sym")
                             .ghost()
                             .xsmall()
-                            .label("+ 添加")
+                            .label(if work { "+ Add" } else { "+ 添加" })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.toggle_palette(window, cx);
                             })),
@@ -1448,16 +2850,24 @@ impl StockApp {
                         Button::new("rm-sym")
                             .ghost()
                             .xsmall()
-                            .label("移除")
+                            .label(if work { "Remove" } else { "移除" })
                             .on_click(cx.listener(|this, _, _w, cx| {
                                 this.remove_selected_from_watchlist(cx);
                             })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground.opacity(0.75))
+                            .child(if work { "↑↓ navigate" } else { "↑↓ 切换" }),
                     ),
             )
     }
 
     fn render_treasure_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.selected.clone();
+        let work = self.work_mode;
         v_flex()
             .size_full()
             .child(
@@ -1476,7 +2886,13 @@ impl StockApp {
                                     .xsmall()
                                     .primary()
                                     .label(if self.treasure_scanning {
-                                        "扫描中…"
+                                        if work {
+                                            "Running…"
+                                        } else {
+                                            "扫描中…"
+                                        }
+                                    } else if work {
+                                        "Start"
                                     } else {
                                         "开始寻宝"
                                     })
@@ -1489,7 +2905,7 @@ impl StockApp {
                                 Button::new("treasure-cancel")
                                     .xsmall()
                                     .ghost()
-                                    .label("取消")
+                                    .label(if work { "Cancel" } else { "取消" })
                                     .disabled(!self.treasure_scanning)
                                     .on_click(cx.listener(|this, _, _w, cx| {
                                         this.cancel_treasure_scan(cx);
@@ -1553,9 +2969,13 @@ impl StockApp {
                     .children(self.treasure_hits.iter().enumerate().map(|(ix, hit)| {
                         let is_selected = hit.code == selected.as_ref();
                         let hit_owned = hit.clone();
-                        let code_label = hit.code.clone();
+                        let code_label = if work {
+                            disguise_label(&hit.code, &hit.name)
+                        } else {
+                            hit.code.clone()
+                        };
                         let name = display_name_str(&hit.name, &hit.code);
-                        let show_name = is_real_name(&name, &hit.code);
+                        let show_name = !work && is_real_name(&name, &hit.code);
                         let score = format!("{:.0}", hit.score);
                         let pos_line = format!(
                             "1Y {} · 3Y {} · 全 {}",
@@ -1683,17 +3103,23 @@ impl StockApp {
             .unwrap_or(true);
         let chg_color = self.chg_color(up, cx);
         let paint = self.chart_paint_data(cx);
+        let work = self.work_mode;
 
-        let code = self.selected.clone();
+        let code_show = self.display_code(self.selected.as_ref());
         let name_raw = sym.map(|s| s.name.as_ref().to_string()).unwrap_or_default();
-        let name_show = if is_real_name(&name_raw, code.as_ref()) {
+        let name_show = if work {
+            None
+        } else if is_real_name(&name_raw, self.selected.as_ref()) {
             Some(shared(name_raw))
         } else {
             None
         };
-        let board = sym
-            .map(|s| s.board.clone())
-            .unwrap_or_else(|| shared(""));
+        let board = if work {
+            shared("metric")
+        } else {
+            sym.map(|s| s.board.clone())
+                .unwrap_or_else(|| shared(""))
+        };
         // Prefer live quote on the watchlist; fall back to last candle only if matched
         let close = sym
             .map(|s| s.last)
@@ -1704,6 +3130,8 @@ impl StockApp {
             .map(|s| s.change_pct)
             .or_else(|| snap.as_ref().map(|s| s.change_pct))
             .unwrap_or(0.0);
+        let close_disp = self.format_value(close);
+        let chg_disp = self.format_change(chg);
 
         v_flex()
             .size_full()
@@ -1726,7 +3154,7 @@ impl StockApp {
                                     .text_xl()
                                     .font_semibold()
                                     .text_color(cx.theme().foreground)
-                                    .child(code),
+                                    .child(code_show),
                             )
                             .when_some(name_show, |row, n| {
                                 row.child(
@@ -1756,14 +3184,14 @@ impl StockApp {
                                     .text_2xl()
                                     .font_semibold()
                                     .text_color(cx.theme().foreground)
-                                    .child(format_price(close)),
+                                    .child(close_disp),
                             )
                             .child(
                                 div()
                                     .text_sm()
                                     .font_medium()
                                     .text_color(chg_color)
-                                    .child(format_pct(chg)),
+                                    .child(chg_disp),
                             ),
                     ),
             )
@@ -1782,21 +3210,37 @@ impl StockApp {
                             let h = snap.as_ref().map(|s| s.high).unwrap_or(0.0);
                             let l = snap.as_ref().map(|s| s.low).unwrap_or(0.0);
                             let v = snap.as_ref().map(|s| s.volume).unwrap_or(0);
-                            h_flex()
-                                .gap_3()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(format!("开 {}", format_price(o)))
-                                .child(format!("高 {}", format_price(h)))
-                                .child(format!("低 {}", format_price(l)))
-                                .child(format!("量 {}", format_volume(v)))
+                            if work {
+                                h_flex()
+                                    .gap_3()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("min {}", self.format_value(l)))
+                                    .child(format!("max {}", self.format_value(h)))
+                                    .child(format!("pts {}", format_volume(v)))
+                            } else {
+                                h_flex()
+                                    .gap_3()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("开 {}", format_price(o)))
+                                    .child(format!("高 {}", format_price(h)))
+                                    .child(format!("低 {}", format_price(l)))
+                                    .child(format!("量 {}", format_volume(v)))
+                            }
                         } else {
                             h_flex()
                                 .gap_3()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(if self.loading {
-                                    "K线加载中…"
+                                    if work {
+                                        "Loading series…"
+                                    } else {
+                                        "K线加载中…"
+                                    }
+                                } else if work {
+                                    "No series data"
                                 } else {
                                     "暂无匹配的 K 线"
                                 })
@@ -1806,9 +3250,38 @@ impl StockApp {
                         h_flex()
                             .gap_1()
                             .items_center()
-                            .child(self.ma_toggle("ma5", "MA5", self.show_ma5, cx))
-                            .child(self.ma_toggle("ma10", "MA10", self.show_ma10, cx))
-                            .child(self.ma_toggle("ma20", "MA20", self.show_ma20, cx))
+                            .child(self.ma_toggle(
+                                "ma5",
+                                if work { "L1" } else { "MA5" },
+                                self.show_ma5,
+                                cx,
+                            ))
+                            .child(self.ma_toggle(
+                                "ma10",
+                                if work { "L2" } else { "MA10" },
+                                self.show_ma10,
+                                cx,
+                            ))
+                            .child(self.ma_toggle(
+                                "ma20",
+                                if work { "L3" } else { "MA20" },
+                                self.show_ma20,
+                                cx,
+                            ))
+                            .child(self.ma_toggle(
+                                "ma60",
+                                if work { "L4" } else { "MA60" },
+                                self.show_ma60,
+                                cx,
+                            ))
+                            .when(!work, |row| {
+                                row.child(self.ma_toggle(
+                                    "vol",
+                                    "VOL",
+                                    self.show_volume,
+                                    cx,
+                                ))
+                            })
                             .child(div().w(px(8.)))
                             .children(ChartRange::all().map(|range| {
                                 let active = self.range == range;
@@ -1878,6 +3351,21 @@ impl StockApp {
                                     cx.notify();
                                 }
                             }))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                                    if ev.click_count >= 2 {
+                                        this.reset_chart_view();
+                                        this.hover_ix = None;
+                                        this.status = shared(if this.work_mode {
+                                            "zoom reset"
+                                        } else {
+                                            "已重置图表缩放"
+                                        });
+                                        cx.notify();
+                                    }
+                                }),
+                            )
                             .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, _w, cx| {
                                 this.on_chart_scroll(ev, cx);
                             })),
@@ -1902,6 +3390,8 @@ impl StockApp {
                     "ma5" => this.show_ma5 = !this.show_ma5,
                     "ma10" => this.show_ma10 = !this.show_ma10,
                     "ma20" => this.show_ma20 = !this.show_ma20,
+                    "ma60" => this.show_ma60 = !this.show_ma60,
+                    "vol" => this.show_volume = !this.show_volume,
                     _ => {}
                 }
                 this.persist();
@@ -1914,46 +3404,78 @@ impl StockApp {
             .candles_code
             .as_ref()
             .is_some_and(|c| c == self.selected.as_ref());
+        let work = self.work_mode;
         if candles_match {
-        if let Some(ix) = self.hover_ix {
-            if let Some(c) = self.candles.get(ix) {
-                let color = self.chg_color(c.close >= c.open, cx);
-                let (m5, m10, m20) = self.ma.value_at(ix);
-                let date_label = format_candle_date(c.date.as_ref());
-                return h_flex()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(
-                        div()
-                            .font_semibold()
-                            .text_color(cx.theme().foreground)
-                            .child(date_label),
-                    )
-                    .child(format!(
-                        "开{} 高{} 低{}",
-                        format_price(c.open),
-                        format_price(c.high),
-                        format_price(c.low)
-                    ))
-                    .child(
-                        div()
-                            .text_color(color)
-                            .child(format!("收{}", format_price(c.close))),
-                    )
-                    .child(format!("量{}", format_volume(c.volume)))
-                    .when(m5.is_some(), |this| {
-                        this.child(format!("MA5 {}", format_price(m5.unwrap())))
-                    })
-                    .when(m10.is_some(), |this| {
-                        this.child(format!("MA10 {}", format_price(m10.unwrap())))
-                    })
-                    .when(m20.is_some(), |this| {
-                        this.child(format!("MA20 {}", format_price(m20.unwrap())))
-                    })
-                    .into_any_element();
+            if let Some(ix) = self.hover_ix {
+                if let Some(c) = self.candles.get(ix) {
+                    let color = self.chg_color(c.close >= c.open, cx);
+                    let (m5, m10, m20, m60) = self.ma.value_at(ix);
+                    let date_label = format_candle_date(c.date.as_ref());
+                    if work {
+                        return h_flex()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(
+                                div()
+                                    .font_semibold()
+                                    .text_color(cx.theme().foreground)
+                                    .child(date_label),
+                            )
+                            .child(format!("v {}", self.format_value(c.close)))
+                            .child(format!("lo {}", self.format_value(c.low)))
+                            .child(format!("hi {}", self.format_value(c.high)))
+                            .when(m5.is_some(), |this| {
+                                this.child(format!("L1 {}", self.format_value(m5.unwrap())))
+                            })
+                            .when(m10.is_some(), |this| {
+                                this.child(format!("L2 {}", self.format_value(m10.unwrap())))
+                            })
+                            .when(m20.is_some(), |this| {
+                                this.child(format!("L3 {}", self.format_value(m20.unwrap())))
+                            })
+                            .when(m60.is_some(), |this| {
+                                this.child(format!("L4 {}", self.format_value(m60.unwrap())))
+                            })
+                            .into_any_element();
+                    }
+                    return h_flex()
+                        .gap_2()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(
+                            div()
+                                .font_semibold()
+                                .text_color(cx.theme().foreground)
+                                .child(date_label),
+                        )
+                        .child(format!(
+                            "开{} 高{} 低{}",
+                            format_price(c.open),
+                            format_price(c.high),
+                            format_price(c.low)
+                        ))
+                        .child(
+                            div()
+                                .text_color(color)
+                                .child(format!("收{}", format_price(c.close))),
+                        )
+                        .child(format!("量{}", format_volume(c.volume)))
+                        .when(m5.is_some(), |this| {
+                            this.child(format!("MA5 {}", format_price(m5.unwrap())))
+                        })
+                        .when(m10.is_some(), |this| {
+                            this.child(format!("MA10 {}", format_price(m10.unwrap())))
+                        })
+                        .when(m20.is_some(), |this| {
+                            this.child(format!("MA20 {}", format_price(m20.unwrap())))
+                        })
+                        .when(m60.is_some(), |this| {
+                            this.child(format!("MA60 {}", format_price(m60.unwrap())))
+                        })
+                        .into_any_element();
+                }
             }
-        }
         }
         let (vs, ve) = self.chart_visible_range();
         let zoom_hint = if !self.candles.is_empty() && ve > vs {
@@ -1963,22 +3485,41 @@ impl StockApp {
                 .get(ve - 1)
                 .map(|c| c.date.as_ref())
                 .unwrap_or("?");
-            format!(
-                "滚轮/双指捏合缩放 · 横向滑动平移 · 可见 {}～{}（{}根）",
-                format_candle_date(first),
-                format_candle_date(last),
-                ve - vs
-            )
+            if work {
+                format!(
+                    "scroll/pinch zoom · pan · dblclick reset · {}…{} ({} pts)",
+                    format_candle_date(first),
+                    format_candle_date(last),
+                    ve - vs
+                )
+            } else {
+                format!(
+                    "滚轮/捏合缩放 · 横向平移 · 双击重置 · 可见 {}～{}（{}根）",
+                    format_candle_date(first),
+                    format_candle_date(last),
+                    ve - vs
+                )
+            }
+        } else if work {
+            "scroll/pinch zoom · pan · dblclick reset · hover for values".into()
         } else {
-            "滚轮/双指捏合缩放 · 横向滑动平移 · 移动鼠标查看十字线".into()
+            "滚轮/捏合缩放 · 横向平移 · 双击重置 · 移动鼠标查看十字线".into()
         };
         div()
             .text_xs()
             .text_color(cx.theme().muted_foreground)
             .child(if self.loading {
-                "加载中…".to_string()
+                if work {
+                    "Loading…".to_string()
+                } else {
+                    "加载中…".to_string()
+                }
             } else if !candles_match || self.candles.is_empty() {
-                "暂无K线数据".to_string()
+                if work {
+                    "No series data".to_string()
+                } else {
+                    "暂无K线数据".to_string()
+                }
             } else {
                 zoom_hint
             })
@@ -1998,7 +3539,9 @@ impl StockApp {
         };
         let code = self.selected.as_ref();
         let name_raw = sym.map(|s| s.name.as_ref()).unwrap_or("");
-        let title = if is_real_name(name_raw, code) {
+        let title = if self.work_mode {
+            self.display_code(code)
+        } else if is_real_name(name_raw, code) {
             format!("{code} {name_raw}")
         } else {
             code.to_string()
@@ -2019,7 +3562,11 @@ impl StockApp {
                             .text_xs()
                             .font_semibold()
                             .text_color(cx.theme().muted_foreground)
-                            .child("详情 / 状态"),
+                            .child(if self.work_mode {
+                                "Inspector"
+                            } else {
+                                "详情 / 状态"
+                            }),
                     ),
             )
             .child(
@@ -2036,36 +3583,58 @@ impl StockApp {
                         v_flex()
                             .gap_1()
                             .min_w(px(180.))
-                            .child(detail_row("标的", &title, cx))
                             .child(detail_row(
-                                "板块",
-                                sym.map(|s| s.board.as_ref()).unwrap_or("--"),
+                                if self.work_mode { "Item" } else { "标的" },
+                                &title,
                                 cx,
                             ))
                             .child(detail_row(
-                                "周期",
-                                &format!("{} · {} 根", self.range.label(), self.candles.len()),
+                                if self.work_mode { "Group" } else { "板块" },
+                                if self.work_mode {
+                                    "svc"
+                                } else {
+                                    sym.map(|s| s.board.as_ref()).unwrap_or("--")
+                                },
                                 cx,
                             ))
                             .child(detail_row(
-                                "昨收",
-                                &format_price(snap.as_ref().map(|s| s.prev_close).unwrap_or(0.0)),
+                                if self.work_mode { "Range" } else { "周期" },
+                                &if self.work_mode {
+                                    format!("{} · {} pts", self.range.label(), self.candles.len())
+                                } else {
+                                    format!("{} · {} 根", self.range.label(), self.candles.len())
+                                },
                                 cx,
                             ))
-                            .child(detail_row("配色", self.color_scheme.label(), cx)),
+                            .child(detail_row(
+                                if self.work_mode { "Base" } else { "昨收" },
+                                &self.format_value(
+                                    snap.as_ref().map(|s| s.prev_close).unwrap_or(0.0),
+                                ),
+                                cx,
+                            ))
+                            .child(detail_row(
+                                if self.work_mode { "Theme" } else { "配色" },
+                                if self.work_mode {
+                                    "neutral"
+                                } else {
+                                    self.color_scheme.label()
+                                },
+                                cx,
+                            )),
                     )
                     .child(
                         v_flex()
                             .gap_1()
                             .min_w(px(120.))
                             .child(detail_row(
-                                "MA5",
+                                if self.work_mode { "L1" } else { "MA5" },
                                 &if candles_match {
                                     self.ma
                                         .ma5
                                         .last()
                                         .and_then(|x| *x)
-                                        .map(format_price)
+                                        .map(|v| self.format_value(v))
                                         .unwrap_or_else(|| "--".into())
                                 } else {
                                     "--".into()
@@ -2073,13 +3642,13 @@ impl StockApp {
                                 cx,
                             ))
                             .child(detail_row(
-                                "MA10",
+                                if self.work_mode { "L2" } else { "MA10" },
                                 &if candles_match {
                                     self.ma
                                         .ma10
                                         .last()
                                         .and_then(|x| *x)
-                                        .map(format_price)
+                                        .map(|v| self.format_value(v))
                                         .unwrap_or_else(|| "--".into())
                                 } else {
                                     "--".into()
@@ -2087,13 +3656,27 @@ impl StockApp {
                                 cx,
                             ))
                             .child(detail_row(
-                                "MA20",
+                                if self.work_mode { "L3" } else { "MA20" },
                                 &if candles_match {
                                     self.ma
                                         .ma20
                                         .last()
                                         .and_then(|x| *x)
-                                        .map(format_price)
+                                        .map(|v| self.format_value(v))
+                                        .unwrap_or_else(|| "--".into())
+                                } else {
+                                    "--".into()
+                                },
+                                cx,
+                            ))
+                            .child(detail_row(
+                                if self.work_mode { "L4" } else { "MA60" },
+                                &if candles_match {
+                                    self.ma
+                                        .ma60
+                                        .last()
+                                        .and_then(|x| *x)
+                                        .map(|v| self.format_value(v))
                                         .unwrap_or_else(|| "--".into())
                                 } else {
                                     "--".into()
@@ -2101,6 +3684,7 @@ impl StockApp {
                                 cx,
                             )),
                     )
+                    .child(self.render_signal_detail_col(cx))
                     .child(self.render_treasure_detail_col(cx))
                     .child(
                         v_flex()
@@ -2111,7 +3695,7 @@ impl StockApp {
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child("状态"),
+                                    .child(if self.work_mode { "Status" } else { "状态" }),
                             )
                             .child(
                                 div()
@@ -2119,17 +3703,67 @@ impl StockApp {
                                     .text_color(cx.theme().foreground)
                                     .child(self.status.clone()),
                             )
-                            .child(
-                                div()
-                                    .mt_1()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(
-                                        "1Y/3Y/全样本评分；「上行中继回撤」= 一年低但多年仍高。仅供学习，非投资建议。",
-                                    ),
-                            ),
+                            .when(!self.work_mode, |col| {
+                                col.child(
+                                    div()
+                                        .mt_1()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(
+                                            "1Y/3Y/全样本评分；「上行中继回撤」= 一年低但多年仍高。仅供学习，非投资建议。",
+                                        ),
+                                )
+                            }),
                     ),
             )
+    }
+
+    fn render_signal_detail_col(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let signal = self.current_signal();
+        let mut col = v_flex().gap_1().min_w(px(240.)).child(
+            div()
+                .text_xs()
+                .font_semibold()
+                .text_color(cx.theme().muted_foreground)
+                .child("策略雷达 · 多因子"),
+        );
+
+        if let Some(s) = signal {
+            let fmt = |v: Option<f64>, suffix: &str| {
+                v.map(|n| format!("{n:.1}{suffix}"))
+                    .unwrap_or_else(|| "—".into())
+            };
+            let reasons = s.reasons.iter().take(4).copied().collect::<Vec<_>>().join(" · ");
+            col = col
+                .child(detail_row(
+                    "综合",
+                    &format!("{:.0}/100 · {}", s.score, s.regime.label()),
+                    cx,
+                ))
+                .child(detail_row("RSI14", &fmt(s.rsi14, ""), cx))
+                .child(detail_row("20日动量", &fmt(s.momentum_20_pct, "%"), cx))
+                .child(detail_row(
+                    "20日年化波动",
+                    &fmt(s.volatility_20_ann_pct, "%"),
+                    cx,
+                ))
+                .child(detail_row(
+                    "1Y最大回撤",
+                    &fmt(s.max_drawdown_1y_pct, "%"),
+                    cx,
+                ))
+                .child(detail_row("量能比", &fmt(s.volume_ratio_20, "x"), cx))
+                .child(detail_row("数据置信", &format!("{:.0}%", s.confidence), cx))
+                .child(detail_row("依据", &reasons, cx));
+        } else {
+            col = col.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("至少需要 20 根有效日K数据。"),
+            );
+        }
+        col
     }
 
     fn render_treasure_detail_col(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2144,7 +3778,11 @@ impl StockApp {
                 .text_xs()
                 .font_semibold()
                 .text_color(cx.theme().muted_foreground)
-                .child("寻宝鼠 · 多窗口"),
+                .child(if self.work_mode {
+                    "Scan · multi-window"
+                } else {
+                    "寻宝鼠 · 多窗口"
+                }),
         );
 
         if let Some(h) = hit {
@@ -2255,7 +3893,7 @@ impl StockApp {
                                     .py_1()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child("自选"),
+                                    .child(if self.work_mode { "List" } else { "自选" }),
                             );
                             for (i, (_, sym)) in local.into_iter().enumerate() {
                                 list = list.child(palette_row(
@@ -2263,6 +3901,8 @@ impl StockApp {
                                     true,
                                     i as u64,
                                     self.color_scheme,
+                                    self.work_mode,
+                                    self.work_identity_reveal,
                                     cx,
                                 ));
                             }
@@ -2274,7 +3914,11 @@ impl StockApp {
                                     .py_1()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child("搜索结果（点击添加）"),
+                                    .child(if self.work_mode {
+                                        "Results (click to add)"
+                                    } else {
+                                        "搜索结果（点击添加）"
+                                    }),
                             );
                             for (i, sym) in remote.into_iter().enumerate() {
                                 list = list.child(palette_row(
@@ -2282,6 +3926,8 @@ impl StockApp {
                                     false,
                                     10_000 + i as u64,
                                     self.color_scheme,
+                                    self.work_mode,
+                                    self.work_identity_reveal,
                                     cx,
                                 ));
                             }
@@ -2292,7 +3938,11 @@ impl StockApp {
                                     .p_4()
                                     .text_sm()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child("输入代码或名称搜索 A 股"),
+                                    .child(if self.work_mode {
+                                        "Type an id or name to search"
+                                    } else {
+                                        "输入代码或名称搜索 A 股"
+                                    }),
                             );
                         }
                         list
@@ -2308,7 +3958,11 @@ impl StockApp {
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child("⌘K 开关 · 点击外部关闭 · 配置自动保存"),
+                                    .child(if self.work_mode {
+                                        "⌘K toggle · click outside to close · local config"
+                                    } else {
+                                        "⌘K 开关 · 点击外部关闭 · 配置自动保存"
+                                    }),
                             ),
                     ),
             )
@@ -2334,29 +3988,70 @@ fn palette_row(
     in_watchlist: bool,
     row_id: u64,
     color_scheme: ColorScheme,
+    work_mode: bool,
+    reveal_identity: bool,
     cx: &mut Context<StockApp>,
 ) -> impl IntoElement {
     let code = sym.code.clone();
     let name = sym.name.to_string();
-    let code_show = sym.code.clone();
-    let name_show = sym.name.clone();
-    let board = sym.board.clone();
-    let last = format_price(sym.last);
-    let chg = format_pct(sym.change_pct);
-    let up = sym.is_up();
-    let chg_color = match color_scheme {
-        ColorScheme::Cn => {
-            if up {
-                cx.theme().red
-            } else {
-                cx.theme().green
-            }
+    let code_width = if work_mode && reveal_identity { 180.0 } else { 64.0 };
+    let code_show = if work_mode && reveal_identity {
+        if is_real_name(sym.name.as_ref(), &sym.code) {
+            format!("{} · {}", sym.name, sym.code)
+        } else {
+            sym.code.clone()
         }
-        ColorScheme::Us => {
-            if up {
-                cx.theme().green
-            } else {
-                cx.theme().red
+    } else if work_mode {
+        disguise_label(&sym.code, sym.name.as_ref())
+    } else {
+        sym.code.clone()
+    };
+    let name_show = if work_mode {
+        shared("series")
+    } else {
+        sym.name.clone()
+    };
+    let board = if work_mode {
+        shared("svc")
+    } else {
+        sym.board.clone()
+    };
+    let last = if work_mode {
+        if sym.last > 0.0 {
+            format!("{}ms", format_price(sym.last))
+        } else {
+            "--".into()
+        }
+    } else {
+        format_price(sym.last)
+    };
+    let chg = if work_mode {
+        format!("{:+.2}", sym.change_pct)
+    } else {
+        format_pct(sym.change_pct)
+    };
+    let up = sym.is_up();
+    let chg_color = if work_mode {
+        if up {
+            cx.theme().muted_foreground
+        } else {
+            cx.theme().muted_foreground.opacity(0.65)
+        }
+    } else {
+        match color_scheme {
+            ColorScheme::Cn => {
+                if up {
+                    cx.theme().red
+                } else {
+                    cx.theme().green
+                }
+            }
+            ColorScheme::Us => {
+                if up {
+                    cx.theme().green
+                } else {
+                    cx.theme().red
+                }
             }
         }
     };
@@ -2380,7 +4075,7 @@ fn palette_row(
         }))
         .child(
             div()
-                .w(px(64.))
+                .w(px(code_width))
                 .text_sm()
                 .font_semibold()
                 .text_color(cx.theme().foreground)
@@ -2421,9 +4116,60 @@ fn palette_row(
                 div()
                     .text_xs()
                     .text_color(cx.theme().accent)
-                    .child("添加"),
+                    .child(if work_mode { "attach" } else { "添加" }),
             )
         })
+}
+
+/// Host metric bar: shows `value_text` (e.g. +0.52%), bar fill 0–100, hover → real index.
+fn sys_gauge(
+    id: u64,
+    label: &str,
+    value_text: String,
+    bar_pct: f64,
+    tooltip_text: String,
+    cx: &App,
+) -> impl IntoElement {
+    let bar_pct = bar_pct.clamp(0.0, 100.0);
+    let fill_w = (bar_pct / 100.0 * 140.0) as f32;
+    let tip = tooltip_text.clone();
+    h_flex()
+        .id(("sys-gauge", id))
+        .w_full()
+        .items_center()
+        .gap_2()
+        .cursor_default()
+        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+        .child(
+            div()
+                .w(px(36.))
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .h(px(8.))
+                .rounded_full()
+                .bg(cx.theme().muted.opacity(0.55))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .h_full()
+                        .w(px(fill_w))
+                        .rounded_full()
+                        .bg(cx.theme().blue.opacity(0.85)),
+                ),
+        )
+        .child(
+            div()
+                .w(px(112.))
+                .whitespace_nowrap()
+                .text_xs()
+                .text_color(cx.theme().foreground)
+                .child(value_text),
+        )
 }
 
 fn detail_row(label: &str, value: &str, cx: &App) -> impl IntoElement {
@@ -2466,6 +4212,7 @@ impl Render for StockApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let left_w = self.left_width;
         let bottom_h = self.bottom_height;
+        let work = self.work_mode;
 
         div()
             .relative()
@@ -2481,33 +4228,95 @@ impl Render for StockApp {
                 this.refresh_all(cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleTreasure, _w, cx| {
-                this.toggle_treasure_tab(cx);
+                // Treasure UI is hidden in work mode; ignore hotkey there.
+                if !this.work_mode {
+                    this.toggle_treasure_tab(cx);
+                }
             }))
-            .child(self.render_title_bar(cx))
+            .on_action(cx.listener(|this, _: &ToggleWorkMode, window, cx| {
+                this.toggle_work_mode(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSettings, _w, cx| {
+                this.toggle_settings(cx);
+            }))
+            .on_action(cx.listener(|this, _: &DismissOverlay, _w, cx| {
+                this.dismiss_overlay(cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectPrevSymbol, _w, cx| {
+                if !this.palette_open && !this.settings_open {
+                    this.select_adjacent_symbol(-1, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SelectNextSymbol, _w, cx| {
+                if !this.palette_open && !this.settings_open {
+                    this.select_adjacent_symbol(1, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ResetChartZoom, _w, cx| {
+                this.reset_chart_view();
+                this.hover_ix = None;
+                cx.notify();
+            }))
+            // Explicit height so the bar always reserves space (avoids list under traffic lights).
             .child(
-                div().flex_1().min_h_0().w_full().child(
-                    h_resizable("main-h")
-                        .child(
-                            resizable_panel()
-                                .size(px(left_w))
-                                .size_range(px(200.)..px(440.))
-                                .child(self.render_left_panel(cx)),
-                        )
-                        .child(
-                            resizable_panel().child(
-                                v_resizable("main-v")
-                                    .child(resizable_panel().child(self.render_chart_area(cx)))
-                                    .child(
-                                        resizable_panel()
-                                            .size(px(bottom_h.max(160.0)))
-                                            .size_range(px(140.)..px(420.))
-                                            .child(self.render_detail_panel(cx)),
-                                    ),
-                            ),
-                        ),
-                ),
+                div()
+                    .w_full()
+                    .h(TITLE_BAR_HEIGHT)
+                    .flex_shrink_0()
+                    .overflow_hidden()
+                    .child(self.render_title_bar(cx)),
             )
+            .child(if work {
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_hidden()
+                    .child(self.render_work_dashboard(cx))
+                    .into_any_element()
+            } else {
+                let entity_h = cx.entity().clone();
+                let entity_v = cx.entity().clone();
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_hidden()
+                    .child(
+                        h_resizable("main-h")
+                            .on_resize(move |state, _window, cx| {
+                                entity_h.update(cx, |this, cx| {
+                                    this.on_main_h_resize(state, cx);
+                                });
+                            })
+                            .child(
+                                resizable_panel()
+                                    .size(px(left_w))
+                                    .size_range(px(200.)..px(440.))
+                                    .child(self.render_left_panel(cx)),
+                            )
+                            .child(
+                                resizable_panel().child(
+                                    v_resizable("main-v")
+                                        .on_resize(move |state, _window, cx| {
+                                            entity_v.update(cx, |this, cx| {
+                                                this.on_main_v_resize(state, cx);
+                                            });
+                                        })
+                                        .child(resizable_panel().child(self.render_chart_area(cx)))
+                                        .child(
+                                            resizable_panel()
+                                                .size(px(bottom_h.max(160.0)))
+                                                .size_range(px(140.)..px(420.))
+                                                .child(self.render_detail_panel(cx)),
+                                        ),
+                                ),
+                            ),
+                    )
+                    .into_any_element()
+            })
             .when(self.palette_open, |this| this.child(self.render_palette(cx)))
+            .when(self.settings_open, |this| this.child(self.render_settings(cx)))
             .children(Root::render_dialog_layer(window, cx))
     }
 }
@@ -2536,6 +4345,20 @@ pub fn run() {
             #[cfg(not(target_os = "macos"))]
             KeyBinding::new("ctrl-t", ToggleTreasure, None),
             #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-shift-w", ToggleWorkMode, None),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-shift-w", ToggleWorkMode, None),
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-,", ToggleSettings, None),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-,", ToggleSettings, None),
+            KeyBinding::new("escape", DismissOverlay, None),
+            KeyBinding::new("up", SelectPrevSymbol, None),
+            KeyBinding::new("down", SelectNextSymbol, None),
+            KeyBinding::new("k", SelectPrevSymbol, None),
+            KeyBinding::new("j", SelectNextSymbol, None),
+            KeyBinding::new("0", ResetChartZoom, None),
+            #[cfg(target_os = "macos")]
             KeyBinding::new("cmd-q", Quit, None),
             #[cfg(not(target_os = "macos"))]
             KeyBinding::new("alt-f4", Quit, None),
@@ -2554,8 +4377,8 @@ pub fn run() {
         cx.spawn(async move |cx| {
             cx.open_window(window_options, |window, cx| {
                 window.activate_window();
-                window.set_window_title("Stock Analysis · A股");
                 Theme::change(ThemeMode::Dark, Some(window), cx);
+                // Title is set inside StockApp::new (respects persisted work_mode).
                 let view = cx.new(|cx| StockApp::new(window, cx));
                 cx.new(|cx| Root::new(view, window, cx))
             })

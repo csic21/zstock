@@ -3,6 +3,73 @@
 use gpui::SharedString;
 use serde::{Deserialize, Serialize};
 
+/// Stable, non-reversible-looking service id for work mode.
+///
+/// The visible alias deliberately does not include the security code or name
+/// initials. It remains stable between launches so rows are still recognisable.
+pub fn disguise_label(code: &str, _name: &str) -> String {
+    const GROUP: &[&str] = &[
+        "api", "cache", "index", "queue", "relay", "search", "store", "stream",
+    ];
+    let h = fnv1a32(code.as_bytes());
+    let group = GROUP[(h as usize) % GROUP.len()];
+    let instance = ((h >> 8) ^ h) & 0x0fff;
+    format!("{group}-{instance:03x}")
+}
+
+fn fnv1a32(bytes: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for &b in bytes {
+        hash ^= u32::from(b);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+#[cfg(test)]
+mod disguise_tests {
+    use super::disguise_label;
+
+    #[test]
+    fn alias_is_stable_and_does_not_leak_identity() {
+        let alias = disguise_label("600519", "贵州茅台");
+        assert_eq!(alias, disguise_label("600519", "renamed"));
+        assert!(!alias.contains("600519"));
+        assert!(!alias.contains("gzmt"));
+        assert_ne!(alias, disguise_label("000001", "平安银行"));
+    }
+}
+
+/// Major A-share index snapshot (work-mode host gauges).
+#[derive(Debug, Clone, Copy)]
+pub struct IndexSnap {
+    pub last: f64,
+    pub change_pct: f64,
+}
+
+impl IndexSnap {
+    pub fn pct_label(self) -> String {
+        format!("{:+.2}%", self.change_pct)
+    }
+
+    pub fn point_label(self) -> String {
+        format!("{:.2}", self.last)
+    }
+}
+
+/// Rebase a price onto index base 100 (work mode — looks like a metric, not a quote).
+pub fn disguise_index(value: f64, base: f64) -> f64 {
+    if base > 1e-9 {
+        value / base * 100.0
+    } else {
+        value
+    }
+}
+
+pub fn format_index(value: f64) -> String {
+    format!("{value:.2}")
+}
+
 /// One row in the watchlist.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Symbol {
@@ -55,16 +122,13 @@ pub struct QuoteSnapshot {
 }
 
 impl QuoteSnapshot {
+    /// Snapshot from the **last** candle (当日/最近一根 OHLC)，不是整段区间极值。
     pub fn from_candles(candles: &[Candle]) -> Option<Self> {
-        let first = candles.first()?;
         let last = candles.last()?;
-        let high = candles.iter().map(|c| c.high).fold(f64::MIN, f64::max);
-        let low = candles.iter().map(|c| c.low).fold(f64::MAX, f64::min);
-        let volume = candles.iter().map(|c| c.volume).sum();
         let prev = candles
             .get(candles.len().saturating_sub(2))
             .map(|c| c.close)
-            .unwrap_or(first.open);
+            .unwrap_or(last.open);
         let change_pct = if prev > 0.0 {
             (last.close - prev) / prev * 100.0
         } else {
@@ -72,10 +136,10 @@ impl QuoteSnapshot {
         };
         Some(Self {
             open: last.open,
-            high,
-            low,
+            high: last.high,
+            low: last.low,
             close: last.close,
-            volume,
+            volume: last.volume,
             change_pct,
             prev_close: prev,
         })

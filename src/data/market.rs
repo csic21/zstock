@@ -4,9 +4,9 @@
 //! Daily K: Eastmoney (前复权) → Tencent (前复权, ≤~640)  
 //! Search: Eastmoney → Tencent SmartBox
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
-use crate::model::{board_for_code, shared, Candle, Symbol};
+use crate::model::{Candle, Symbol, board_for_code, shared};
 
 use super::eastmoney::{self, QuoteTick};
 use super::tencent;
@@ -28,6 +28,18 @@ fn quotes_usable(ticks: &[QuoteTick], requested: usize) -> bool {
         return true;
     }
     ticks.iter().any(|t| t.last > 0.0 || !t.name.is_empty())
+}
+
+/// 上证 / 沪深300 / 创业板 — Eastmoney only (indices).
+pub fn fetch_major_indices() -> Result<Sourced<Vec<QuoteTick>>> {
+    match eastmoney::fetch_major_indices() {
+        Ok(data) if !data.is_empty() => Ok(Sourced {
+            data,
+            source: SRC_EASTMONEY,
+        }),
+        Ok(_) => Err(anyhow!("指数行情为空")),
+        Err(e) => Err(e),
+    }
 }
 
 /// Batch quotes: Eastmoney → Tencent.
@@ -184,6 +196,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires public market-data network"]
     fn quotes_failover_works() {
         let codes = vec!["600519".into(), "000001".into()];
         let r = fetch_quotes(&codes).expect("quotes");
@@ -193,6 +206,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires public market-data network"]
     fn klines_failover_works() {
         let r = fetch_klines("600519", 30).expect("klines");
         assert!(!r.data.2.is_empty(), "source={}", r.source);
@@ -200,6 +214,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires public market-data network"]
     fn tencent_direct_works() {
         let r = tencent::fetch_klines("600519", 15).expect("tencent");
         assert!(r.2.len() >= 5);
