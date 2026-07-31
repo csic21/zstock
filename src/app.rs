@@ -20,13 +20,16 @@ use gpui_component::{
 };
 use gpui_component::tooltip::Tooltip;
 
-use crate::chart::{index_from_x, paint_chart, paint_sparkline, ChartPaintData, ChartStyle};
+use crate::chart::{
+    index_from_x, paint_chart, paint_sparkline, ChartPaintData, ChartStyle, MinutePaintData,
+};
 use crate::data::treasure::{self, fmt_dd, fmt_pos, TreasureHit, TREASURE_KLINE_LIMIT};
 use crate::data::universe::{self, TREASURE_SCAN_CAP, TREASURE_TOP_N};
 use crate::data::{indicators::MaSeries, market, signals};
+use crate::data::market::Sourced;
 use crate::model::{
     board_for_code, disguise_index, disguise_label, format_index, format_pct, format_price,
-    format_volume, shared, Candle, IndexSnap, QuoteSnapshot, Symbol,
+    format_volume, shared, Candle, IndexSnap, MinutePeriod, MinuteSeries, QuoteSnapshot, Symbol,
 };
 use crate::storage::{self, clamp_quote_interval_secs, AppConfig, ColorScheme, WatchlistSort};
 
@@ -112,6 +115,40 @@ impl ChartRange {
     }
 }
 
+/// 图表类型：分时 / 日 K / 分钟 K。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChartKind {
+    /// 分时（当日分钟线，腾讯 minute/query）。
+    Intraday,
+    /// 日 K（配合 `ChartRange` 选择窗口）。
+    DayK,
+    /// 分钟 K（1/5/15/30/60 分）。
+    MinuteK(MinutePeriod),
+}
+
+impl ChartKind {
+    fn from_label(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "intraday" | "分时" => Self::Intraday,
+            "m1" => Self::MinuteK(MinutePeriod::M1),
+            "m5" => Self::MinuteK(MinutePeriod::M5),
+            "m15" => Self::MinuteK(MinutePeriod::M15),
+            "m30" => Self::MinuteK(MinutePeriod::M30),
+            "m60" => Self::MinuteK(MinutePeriod::M60),
+            _ => Self::DayK,
+        }
+    }
+
+    fn to_label(self) -> &'static str {
+        match self {
+            Self::Intraday => "intraday",
+            Self::DayK => "day",
+            Self::MinuteK(p) => p.param(),
+        }
+    }
+
+}
+
 /// 左侧栏：自选 vs 寻宝鼠。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum LeftTab {
@@ -130,6 +167,13 @@ pub struct StockApp {
     candles: Vec<Candle>,
     ma: MaSeries,
     range: ChartRange,
+    chart_kind: ChartKind,
+    /// 分时数据（仅 Intraday 模式使用）。
+    minute: Option<MinuteSeries>,
+    /// Code that currently loaded `minute` belong to.
+    minute_code: Option<String>,
+    /// Monotonic token so stale async minute responses are dropped.
+    minute_gen: u64,
     show_ma5: bool,
     show_ma10: bool,
     show_ma20: bool,
@@ -252,6 +296,10 @@ impl StockApp {
             candles: Vec::new(),
             ma: MaSeries::default(),
             range,
+            chart_kind: ChartKind::from_label(&cfg.chart_kind),
+            minute: None,
+            minute_code: None,
+            minute_gen: 0,
             show_ma5: cfg.show_ma5,
             show_ma10: cfg.show_ma10,
             show_ma20: cfg.show_ma20,
@@ -471,25 +519,103 @@ impl StockApp {
             }
         })
         .detach();
+
+        // 分时自动刷新（仅 Intraday 模式）。
+        self.spawn_minute_refresh_loop(cx);
+    }
+
+    // 分时自动刷新：仅 Intraday 模式生效，约每 5 秒补一根新分钟线。
+    // 分时刷新在 quote loop 之外单独跑，避免拖慢行情轮询。
+    fn spawn_minute_refresh_loop(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let mut delay = Duration::from_secs(5);
+            loop {
+                Timer::after(delay).await;
+                let is_intraday = this
+                    .read_with(cx, |app, _| {
+                        matches!(app.chart_kind, ChartKind::Intraday)
+                    })
+                    .unwrap_or(false);
+                if !is_intraday {
+                    delay = Duration::from_secs(5);
+                    continue;
+                }
+                let selected = match this.read_with(cx, |app, _| app.selected.to_string()) {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                if selected.is_empty() {
+                    continue;
+                }
+                let fetch_code = selected.clone();
+                let result =
+                    smol::unblock(move || market::fetch_minute_series(&fetch_code)).await;
+                let ok = this.update(cx, |app, cx| {
+                    if !matches!(app.chart_kind, ChartKind::Intraday)
+                        || app.selected.as_ref() != selected
+                    {
+                        return;
+                    }
+                    if let Ok(sourced) = result {
+                        app.apply_minute(&selected, sourced.data);
+                        cx.notify();
+                    }
+                });
+                if ok.is_err() {
+                    break;
+                }
+                delay = Duration::from_secs(5);
+            }
+        })
+        .detach();
     }
 
     fn refresh_all(&mut self, cx: &mut Context<Self>) {
         let codes: Vec<String> = self.symbols.iter().map(|s| s.code.clone()).collect();
         let selected = self.selected.to_string();
-        let bars = self.range.bars();
+        let bars = self.current_bars();
+        let is_intraday = matches!(self.chart_kind, ChartKind::Intraday);
+        let minute_period = match self.chart_kind {
+            ChartKind::MinuteK(p) => Some(p),
+            ChartKind::DayK | ChartKind::Intraday => None,
+        };
+        let req_kind = self.chart_kind;
         self.kline_gen = self.kline_gen.wrapping_add(1);
         let req_gen = self.kline_gen;
         // Keep previous candles painted until the new series arrives (no blank flash).
         self.hover_ix = None;
         self.loading = true;
-        self.status = shared("加载中…");
+        self.status = shared(if is_intraday {
+            format!("加载 {selected} 分时…")
+        } else {
+            "加载中…".into()
+        });
         cx.notify();
 
         cx.spawn(async move |this, cx| {
             let codes2 = codes.clone();
             let req_code = selected.clone();
             let quotes = smol::unblock(move || market::hydrate_symbols(&codes2)).await;
-            let kline = smol::unblock(move || market::fetch_klines(&selected, bars)).await;
+            let minute = if is_intraday {
+                let c = selected.clone();
+                Some(smol::unblock(move || market::fetch_minute_series(&c)).await)
+            } else {
+                None
+            };
+            let kline = if is_intraday {
+                None
+            } else if let Some(p) = minute_period {
+                let code = selected.clone();
+                Some(smol::unblock(move || {
+                    market::fetch_minute_klines(&code, p, bars).map(|s| Sourced {
+                        data: (code.clone(), String::new(), s.data),
+                        source: s.source,
+                    })
+                })
+                .await)
+            } else {
+                Some(smol::unblock(move || market::fetch_klines(&selected, bars)).await)
+            };
 
             this.update(cx, |app, cx| {
                 let mut quote_src = None;
@@ -522,24 +648,49 @@ impl StockApp {
                     }
                 }
                 // Drop stale kline if user switched while we were loading
-                if req_gen != app.kline_gen || app.selected.as_ref() != req_code {
+                if req_gen != app.kline_gen
+                    || app.selected.as_ref() != req_code
+                    || app.chart_kind != req_kind
+                {
                     return;
                 }
-                match kline {
-                    Ok(sourced) => {
-                        let (_resp_code, name, candles) = sourced.data;
-                        app.apply_klines(&req_code, name, candles);
-                        app.status = shared(format!(
-                            "已加载 {} · {} 根K线 · 行情{} · K线{} · {}",
-                            req_code,
-                            app.candles.len(),
-                            quote_src.unwrap_or("—"),
-                            sourced.source,
-                            chrono::Local::now().format("%H:%M:%S")
-                        ));
+                if is_intraday {
+                    match minute {
+                        Some(Ok(sourced)) => {
+                            let name = sourced.data.name.clone();
+                            app.apply_minute(&req_code, sourced.data);
+                            app.status = shared(format!(
+                                "已加载 {} · 分时 {} · 行情{} · {} · {}",
+                                req_code,
+                                name,
+                                quote_src.unwrap_or("—"),
+                                sourced.source,
+                                chrono::Local::now().format("%H:%M:%S")
+                            ));
+                        }
+                        Some(Err(e)) => {
+                            app.status = shared(format!("分时加载失败: {e}"));
+                        }
+                        None => {}
                     }
-                    Err(e) => {
-                        app.status = shared(format!("K线加载失败: {e}"));
+                } else {
+                    match kline {
+                        Some(Ok(sourced)) => {
+                            let (_resp_code, name, candles) = sourced.data;
+                            app.apply_klines(&req_code, name, candles);
+                            app.status = shared(format!(
+                                "已加载 {} · {} 根K线 · 行情{} · K线{} · {}",
+                                req_code,
+                                app.candles.len(),
+                                quote_src.unwrap_or("—"),
+                                sourced.source,
+                                chrono::Local::now().format("%H:%M:%S")
+                            ));
+                        }
+                        Some(Err(e)) => {
+                            app.status = shared(format!("K线加载失败: {e}"));
+                        }
+                        None => {}
                     }
                 }
                 app.loading = false;
@@ -579,6 +730,50 @@ impl StockApp {
         self.ma = MaSeries::from_candles(&self.candles);
         self.hover_ix = None;
         self.reset_chart_view();
+    }
+
+    fn apply_minute(&mut self, code: &str, series: MinuteSeries) {
+        // Periodic refresh of the same code keeps the user's zoom/pan window.
+        let same_series = self.minute_code.as_deref() == Some(code) && self.minute.is_some();
+        if let Some(sym) = self.symbols.iter_mut().find(|s| s.code == code) {
+            if is_real_name(&series.name, code) {
+                sym.name = shared(series.name.clone());
+            }
+            if sym.last <= 0.0 {
+                if let Some(snap) = series.snapshot() {
+                    sym.last = snap.close;
+                    sym.change_pct = snap.change_pct;
+                    sym.volume = snap.volume;
+                }
+            }
+        }
+        self.candles = series.as_candles();
+        self.candles_code = Some(code.to_string());
+        self.minute = Some(series);
+        self.minute_code = Some(code.to_string());
+        self.ma = MaSeries::default();
+        self.hover_ix = None;
+        if !same_series {
+            self.reset_chart_view();
+        }
+    }
+
+    /// Bars requested for the current chart kind.
+    fn current_bars(&self) -> usize {
+        match self.chart_kind {
+            ChartKind::Intraday => 0,
+            ChartKind::DayK => self.range.bars(),
+            ChartKind::MinuteK(p) => p.bars(),
+        }
+    }
+
+    /// Human label for the current chart, e.g. `日K · 3M`, `5分K`, `分时`.
+    fn chart_label(&self) -> String {
+        match self.chart_kind {
+            ChartKind::Intraday => "分时".into(),
+            ChartKind::DayK => format!("日K · {}", self.range.label()),
+            ChartKind::MinuteK(p) => format!("{}K", p.label()),
+        }
     }
 
     fn reset_chart_view(&mut self) {
@@ -733,20 +928,39 @@ impl StockApp {
 
     fn reload_klines(&mut self, cx: &mut Context<Self>) {
         let selected = self.selected.to_string();
-        let bars = self.range.bars();
+        let bars = self.current_bars();
+        let minute_period = match self.chart_kind {
+            ChartKind::MinuteK(p) => Some(p),
+            ChartKind::DayK | ChartKind::Intraday => None,
+        };
+        let req_kind = self.chart_kind;
         self.kline_gen = self.kline_gen.wrapping_add(1);
         let req_gen = self.kline_gen;
         // Keep last series visible while loading (header uses live quote + loading flag).
         self.hover_ix = None;
         self.loading = true;
-        self.status = shared(format!("加载 {selected} K线…"));
+        self.status = shared(format!("加载 {selected} {}…", self.chart_label()));
         cx.notify();
 
         cx.spawn(async move |this, cx| {
             let req_code = selected.clone();
-            let result = smol::unblock(move || market::fetch_klines(&selected, bars)).await;
+            let result = if let Some(p) = minute_period {
+                let code = selected.clone();
+                smol::unblock(move || {
+                    market::fetch_minute_klines(&code, p, bars).map(|s| Sourced {
+                        data: (code.clone(), String::new(), s.data),
+                        source: s.source,
+                    })
+                })
+                .await
+            } else {
+                smol::unblock(move || market::fetch_klines(&selected, bars)).await
+            };
             this.update(cx, |app, cx| {
-                if req_gen != app.kline_gen || app.selected.as_ref() != req_code {
+                if req_gen != app.kline_gen
+                    || app.selected.as_ref() != req_code
+                    || app.chart_kind != req_kind
+                {
                     // A newer request is in flight / selection changed
                     return;
                 }
@@ -755,14 +969,15 @@ impl StockApp {
                         let (_resp_code, name, candles) = sourced.data;
                         app.apply_klines(&req_code, name, candles);
                         app.status = shared(format!(
-                            "{} · {} 根K线 · {}",
+                            "{} · {} 根 {} · {}",
                             req_code,
                             app.candles.len(),
+                            app.chart_label(),
                             sourced.source
                         ));
                     }
                     Err(e) => {
-                        app.status = shared(format!("K线失败: {e}"));
+                        app.status = shared(format!("{}加载失败: {e}", app.chart_label()));
                     }
                 }
                 app.loading = false;
@@ -774,11 +989,70 @@ impl StockApp {
         .detach();
     }
 
+    fn reload_minute(&mut self, cx: &mut Context<Self>) {
+        let selected = self.selected.to_string();
+        self.minute_gen = self.minute_gen.wrapping_add(1);
+        let req_gen = self.minute_gen;
+        self.hover_ix = None;
+        self.loading = true;
+        self.status = shared(format!("加载 {selected} 分时…"));
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let req_code = selected.clone();
+            let result = smol::unblock(move || market::fetch_minute_series(&selected)).await;
+            this.update(cx, |app, cx| {
+                if req_gen != app.minute_gen
+                    || app.selected.as_ref() != req_code
+                    || !matches!(app.chart_kind, ChartKind::Intraday)
+                {
+                    return;
+                }
+                match result {
+                    Ok(sourced) => {
+                        app.apply_minute(&req_code, sourced.data);
+                        app.status = shared(format!(
+                            "{} · 分时 {} 点 · {}",
+                            req_code,
+                            app.minute.as_ref().map(|m| m.points.len()).unwrap_or(0),
+                            sourced.source
+                        ));
+                    }
+                    Err(e) => {
+                        app.status = shared(format!("分时失败: {e}"));
+                    }
+                }
+                app.loading = false;
+                app.persist();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn reload_chart(&mut self, cx: &mut Context<Self>) {
+        match self.chart_kind {
+            ChartKind::Intraday => self.reload_minute(cx),
+            ChartKind::DayK | ChartKind::MinuteK(_) => self.reload_klines(cx),
+        }
+    }
+
+    fn set_chart_kind(&mut self, kind: ChartKind, cx: &mut Context<Self>) {
+        if self.chart_kind == kind {
+            return;
+        }
+        self.chart_kind = kind;
+        self.persist();
+        self.reload_chart(cx);
+    }
+
     fn persist(&self) {
         let cfg = AppConfig {
             watchlist: self.symbols.iter().map(|s| s.code.clone()).collect(),
             selected: self.selected.to_string(),
             range: self.range.label().into(),
+            chart_kind: self.chart_kind.to_label().into(),
             show_ma5: self.show_ma5,
             show_ma10: self.show_ma10,
             show_ma20: self.show_ma20,
@@ -985,7 +1259,7 @@ impl StockApp {
         self.selected = code;
         self.palette_open = false;
         self.persist();
-        self.reload_klines(cx);
+        self.reload_chart(cx);
     }
 
     /// 从寻宝列表点选：必要时临时加入自选，并切到 3Y 以便对照多年高低。
@@ -1012,6 +1286,8 @@ impl StockApp {
         if !matches!(self.range, ChartRange::Y3 | ChartRange::Max) {
             self.range = ChartRange::Y3;
         }
+        // 多年对照需要日 K 视图；分时/分钟K 自动切回日 K。
+        self.chart_kind = ChartKind::DayK;
         self.left_tab = LeftTab::Treasure;
         self.persist();
         self.select_symbol(shared(code.clone()), cx);
@@ -1367,10 +1643,11 @@ impl StockApp {
     }
 
     fn set_range(&mut self, range: ChartRange, cx: &mut Context<Self>) {
-        if self.range == range {
+        if self.range == range && matches!(self.chart_kind, ChartKind::DayK) {
             return;
         }
         self.range = range;
+        self.chart_kind = ChartKind::DayK;
         self.persist();
         self.reload_klines(cx);
     }
@@ -1437,8 +1714,17 @@ impl StockApp {
             .candles_code
             .as_ref()
             .is_some_and(|c| c == self.selected.as_ref());
+        let minute_matched = matches!(self.chart_kind, ChartKind::Intraday)
+            && self
+                .minute_code
+                .as_ref()
+                .is_some_and(|c| c == self.selected.as_ref());
         // While loading a new series, keep painting the previous candles to avoid a blank flash.
-        let show_series = matched || (self.loading && !self.candles.is_empty());
+        let show_series = if matches!(self.chart_kind, ChartKind::Intraday) {
+            minute_matched && matched
+        } else {
+            matched || (self.loading && !self.candles.is_empty())
+        };
         let (start, end) = if show_series {
             self.chart_visible_range()
         } else {
@@ -1466,9 +1752,15 @@ impl StockApp {
             None
         };
         let work = self.work_mode;
+        let minute = if matches!(self.chart_kind, ChartKind::Intraday) {
+            self.minute_paint_data(cx)
+        } else {
+            None
+        };
         ChartPaintData {
             candles,
             ma,
+            minute,
             show_ma5: self.show_ma5,
             show_ma10: self.show_ma10,
             show_ma20: self.show_ma20,
@@ -1512,6 +1804,62 @@ impl StockApp {
             crosshair: theme.muted_foreground.opacity(0.7),
             axis_color: theme.muted_foreground,
         }
+    }
+
+    fn minute_paint_data(&self, cx: &App) -> Option<MinutePaintData> {
+        let theme = cx.theme();
+        let matched = self
+            .minute_code
+            .as_ref()
+            .is_some_and(|c| c == self.selected.as_ref())
+            && self
+                .candles_code
+                .as_ref()
+                .is_some_and(|c| c == self.selected.as_ref());
+        if !matched {
+            return None;
+        }
+        let m = self.minute.as_ref()?;
+        if m.is_empty() {
+            return None;
+        }
+        let (start, end) = self.chart_visible_range();
+        if start >= end || end > m.points.len() {
+            return None;
+        }
+        let mut prices = Vec::with_capacity(end - start);
+        let mut avg = Vec::with_capacity(end - start);
+        let mut volumes = Vec::with_capacity(end - start);
+        for i in start..end {
+            let p = &m.points[i];
+            prices.push(p.price);
+            avg.push(p.avg_price());
+            volumes.push(p.minute_volume(i.checked_sub(1).map(|j| &m.points[j])));
+        }
+        let hover_ix = self.hover_ix.and_then(|ix| {
+            if ix >= start && ix < end {
+                Some(ix - start)
+            } else {
+                None
+            }
+        });
+        Some(MinutePaintData {
+            prices,
+            avg,
+            volumes,
+            prev_close: m.prev_close,
+            hover_ix,
+            bullish: self.chg_color(true, cx),
+            bearish: self.chg_color(false, cx),
+            avg_color: if self.work_mode {
+                theme.muted_foreground.opacity(0.85)
+            } else {
+                theme.yellow
+            },
+            border: theme.border,
+            crosshair: theme.muted_foreground.opacity(0.7),
+            axis_color: theme.muted_foreground,
+        })
     }
 
     /// Display id: real code, or stable camouflage label in work mode.
@@ -3133,7 +3481,12 @@ impl StockApp {
             .as_ref()
             .is_some_and(|c| c == self.selected.as_ref());
         let snap = if candles_match {
-            QuoteSnapshot::from_candles(&self.candles)
+            match self.chart_kind {
+                ChartKind::Intraday => self.minute.as_ref().and_then(|m| m.snapshot()),
+                ChartKind::DayK | ChartKind::MinuteK(_) => {
+                    QuoteSnapshot::from_candles(&self.candles)
+                }
+            }
         } else {
             None
         };
@@ -3277,11 +3630,15 @@ impl StockApp {
                                 .child(if self.loading {
                                     if work {
                                         "Loading series…"
+                                    } else if matches!(self.chart_kind, ChartKind::Intraday) {
+                                        "分时加载中…"
                                     } else {
                                         "K线加载中…"
                                     }
                                 } else if work {
                                     "No series data"
+                                } else if matches!(self.chart_kind, ChartKind::Intraday) {
+                                    "暂无分时数据"
                                 } else {
                                     "暂无匹配的 K 线"
                                 })
@@ -3291,50 +3648,90 @@ impl StockApp {
                         h_flex()
                             .gap_1()
                             .items_center()
-                            .child(self.ma_toggle(
-                                "ma5",
-                                if work { "L1" } else { "MA5" },
-                                self.show_ma5,
-                                cx,
-                            ))
-                            .child(self.ma_toggle(
-                                "ma10",
-                                if work { "L2" } else { "MA10" },
-                                self.show_ma10,
-                                cx,
-                            ))
-                            .child(self.ma_toggle(
-                                "ma20",
-                                if work { "L3" } else { "MA20" },
-                                self.show_ma20,
-                                cx,
-                            ))
-                            .child(self.ma_toggle(
-                                "ma60",
-                                if work { "L4" } else { "MA60" },
-                                self.show_ma60,
-                                cx,
-                            ))
-                            .when(!work, |row| {
-                                row.child(self.ma_toggle(
-                                    "vol",
-                                    "VOL",
-                                    self.show_volume,
-                                    cx,
-                                ))
-                            })
+                            .when(
+                                !matches!(self.chart_kind, ChartKind::Intraday),
+                                |row| {
+                                    row.child(self.ma_toggle(
+                                        "ma5",
+                                        if work { "L1" } else { "MA5" },
+                                        self.show_ma5,
+                                        cx,
+                                    ))
+                                    .child(self.ma_toggle(
+                                        "ma10",
+                                        if work { "L2" } else { "MA10" },
+                                        self.show_ma10,
+                                        cx,
+                                    ))
+                                    .child(self.ma_toggle(
+                                        "ma20",
+                                        if work { "L3" } else { "MA20" },
+                                        self.show_ma20,
+                                        cx,
+                                    ))
+                                    .child(self.ma_toggle(
+                                        "ma60",
+                                        if work { "L4" } else { "MA60" },
+                                        self.show_ma60,
+                                        cx,
+                                    ))
+                                    .when(!work, |row| {
+                                        row.child(self.ma_toggle(
+                                            "vol",
+                                            "VOL",
+                                            self.show_volume,
+                                            cx,
+                                        ))
+                                    })
+                                },
+                            )
                             .child(div().w(px(8.)))
-                            .children(ChartRange::all().map(|range| {
-                                let active = self.range == range;
-                                Button::new(("range", range as u32))
-                                    .xsmall()
-                                    .when(active, |b| b.primary())
-                                    .when(!active, |b| b.ghost())
-                                    .label(range.label())
-                                    .on_click(cx.listener(move |this, _, _w, cx| {
-                                        this.set_range(range, cx);
+                            .child(self.kind_button("分时", ChartKind::Intraday, cx))
+                            .child(self.kind_button("日K", ChartKind::DayK, cx))
+                            .child(
+                                self.kind_button(
+                                    "分钟",
+                                    ChartKind::MinuteK(self.current_minute_period()),
+                                    cx,
+                                ),
+                            )
+                            .when(matches!(self.chart_kind, ChartKind::DayK), |row| {
+                                row.child(div().w(px(8.)))
+                                    .children(ChartRange::all().map(|range| {
+                                        let active = self.range == range;
+                                        Button::new(("range", range as u32))
+                                            .xsmall()
+                                            .when(active, |b| b.primary())
+                                            .when(!active, |b| b.ghost())
+                                            .label(range.label())
+                                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                                this.set_range(range, cx);
+                                            }))
                                     }))
-                            })),
+                            })
+                            .when(
+                                matches!(self.chart_kind, ChartKind::MinuteK(_)),
+                                |row| {
+                                    row.child(div().w(px(8.)))
+                                        .children(MinutePeriod::all().map(|p| {
+                                            let active =
+                                                self.chart_kind == ChartKind::MinuteK(p);
+                                            Button::new(("mperiod", p as u32))
+                                                .xsmall()
+                                                .when(active, |b| b.primary())
+                                                .when(!active, |b| b.ghost())
+                                                .label(p.label())
+                                                .on_click(cx.listener(
+                                                    move |this, _, _w, cx| {
+                                                        this.set_chart_kind(
+                                                            ChartKind::MinuteK(p),
+                                                            cx,
+                                                        );
+                                                    },
+                                                ))
+                                        }))
+                                },
+                            ),
                     ),
             )
             // hover strip
@@ -3440,12 +3837,71 @@ impl StockApp {
             }))
     }
 
+    /// The minute period to select when the 分钟K button is pressed.
+    fn current_minute_period(&self) -> MinutePeriod {
+        match self.chart_kind {
+            ChartKind::MinuteK(p) => p,
+            _ => MinutePeriod::M5,
+        }
+    }
+
+    fn kind_button(
+        &self,
+        label: &'static str,
+        kind: ChartKind,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = self.chart_kind == kind;
+        Button::new(kind.to_label())
+            .xsmall()
+            .when(active, |b| b.primary())
+            .when(!active, |b| b.ghost())
+            .label(label)
+            .on_click(cx.listener(move |this, _, _w, cx| {
+                this.set_chart_kind(kind, cx);
+            }))
+    }
+
     fn render_hover_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let candles_match = self
             .candles_code
             .as_ref()
             .is_some_and(|c| c == self.selected.as_ref());
         let work = self.work_mode;
+        if candles_match && matches!(self.chart_kind, ChartKind::Intraday) {
+            if let Some(ix) = self.hover_ix {
+                if let (Some(m), Some(p)) = (self.minute.as_ref(), self.minute.as_ref().and_then(|m| m.points.get(ix))) {
+                    let color = self.chg_color(p.price >= m.prev_close, cx);
+                    let vol = p.minute_volume(ix.checked_sub(1).map(|j| &m.points[j]));
+                    return h_flex()
+                        .gap_2()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(
+                            div()
+                                .font_semibold()
+                                .text_color(cx.theme().foreground)
+                                .child(p.time.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_color(color)
+                                .child(format!("价 {}", format_price(p.price))),
+                        )
+                        .child(format!("均价 {}", format_price(p.avg_price())))
+                        .child(format!(
+                            "涨跌 {}",
+                            format_pct(if m.prev_close > 0.0 {
+                                (p.price - m.prev_close) / m.prev_close * 100.0
+                            } else {
+                                0.0
+                            })
+                        ))
+                        .child(format!("量 {}", format_volume(vol)))
+                        .into_any_element();
+                }
+            }
+        }
         if candles_match {
             if let Some(ix) = self.hover_ix {
                 if let Some(c) = self.candles.get(ix) {
@@ -3519,7 +3975,30 @@ impl StockApp {
             }
         }
         let (vs, ve) = self.chart_visible_range();
-        let zoom_hint = if !self.candles.is_empty() && ve > vs {
+        let zoom_hint = if matches!(self.chart_kind, ChartKind::Intraday) {
+            if let Some(m) = self.minute.as_ref() {
+                let date = if m.date.len() >= 8 {
+                    format!("{}-{}-{}", &m.date[..4], &m.date[4..6], &m.date[6..8])
+                } else {
+                    m.date.clone()
+                };
+                if work {
+                    format!(
+                        "intraday {date} · {} pts · scroll/pinch zoom · pan · dblclick reset",
+                        m.points.len()
+                    )
+                } else {
+                    format!(
+                        "分时 {date} · {} 点 · 滚轮/捏合缩放 · 横向平移 · 双击重置",
+                        m.points.len()
+                    )
+                }
+            } else if work {
+                "intraday · scroll/pinch zoom · pan · dblclick reset".into()
+            } else {
+                "分时 · 滚轮/捏合缩放 · 横向平移 · 双击重置".into()
+            }
+        } else if !self.candles.is_empty() && ve > vs {
             let first = self.candles.get(vs).map(|c| c.date.as_ref()).unwrap_or("?");
             let last = self
                 .candles
@@ -3574,7 +4053,12 @@ impl StockApp {
             .as_ref()
             .is_some_and(|c| c == self.selected.as_ref());
         let snap = if candles_match {
-            QuoteSnapshot::from_candles(&self.candles)
+            match self.chart_kind {
+                ChartKind::Intraday => self.minute.as_ref().and_then(|m| m.snapshot()),
+                ChartKind::DayK | ChartKind::MinuteK(_) => {
+                    QuoteSnapshot::from_candles(&self.candles)
+                }
+            }
         } else {
             None
         };
@@ -3641,9 +4125,9 @@ impl StockApp {
                             .child(detail_row(
                                 if self.work_mode { "Range" } else { "周期" },
                                 &if self.work_mode {
-                                    format!("{} · {} pts", self.range.label(), self.candles.len())
+                                    format!("{} · {} pts", self.chart_label(), self.candles.len())
                                 } else {
-                                    format!("{} · {} 根", self.range.label(), self.candles.len())
+                                    format!("{} · {} 根", self.chart_label(), self.candles.len())
                                 },
                                 cx,
                             ))
@@ -4014,8 +4498,13 @@ impl StockApp {
 fn format_candle_date(raw: &str) -> String {
     let s = raw.trim();
     if s.len() >= 10 && s.as_bytes().get(4) == Some(&b'-') {
-        // 2026-07-29 → keep ISO; also accept already short forms
-        s[..10].to_string()
+        if s.len() > 10 && s.as_bytes().get(10) == Some(&b' ') {
+            // minute bar: `2026-07-31 15:00` → `07-31 15:00`
+            format!("{}{}", &s[5..10], &s[10..])
+        } else {
+            // 2026-07-29 → keep ISO; also accept already short forms
+            s[..10].to_string()
+        }
     } else if s.len() == 5 && s.contains('/') {
         // legacy MM/DD — cannot recover year
         s.to_string()

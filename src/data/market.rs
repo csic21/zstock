@@ -6,7 +6,7 @@
 
 use anyhow::{Result, anyhow};
 
-use crate::model::{Candle, Symbol, board_for_code, shared};
+use crate::model::{Candle, MinutePeriod, MinuteSeries, Symbol, board_for_code, shared};
 
 use super::eastmoney::{self, QuoteTick};
 use super::tencent;
@@ -120,6 +120,28 @@ pub fn fetch_klines(code: &str, limit: usize) -> Result<Sourced<(String, String,
     try_klines_chain(code, limit, &mut errors)
 }
 
+/// 分时（当日分钟线）：腾讯 `minute/query`。
+pub fn fetch_minute_series(code: &str) -> Result<Sourced<MinuteSeries>> {
+    let data = tencent::fetch_minute_series(code)?;
+    Ok(Sourced {
+        data,
+        source: SRC_TENCENT,
+    })
+}
+
+/// 分钟 K：腾讯 `mkline`（m1/m5/m15/m30/m60）。
+pub fn fetch_minute_klines(
+    code: &str,
+    period: MinutePeriod,
+    limit: usize,
+) -> Result<Sourced<Vec<Candle>>> {
+    let data = tencent::fetch_minute_klines(code, period, limit)?;
+    Ok(Sourced {
+        data,
+        source: SRC_TENCENT,
+    })
+}
+
 /// 历史低位比较专用：只走**前复权**源（东财 → 腾讯）。
 ///
 /// 腾讯日 K 上限约 640 根；东财可到约 1000。寻宝鼠优先东财长窗。
@@ -222,6 +244,34 @@ mod tests {
             "tencent direct n={} close={}",
             r.2.len(),
             r.2.last().unwrap().close
+        );
+    }
+
+    #[test]
+    #[ignore = "requires public market-data network"]
+    fn minute_series_works() {
+        let r = fetch_minute_series("600519").expect("minute series");
+        assert!(!r.data.is_empty(), "source={}", r.source);
+        assert_eq!(r.source, SRC_TENCENT);
+        eprintln!(
+            "minute series source={} pts={} prev_close={}",
+            r.source,
+            r.data.points.len(),
+            r.data.prev_close
+        );
+    }
+
+    #[test]
+    #[ignore = "requires public market-data network"]
+    fn minute_klines_works() {
+        let r = fetch_minute_klines("600519", MinutePeriod::M5, 30).expect("minute klines");
+        assert!(r.data.len() >= 5, "source={} n={}", r.source, r.data.len());
+        assert_eq!(r.source, SRC_TENCENT);
+        eprintln!(
+            "minute klines source={} n={} last={}",
+            r.source,
+            r.data.len(),
+            r.data.last().unwrap().close
         );
     }
 }

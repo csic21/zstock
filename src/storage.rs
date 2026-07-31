@@ -81,6 +81,9 @@ pub struct AppConfig {
     pub selected: String,
     /// `1M` | `3M` | `6M` | `1Y`
     pub range: String,
+    /// `intraday` | `day` | `m1` | `m5` | `m15` | `m30` | `m60`
+    #[serde(default = "default_chart_kind")]
+    pub chart_kind: String,
     pub show_ma5: bool,
     pub show_ma10: bool,
     pub show_ma20: bool,
@@ -111,6 +114,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_chart_kind() -> String {
+    "day".into()
+}
+
 fn default_quote_interval_secs() -> u64 {
     1
 }
@@ -128,6 +135,7 @@ impl Default for AppConfig {
             watchlist,
             selected,
             range: "3M".into(),
+            chart_kind: "day".into(),
             show_ma5: true,
             show_ma10: true,
             show_ma20: true,

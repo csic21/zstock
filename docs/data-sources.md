@@ -10,6 +10,7 @@
 |------|------|------|
 | 批量行情 | 东财 `ulist` | 腾讯 `qt.gtimg.cn` |
 | 历史日 K（前复权） | 东财 `fqt=1` | 腾讯 `newfqkline`（`qfq`，约 640 根上限；旧 `fqkline` 再兜底） |
+| 分时 / 分钟 K | —（暂未接入） | 腾讯 `minute/query` + `kline/mkline` |
 | 代码搜索 | 东财 suggest | 腾讯 SmartBox |
 | 宇宙榜单（寻宝池） | 东财 `clist` | —（失败回落内置池） |
 
@@ -48,9 +49,19 @@
 | 批量行情 | `https://qt.gtimg.cn/q=sh600519,sz000001`（`~` 分隔，GBK） |
 | 日 K | `https://web.ifzq.gtimg.cn/appstock/app/newfqkline/get?param={sym},day,,,{n},qfq` |
 | 日 K 兜底 | `https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=…` |
+| 分时 | `https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={sym}` |
+| 分钟 K | `https://ifzq.gtimg.cn/appstock/app/kline/mkline?param={sym},m1|m5|m15|m30|m60,,{n}` |
 | 搜索 | `https://smartbox.gtimg.cn/s3/?q=关键词&t=all` |
 
 实现：`eastmoney.rs`、`tencent.rs`；调度：`market.rs`。
+
+### 腾讯分时 / 分钟 K 说明
+
+- **分时**：`minute/query` 返回当日每分钟 `HHMM price cum_volume cum_amount`（累计手数 / 累计成交额），
+  由 `cum_amount / (cum_volume×100)` 客户端计算均价线；昨收取返回的 `qt` 字段（index 4），作为分时基准线。
+- **分钟 K**：`kline/mkline` 的 `m1/m5/m15/m30/m60` 返回 `[datetime, open, close, high, low, volume]`；
+  m1 单次约 320 根，m5–m60 约 800 根。分钟 K 复用日 K 的 MA / 缩放 / 十字线链路。
+- 分时在 Intraday 模式下约每 5 秒自动刷新一次；分钟 K 与日 K 一样按需加载、`⌘R` 刷新。
 
 ---
 
@@ -85,6 +96,8 @@
 ```
 Watchlist codes ──► market::fetch_quotes (东财→腾讯, 1s)      ──► 左侧列表报价
 Selected code  ──► market::fetch_klines (东财→腾讯)          ──► 日 K + MA
+Selected code  ──► market::fetch_minute_series (腾讯)       ──► 分时（价格/均价/基准线/量）
+Selected code  ──► market::fetch_minute_klines (腾讯)       ──► 1/5/15/30/60 分 K + MA
 ⌘K 搜索       ──► market::search (东财→腾讯 SmartBox)        ──► 添加自选
 寻宝鼠扫描    ──► market::fetch_klines_adjusted (东财→腾讯)  ──► treasure 评分
               ──► treasure_cache.json

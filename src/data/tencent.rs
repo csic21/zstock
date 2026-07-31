@@ -10,7 +10,9 @@
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 
-use crate::model::{Candle, Symbol, board_for_code, shared};
+use crate::model::{
+    Candle, MinutePeriod, MinutePoint, MinuteSeries, Symbol, board_for_code, shared,
+};
 
 use super::eastmoney::QuoteTick;
 
@@ -236,6 +238,161 @@ fn parse_klines_response(
     Ok((code.to_string(), name, candles))
 }
 
+/// 分时（当日分钟线），腾讯 `minute/query`。
+///
+/// 每行 `HHMM price cum_volume cum_amount`，其中 volume 为累计手数、amount 为累计成交额。
+pub fn fetch_minute_series(code: &str) -> Result<MinuteSeries> {
+    let code = code.trim();
+    let symbol = tencent_symbol(code);
+    let url = format!(
+        "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={symbol}"
+    );
+    let v = fetch_json(&url)?;
+    let node = v
+        .pointer(&format!("/data/{symbol}/data"))
+        .ok_or_else(|| anyhow!("腾讯分时无 data/{symbol}/data"))?;
+
+    let name = v
+        .pointer(&format!("/data/{symbol}/qt/{symbol}/1"))
+        .and_then(|x| x.as_str())
+        .unwrap_or(code)
+        .to_string();
+    let prev_close = v
+        .pointer(&format!("/data/{symbol}/qt/{symbol}/4"))
+        .and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse().ok())))
+        .unwrap_or(0.0);
+    let date = node
+        .get("date")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let rows = node
+        .get("data")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let points = parse_minute_rows(&rows);
+    if points.is_empty() {
+        return Err(anyhow!("腾讯分时为空 ({code})"));
+    }
+    Ok(MinuteSeries {
+        date,
+        points,
+        prev_close,
+        name,
+    })
+}
+
+/// `HHMM price cum_volume cum_amount` → points. Volume 为累计手数，amount 为累计成交额。
+fn parse_minute_rows(rows: &[Value]) -> Vec<MinutePoint> {
+    let mut points = Vec::with_capacity(rows.len());
+    for row in rows {
+        let s = row.as_str().unwrap_or_default();
+        let mut parts = s.split_whitespace();
+        let (Some(hhmm), Some(price), Some(cum_vol), Some(cum_amt)) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            continue;
+        };
+        let (Ok(price), Ok(cum_vol), Ok(cum_amt)) = (
+            price.parse::<f64>(),
+            cum_vol.parse::<f64>(),
+            cum_amt.parse::<f64>(),
+        ) else {
+            continue;
+        };
+        let time = if hhmm.len() == 4 {
+            format!("{}:{}", &hhmm[..2], &hhmm[2..])
+        } else {
+            hhmm.to_string()
+        };
+        points.push(MinutePoint {
+            time: shared(time),
+            price,
+            cum_volume: cum_vol as u64,
+            cum_amount: cum_amt,
+        });
+    }
+    points
+}
+
+/// 分钟 K（`mkline`）：m1/m5/m15/m30/m60，单次上限约 320/800 根。
+pub fn fetch_minute_klines(
+    code: &str,
+    period: MinutePeriod,
+    limit: usize,
+) -> Result<Vec<Candle>> {
+    let code = code.trim();
+    let symbol = tencent_symbol(code);
+    let limit = limit.clamp(5, period.bars());
+    let url = format!(
+        "https://ifzq.gtimg.cn/appstock/app/kline/mkline?param={symbol},{},,{limit}",
+        period.param()
+    );
+    let v = fetch_json(&url)?;
+    let series = v
+        .pointer(&format!("/data/{symbol}/{}", period.param()))
+        .and_then(|x| x.as_array())
+        .ok_or_else(|| anyhow!("腾讯分钟K无 data/{symbol}/{}", period.param()))?;
+
+    let mut candles = Vec::with_capacity(series.len());
+    for row in series {
+        let parts = match row {
+            Value::Array(a) => a,
+            _ => continue,
+        };
+        if parts.len() < 6 {
+            continue;
+        }
+        let ts = parts[0].as_str().unwrap_or_default();
+        if ts.is_empty() {
+            continue;
+        }
+        let num = |i: usize| -> f64 {
+            parts
+                .get(i)
+                .and_then(|x| {
+                    x.as_f64()
+                        .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+                })
+                .unwrap_or(0.0)
+        };
+        // `202607311500` → `2026-07-31 15:00`
+        candles.push(Candle {
+            date: shared(format_minute_label(ts)),
+            open: num(1),
+            close: num(2),
+            high: num(3),
+            low: num(4),
+            volume: num(5) as u64,
+        });
+    }
+    if candles.is_empty() {
+        return Err(anyhow!("腾讯分钟K为空 ({code} {})", period.param()));
+    }
+    Ok(candles)
+}
+
+fn format_minute_label(ts: &str) -> String {
+    let b = ts.as_bytes();
+    if b.len() >= 12 && b.iter().all(|c| c.is_ascii_digit()) {
+        format!(
+            "{}-{}-{} {}:{}",
+            &ts[..4],
+            &ts[4..6],
+            &ts[6..8],
+            &ts[8..10],
+            &ts[10..12]
+        )
+    } else {
+        ts.to_string()
+    }
+}
+
 /// SmartBox search (name / pinyin / code). Filters to A-share style 6-digit codes.
 pub fn search_symbols(query: &str, limit: usize) -> Result<Vec<Symbol>> {
     let q = query.trim();
@@ -413,6 +570,57 @@ mod tests {
     fn search_smoke() {
         let r = search_symbols("茅台", 8).expect("search");
         assert!(r.iter().any(|s| s.code == "600519"), "{r:?}");
+    }
+
+    #[test]
+    #[ignore = "requires public market-data network"]
+    fn minute_series_smoke() {
+        let s = fetch_minute_series("600519").expect("tencent minute series");
+        assert!(!s.points.is_empty());
+        assert!(s.prev_close > 0.0);
+        assert!(s.points[0].cum_volume > 0);
+        assert!(!s.points[0].time.is_empty());
+        eprintln!(
+            "tencent minute: date={} pts={} prev_close={} last={}",
+            s.date,
+            s.points.len(),
+            s.prev_close,
+            s.points.last().unwrap().price
+        );
+    }
+
+    #[test]
+    #[ignore = "requires public market-data network"]
+    fn minute_klines_smoke() {
+        for p in [
+            MinutePeriod::M1,
+            MinutePeriod::M5,
+            MinutePeriod::M15,
+            MinutePeriod::M30,
+            MinutePeriod::M60,
+        ] {
+            let c = fetch_minute_klines("600519", p, 30).expect("tencent minute klines");
+            assert!(c.len() >= 5, "{p:?} n={}", c.len());
+            let last = c.last().unwrap();
+            assert!(last.high >= last.low && last.close > 0.0, "{p:?}");
+            assert!(last.date.as_ref().contains(':'), "{}", last.date);
+        }
+        eprintln!("tencent minute klines ok");
+    }
+
+    #[test]
+    fn parse_minute_rows_offline() {
+        let rows: Vec<Value> = serde_json::from_str(
+            r#"["0930 1330.03 1191 158406573.03","0931 1327.77 3547 471549408.00","bad row"]"#,
+        )
+        .unwrap();
+        let points = parse_minute_rows(&rows);
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].time.as_ref(), "09:30");
+        assert!((points[0].price - 1330.03).abs() < 1e-6);
+        assert_eq!(points[0].cum_volume, 1191);
+        assert!((points[1].avg_price() - 471549408.0 / (3547.0 * 100.0)).abs() < 1e-6);
+        assert_eq!(points[1].minute_volume(Some(&points[0])), 3547 - 1191);
     }
 
     #[test]

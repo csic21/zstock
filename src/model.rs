@@ -109,6 +109,140 @@ pub struct Candle {
     pub volume: u64,
 }
 
+/// 分钟 K 周期（腾讯 `mkline` 支持 m1/m5/m15/m30/m60）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MinutePeriod {
+    M1,
+    M5,
+    M15,
+    M30,
+    M60,
+}
+
+impl MinutePeriod {
+    /// Endpoint param, e.g. `m5`.
+    pub fn param(self) -> &'static str {
+        match self {
+            Self::M1 => "m1",
+            Self::M5 => "m5",
+            Self::M15 => "m15",
+            Self::M30 => "m30",
+            Self::M60 => "m60",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::M1 => "1分",
+            Self::M5 => "5分",
+            Self::M15 => "15分",
+            Self::M30 => "30分",
+            Self::M60 => "60分",
+        }
+    }
+
+    /// Practical bar cap of the Tencent `mkline` endpoint per period.
+    pub fn bars(self) -> usize {
+        match self {
+            Self::M1 => 320,
+            Self::M5 | Self::M15 | Self::M30 | Self::M60 => 800,
+        }
+    }
+
+    pub fn all() -> [Self; 5] {
+        [Self::M1, Self::M5, Self::M15, Self::M30, Self::M60]
+    }
+}
+
+/// One minute of an intraday (分时) series.
+#[derive(Debug, Clone)]
+pub struct MinutePoint {
+    /// `HH:MM` clock label, e.g. `09:30`.
+    pub time: SharedString,
+    pub price: f64,
+    /// Cumulative volume (手) up to this minute.
+    pub cum_volume: u64,
+    /// Cumulative turnover (元) up to this minute.
+    pub cum_amount: f64,
+}
+
+impl MinutePoint {
+    /// Volume-weighted average price up to this minute (cum_amount / shares).
+    pub fn avg_price(&self) -> f64 {
+        let shares = self.cum_volume as f64 * 100.0;
+        if shares > 1e-9 {
+            self.cum_amount / shares
+        } else {
+            self.price
+        }
+    }
+
+    /// Volume traded in this minute vs the previous point.
+    pub fn minute_volume(&self, prev: Option<&MinutePoint>) -> u64 {
+        self.cum_volume.saturating_sub(prev.map(|p| p.cum_volume).unwrap_or(0))
+    }
+}
+
+/// Full-day intraday series from Tencent `minute/query`.
+#[derive(Debug, Clone, Default)]
+pub struct MinuteSeries {
+    /// Trading date `YYYYMMDD`.
+    pub date: String,
+    pub points: Vec<MinutePoint>,
+    /// Previous close (基准价).
+    pub prev_close: f64,
+    pub name: String,
+}
+
+impl MinuteSeries {
+    pub fn is_empty(&self) -> bool {
+        self.points.is_empty()
+    }
+
+    /// Convert points to Candle rows so the existing zoom / pan / hover machinery
+    /// can be reused (open=high=low=close=price, volume=per-minute volume).
+    pub fn as_candles(&self) -> Vec<Candle> {
+        let mut prev: Option<&MinutePoint> = None;
+        let mut out = Vec::with_capacity(self.points.len());
+        for p in &self.points {
+            let vol = p.minute_volume(prev);
+            out.push(Candle {
+                date: p.time.clone(),
+                open: p.price,
+                high: p.price,
+                low: p.price,
+                close: p.price,
+                volume: vol,
+            });
+            prev = Some(p);
+        }
+        out
+    }
+
+    /// Day snapshot: 开=首笔价, 高/低=全天极值, 收=最新价, 量=累计量, 涨跌 vs 昨收.
+    pub fn snapshot(&self) -> Option<QuoteSnapshot> {
+        let first = self.points.first()?;
+        let last = self.points.last()?;
+        let high = self.points.iter().map(|p| p.price).fold(f64::MIN, f64::max);
+        let low = self.points.iter().map(|p| p.price).fold(f64::MAX, f64::min);
+        let change_pct = if self.prev_close > 0.0 {
+            (last.price - self.prev_close) / self.prev_close * 100.0
+        } else {
+            0.0
+        };
+        Some(QuoteSnapshot {
+            open: first.price,
+            high,
+            low,
+            close: last.price,
+            volume: last.cum_volume,
+            change_pct,
+            prev_close: self.prev_close,
+        })
+    }
+}
+
 /// Header snapshot for the active symbol.
 #[derive(Debug, Clone, Default)]
 pub struct QuoteSnapshot {
