@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use gpui::{
-    actions, canvas, div, px, size, App, AppContext, Context, Entity, FocusHandle,
+    actions, canvas, div, point, px, size, App, AppContext, Bounds, Context, Entity, FocusHandle,
     InteractiveElement, IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
     ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString,
     StatefulInteractiveElement, Styled, Timer, Window, WindowBounds, WindowOptions,
@@ -22,18 +22,25 @@ use gpui_component::{
 use gpui_component::tooltip::Tooltip;
 
 use crate::chart::{
-    index_from_x, paint_chart, paint_sparkline, ChartPaintData, ChartStyle, MinutePaintData,
+    chart_layout, index_from_x, paint_chart, paint_sparkline, price_from_y, BollPaintData,
+    ChartPaintData, ChartStyle, MacdPaintData, MinutePaintData,
 };
 use crate::data::ai::{self, AiConfig, AiKind};
 use crate::data::treasure::{self, fmt_dd, fmt_pos, TreasureHit, TREASURE_KLINE_LIMIT};
-use crate::data::universe::{self, TREASURE_SCAN_CAP, TREASURE_TOP_N};
-use crate::data::{indicators::MaSeries, market, signals};
+use crate::data::universe::{self, FinFilter, TreasurePool, TREASURE_SCAN_CAP, TREASURE_TOP_N};
+use crate::data::{
+    indicators::{BollSeries, MaSeries, MacdSeries},
+    market, signals,
+};
 use crate::data::market::Sourced;
 use crate::model::{
     board_for_code, disguise_index, disguise_label, format_index, format_pct, format_price,
     format_volume, shared, Candle, IndexSnap, MinutePeriod, MinuteSeries, QuoteSnapshot, Symbol,
+    TrendLine,
 };
-use crate::storage::{self, clamp_quote_interval_secs, AppConfig, ColorScheme, WatchlistSort};
+use crate::storage::{
+    self, clamp_quote_interval_secs, AppConfig, ColorScheme, DockLayout, WatchlistSort,
+};
 use crate::update::{self, UpdateState};
 
 actions!(
@@ -170,9 +177,40 @@ enum AiPanelState {
     },
     Ready {
         text: SharedString,
+        /// 点评来源（本地规则 / LLM 模型），让用户一眼区分。
+        source: AiSource,
         /// 附加说明（例如 LLM 失败时标注“已回退本地规则”）。
         note: Option<SharedString>,
     },
+}
+
+/// 点评来源。
+#[derive(Debug, Clone)]
+enum AiSource {
+    Local,
+    Llm {
+        model: String,
+    },
+}
+
+impl AiSource {
+    fn label(&self, work: bool) -> SharedString {
+        match self {
+            Self::Local => shared(if work { "Local rules" } else { "本地规则" }),
+            Self::Llm { model } => shared(format!("LLM · {model}")),
+        }
+    }
+
+    fn is_llm(&self) -> bool {
+        matches!(self, Self::Llm { .. })
+    }
+}
+
+/// 内存缓存条目：文本 + 来源（LLM 成功后替换本地条目，来源随条目保存）。
+#[derive(Debug, Clone)]
+struct AiCacheEntry {
+    text: String,
+    source: AiSource,
 }
 
 pub struct StockApp {
@@ -197,6 +235,10 @@ pub struct StockApp {
     show_ma20: bool,
     show_ma60: bool,
     show_volume: bool,
+    show_macd: bool,
+    show_boll: bool,
+    macd: MacdSeries,
+    boll: BollSeries,
     hover_ix: Option<usize>,
     /// Visible window into `candles` for zoom/pan (inclusive start).
     chart_view_start: usize,
@@ -204,6 +246,18 @@ pub struct StockApp {
     chart_view_count: usize,
     chart_width: f32,
     chart_origin: Point<Pixels>,
+    /// Full bounds of the chart surface (for drawing line anchors).
+    chart_bounds: Bounds<Pixels>,
+    /// Drawing mode: drag on the chart to create trend/price lines.
+    drawing_mode: bool,
+    /// Anchor of the line being drawn (abs candle index, price).
+    drawing_anchor: Option<(usize, f64)>,
+    /// In-progress line preview while dragging.
+    draft_line: Option<TrendLine>,
+    /// Per-symbol persisted lines (index/price anchors).
+    chart_lines: std::collections::HashMap<String, Vec<TrendLine>>,
+    /// Next palette color index for newly drawn lines.
+    draw_color_ix: usize,
     status: SharedString,
     loading: bool,
     data_source: SharedString,
@@ -221,6 +275,10 @@ pub struct StockApp {
     filtered_local: Vec<usize>,
     left_width: f32,
     bottom_height: f32,
+    /// Full dock panel sizes (all groups), persisted.
+    dock: DockLayout,
+    /// Last-known window frame (x, y, w, h); persisted on change.
+    window_bounds: Option<(f32, f32, f32, f32)>,
     /// 涨跌配色：中国红涨绿跌 / 美国绿涨红跌
     color_scheme: ColorScheme,
     /// 工作模式：中性文案 + 去红绿
@@ -234,6 +292,10 @@ pub struct StockApp {
     left_tab: LeftTab,
     /// 寻宝扫描结果（按 score 降序）。
     treasure_hits: Vec<TreasureHit>,
+    /// 候选池来源。
+    treasure_pool: TreasurePool,
+    /// 财务分位过滤。
+    treasure_fin: FinFilter,
     treasure_scanning: bool,
     treasure_done: usize,
     treasure_total: usize,
@@ -252,8 +314,8 @@ pub struct StockApp {
     ai_panel: AiPanelState,
     /// 当前展示的点评对应的缓存键 `code@date`（用于防止串股）。
     ai_key: Option<String>,
-    /// 内存缓存：`code@date` → 点评文本（本地或 LLM）。
-    ai_cache: HashMap<String, String>,
+    /// 内存缓存：`code@date` → 点评文本 + 来源。
+    ai_cache: HashMap<String, AiCacheEntry>,
     /// 使过期的 LLM 响应失效。
     ai_gen: u64,
     ai_base_url_input: Entity<InputState>,
@@ -370,6 +432,16 @@ impl StockApp {
             ))
         };
 
+        let mut dock = cfg.dock.clone();
+        // 旧配置回退：只有宽/高向量为空时才用 legacy 字段。
+        if dock.main_h.is_empty() {
+            dock.main_h = vec![cfg.left_width];
+        }
+        if dock.main_v.is_empty() {
+            dock.main_v = vec![cfg.bottom_height];
+        }
+        let window_bounds = dock.window;
+
         let mut app = Self {
             symbols,
             selected,
@@ -387,11 +459,21 @@ impl StockApp {
             show_ma20: cfg.show_ma20,
             show_ma60: cfg.show_ma60,
             show_volume: cfg.show_volume,
+            show_macd: cfg.show_macd,
+            show_boll: cfg.show_boll,
+            macd: MacdSeries::default(),
+            boll: BollSeries::default(),
             hover_ix: None,
             chart_view_start: 0,
             chart_view_count: 0,
             chart_width: 800.0,
             chart_origin: Point::default(),
+            chart_bounds: Bounds::default(),
+            drawing_mode: false,
+            drawing_anchor: None,
+            draft_line: None,
+            chart_lines: cfg.chart_lines.clone(),
+            draw_color_ix: 0,
             status: shared("正在连接行情源…"),
             loading: true,
             data_source: shared(market::SRC_LABEL),
@@ -405,6 +487,8 @@ impl StockApp {
             filtered_local,
             left_width: cfg.left_width,
             bottom_height: cfg.bottom_height,
+            dock,
+            window_bounds,
             color_scheme: cfg.color_scheme,
             work_mode: cfg.work_mode,
             work_identity_reveal: false,
@@ -412,6 +496,8 @@ impl StockApp {
             quote_fail_streak: 0,
             left_tab: LeftTab::Watchlist,
             treasure_hits,
+            treasure_pool: TreasurePool::from_id(&cfg.treasure_pool),
+            treasure_fin: FinFilter::from_id(&cfg.treasure_fin),
             treasure_scanning: false,
             treasure_done: 0,
             treasure_total: 0,
@@ -850,6 +936,8 @@ impl StockApp {
         self.candles = candles;
         self.candles_code = Some(code.to_string());
         self.ma = MaSeries::from_candles(&self.candles);
+        self.macd = MacdSeries::from_candles(&self.candles);
+        self.boll = BollSeries::from_candles(&self.candles);
         self.hover_ix = None;
         self.reset_chart_view();
     }
@@ -874,6 +962,8 @@ impl StockApp {
         self.minute = Some(series);
         self.minute_code = Some(code.to_string());
         self.ma = MaSeries::default();
+        self.macd = MacdSeries::default();
+        self.boll = BollSeries::default();
         self.hover_ix = None;
         if !same_series {
             self.reset_chart_view();
@@ -1170,6 +1260,8 @@ impl StockApp {
     }
 
     fn persist(&self) {
+        let mut dock = self.dock.clone();
+        dock.window = self.window_bounds;
         let cfg = AppConfig {
             watchlist: self.symbols.iter().map(|s| s.code.clone()).collect(),
             selected: self.selected.to_string(),
@@ -1180,6 +1272,9 @@ impl StockApp {
             show_ma20: self.show_ma20,
             show_ma60: self.show_ma60,
             show_volume: self.show_volume,
+            show_macd: self.show_macd,
+            show_boll: self.show_boll,
+            dock,
             left_width: self.left_width,
             bottom_height: self.bottom_height,
             color_scheme: self.color_scheme,
@@ -1187,6 +1282,9 @@ impl StockApp {
             quote_interval_secs: self.quote_interval_secs,
             watchlist_sort: self.watchlist_sort,
             ai_api: self.ai_config.clone(),
+            chart_lines: self.chart_lines.clone(),
+            treasure_pool: self.treasure_pool.id().into(),
+            treasure_fin: self.treasure_fin.id().into(),
         };
         let _ = storage::save_config(&cfg);
     }
@@ -1195,6 +1293,18 @@ impl StockApp {
         if self.palette_open || self.settings_open {
             self.palette_open = false;
             self.settings_open = false;
+            cx.notify();
+            return;
+        }
+        if self.drawing_mode {
+            self.drawing_mode = false;
+            self.drawing_anchor = None;
+            self.draft_line = None;
+            self.status = shared(if self.work_mode {
+                "draw mode off"
+            } else {
+                "已退出画线模式"
+            });
             cx.notify();
         }
     }
@@ -1259,12 +1369,13 @@ impl StockApp {
         cx: &mut Context<Self>,
     ) {
         let sizes = state.read(cx).sizes().clone();
-        if let Some(w) = sizes.first() {
-            let w = w.as_f32();
-            if (w - self.left_width).abs() > 0.5 {
-                self.left_width = w;
-                self.persist();
+        let new: Vec<f32> = sizes.iter().map(|s| s.as_f32()).collect();
+        if !new.is_empty() && new != self.dock.main_h {
+            self.dock.main_h = new.clone();
+            if let Some(w) = new.first() {
+                self.left_width = *w;
             }
+            self.persist();
         }
     }
 
@@ -1274,13 +1385,13 @@ impl StockApp {
         cx: &mut Context<Self>,
     ) {
         let sizes = state.read(cx).sizes().clone();
-        // Vertical group: [chart, detail] — persist detail (bottom) height.
-        if let Some(h) = sizes.get(1) {
-            let h = h.as_f32();
-            if (h - self.bottom_height).abs() > 0.5 {
-                self.bottom_height = h;
-                self.persist();
+        let new: Vec<f32> = sizes.iter().map(|s| s.as_f32()).collect();
+        if !new.is_empty() && new != self.dock.main_v {
+            self.dock.main_v = new.clone();
+            if let Some(h) = new.get(1) {
+                self.bottom_height = *h;
             }
+            self.persist();
         }
     }
 
@@ -1376,6 +1487,7 @@ impl StockApp {
         let Some(snap) = ai::build_snapshot(&self.candles, &code, &name) else {
             self.ai_panel = AiPanelState::Ready {
                 text: shared("数据不足：策略雷达需要至少 20 根有效日 K。"),
+                source: AiSource::Local,
                 note: None,
             };
             self.ai_key = self.ai_current_key();
@@ -1387,7 +1499,8 @@ impl StockApp {
         // 内存缓存命中（本地或 LLM 结果）直接展示。
         if let Some(hit) = self.ai_cache.get(&cache_key).cloned() {
             self.ai_panel = AiPanelState::Ready {
-                text: hit.into(),
+                text: hit.text.into(),
+                source: hit.source,
                 note: None,
             };
             self.ai_key = Some(cache_key);
@@ -1397,12 +1510,19 @@ impl StockApp {
 
         // 先秒出本地规则点评，LLM 结果到达后再覆盖。
         let local = ai::local_commentary(&snap);
-        self.ai_cache.insert(cache_key.clone(), local.clone());
+        self.ai_cache.insert(
+            cache_key.clone(),
+            AiCacheEntry {
+                text: local.clone(),
+                source: AiSource::Local,
+            },
+        );
         self.ai_key = Some(cache_key.clone());
 
         if !self.ai_config.enabled {
             self.ai_panel = AiPanelState::Ready {
                 text: local.into(),
+                source: AiSource::Local,
                 note: None,
             };
             cx.notify();
@@ -1415,6 +1535,7 @@ impl StockApp {
         self.ai_gen = self.ai_gen.wrapping_add(1);
         let req_id = self.ai_gen;
         let cfg = self.ai_config.clone();
+        let llm_model = cfg.model.clone();
         cx.spawn(async move |this, cx| {
             let res = smol::unblock(move || ai::llm_commentary(&cfg, &snap)).await;
             let _ = this.update(cx, |app, cx| {
@@ -1423,22 +1544,34 @@ impl StockApp {
                 }
                 match res {
                     Ok(text) if !text.trim().is_empty() => {
-                        app.ai_cache.insert(cache_key.clone(), text.clone());
+                        let source = AiSource::Llm {
+                            model: llm_model.clone(),
+                        };
+                        app.ai_cache.insert(
+                            cache_key.clone(),
+                            AiCacheEntry {
+                                text: text.clone(),
+                                source: source.clone(),
+                            },
+                        );
                         app.ai_panel = AiPanelState::Ready {
                             text: text.into(),
+                            source,
                             note: None,
                         };
                     }
                     Ok(_) => {
                         app.ai_panel = AiPanelState::Ready {
                             text: local.clone().into(),
-                            note: Some(shared("本地点评（LLM 返回了空内容）")),
+                            source: AiSource::Local,
+                            note: Some(shared("LLM 返回了空内容")),
                         };
                     }
                     Err(e) => {
                         app.ai_panel = AiPanelState::Ready {
                             text: local.clone().into(),
-                            note: Some(shared(format!("本地点评（LLM 请求失败：{e}）"))),
+                            source: AiSource::Local,
+                            note: Some(shared(format!("LLM 请求失败：{e}"))),
                         };
                     }
                 }
@@ -1733,6 +1866,24 @@ impl StockApp {
         cx.notify();
     }
 
+    fn set_treasure_pool(&mut self, pool: TreasurePool, cx: &mut Context<Self>) {
+        if self.treasure_pool == pool {
+            return;
+        }
+        self.treasure_pool = pool;
+        self.persist();
+        cx.notify();
+    }
+
+    fn set_treasure_fin(&mut self, fin: FinFilter, cx: &mut Context<Self>) {
+        if self.treasure_fin == fin {
+            return;
+        }
+        self.treasure_fin = fin;
+        self.persist();
+        cx.notify();
+    }
+
     fn toggle_treasure_tab(&mut self, cx: &mut Context<Self>) {
         self.left_tab = match self.left_tab {
             LeftTab::Watchlist => LeftTab::Treasure,
@@ -1749,6 +1900,8 @@ impl StockApp {
             return;
         }
         let watchlist: Vec<String> = self.symbols.iter().map(|s| s.code.clone()).collect();
+        let pool = self.treasure_pool;
+        let fin = self.treasure_fin;
 
         self.treasure_gen = self.treasure_gen.wrapping_add(1);
         let scan_id = self.treasure_gen;
@@ -1757,20 +1910,27 @@ impl StockApp {
         self.treasure_total = 0;
         self.treasure_hits.clear();
         self.treasure_status = shared(format!(
-            "拉取扩大池（最多 {TREASURE_SCAN_CAP}）· 将取 Top {TREASURE_TOP_N}…"
+            "拉取 {} 池（{}）· 将取 Top {TREASURE_TOP_N}…",
+            pool.label(),
+            fin.label()
         ));
         self.status = shared(format!(
-            "🐭 扩大搜索 · 市值池≤{TREASURE_SCAN_CAP} · 入榜{TREASURE_TOP_N}"
+            "🐭 寻宝 · {}池 · {} · 入榜{TREASURE_TOP_N}",
+            pool.label(),
+            fin.label()
         ));
         self.left_tab = LeftTab::Treasure;
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            // 网络拉扩大候选（失败则内置表）
-            let (codes, pool_src) = smol::unblock(move || {
-                universe::build_scan_universe_expanded(&watchlist)
+            // 网络拉候选（指数成分动态拉取 / 市值池；财务分位过滤；失败回落内置表）
+            let build = smol::unblock(move || {
+                universe::build_scan_universe_for_pool(&watchlist, pool, fin)
             })
             .await;
+            let codes = build.codes;
+            let pool_src = build.source;
+            let filter_note = build.filter_note;
 
             if codes.is_empty() {
                 let _ = this.update(cx, |app, cx| {
@@ -1778,7 +1938,7 @@ impl StockApp {
                         return;
                     }
                     app.treasure_scanning = false;
-                    app.treasure_status = shared("没有可扫描代码");
+                    app.treasure_status = shared(format!("没有可扫描代码 · {filter_note}"));
                     app.status = shared("寻宝失败：候选池为空");
                     cx.notify();
                 });
@@ -1792,9 +1952,9 @@ impl StockApp {
                 }
                 app.treasure_total = total;
                 app.treasure_status = shared(format!(
-                    "池 {total} 只（{pool_src}）· 深评中 0/{total} · 将取 Top {TREASURE_TOP_N}"
+                    "池 {total} 只（{pool_src}）· {filter_note} · 深评中 0/{total} · 将取 Top {TREASURE_TOP_N}"
                 ));
-                app.status = shared(format!("🐭 深评 {total} 只 · 源 {pool_src}"));
+                app.status = shared(format!("🐭 深评 {total} 只 · 源 {pool_src} · {filter_note}"));
                 cx.notify();
             });
 
@@ -1909,7 +2069,7 @@ impl StockApp {
                     }
                 }
                 app.treasure_status = shared(format!(
-                    "完成 · 深评 {total} · 入榜 {} · {pool_src} · {updated_at}",
+                    "完成 · 深评 {total} · 入榜 {} · {pool_src} · {filter_note} · {updated_at}",
                     app.treasure_hits.len(),
                 ));
                 app.status = shared(format!(
@@ -2094,6 +2254,67 @@ impl StockApp {
         } else {
             MaSeries::default()
         };
+        let work = self.work_mode;
+        let is_intraday = matches!(self.chart_kind, ChartKind::Intraday);
+        let macd = if show_series && end > start && !is_intraday && self.show_macd && !work {
+            let s = self.macd.slice(start, end);
+            Some(MacdPaintData {
+                dif: s.dif,
+                dea: s.dea,
+                hist: s.hist,
+                dif_color: theme.foreground,
+                dea_color: theme.blue,
+                axis_color: theme.muted_foreground,
+                bullish: self.chg_color(true, cx),
+                bearish: self.chg_color(false, cx),
+            })
+        } else {
+            None
+        };
+        let boll = if show_series && end > start && !is_intraday && self.show_boll && !work {
+            let s = self.boll.slice(start, end);
+            Some(BollPaintData {
+                upper: s.upper,
+                mid: s.mid,
+                lower: s.lower,
+                upper_color: theme.cyan.opacity(0.9),
+                mid_color: theme.muted_foreground.opacity(0.8),
+                lower_color: theme.magenta.opacity(0.9),
+            })
+        } else {
+            None
+        };
+        // 画线：当前标的的线（裁剪到可见区间，保持锚点索引为切片内坐标）。
+        let mut lines = Vec::new();
+        if show_series && end > start && !work {
+            let owned = self
+                .chart_lines
+                .get(self.selected.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            for line in owned {
+                if line.from.0 < start || line.to.0 < start {
+                    continue;
+                }
+                if line.from.0 >= end || line.to.0 >= end {
+                    continue;
+                }
+                lines.push(TrendLine {
+                    from: (line.from.0 - start, line.from.1),
+                    to: (line.to.0 - start, line.to.1),
+                    color_ix: line.color_ix,
+                });
+            }
+            if let Some(draft) = self.draft_line {
+                if draft.from.0 >= start && draft.from.0 < end && draft.to.0 >= start && draft.to.0 < end {
+                    lines.push(TrendLine {
+                        from: (draft.from.0 - start, draft.from.1),
+                        to: (draft.to.0 - start, draft.to.1),
+                        color_ix: draft.color_ix,
+                    });
+                }
+            }
+        }
         let hover_ix = if matched {
             self.hover_ix.and_then(|ix| {
                 if ix >= start && ix < end {
@@ -2105,7 +2326,6 @@ impl StockApp {
         } else {
             None
         };
-        let work = self.work_mode;
         let minute = if matches!(self.chart_kind, ChartKind::Intraday) {
             self.minute_paint_data(cx)
         } else {
@@ -2114,6 +2334,10 @@ impl StockApp {
         ChartPaintData {
             candles,
             ma,
+            macd,
+            boll,
+            lines,
+            line_colors: chart_line_palette(theme),
             minute,
             show_ma5: self.show_ma5,
             show_ma10: self.show_ma10,
@@ -3927,7 +4151,56 @@ impl StockApp {
                             .text_xs()
                             .text_color(cx.theme().muted_foreground.opacity(0.85))
                             .child(format!(
-                                "市值池≤{TREASURE_SCAN_CAP} · Top{TREASURE_TOP_N} · 1Y/3Y/全 · 前复权"
+                                "{}池 · {} · ≤{TREASURE_SCAN_CAP} · Top{TREASURE_TOP_N} · 1Y/3Y/全 · 前复权",
+                                self.treasure_pool.label(),
+                                self.treasure_fin.label(),
+                            )),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .flex_wrap()
+                            .children(TreasurePool::all().into_iter().enumerate().map(
+                                |(ix, p)| {
+                                    let active = self.treasure_pool == p;
+                                    Button::new(("tpool", ix as u32))
+                                    .xsmall()
+                                    .when(active, |b| b.primary())
+                                    .when(!active, |b| b.ghost())
+                                    .label(p.label())
+                                    .tooltip(if p == TreasurePool::Mcap {
+                                        "东财按总市值取沪深 A（默认）"
+                                    } else {
+                                        "指数成分动态拉取（新浪）"
+                                    })
+                                    .on_click(cx.listener(move |this, _, _w, cx| {
+                                        this.set_treasure_pool(p, cx);
+                                    }))
+                                },
+                            )),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .flex_wrap()
+                            .children(FinFilter::all().into_iter().enumerate().map(
+                                |(ix, f)| {
+                                    let active = self.treasure_fin == f;
+                                    Button::new(("tfin", ix as u32))
+                                    .xsmall()
+                                    .when(active, |b| b.primary())
+                                    .when(!active, |b| b.ghost())
+                                    .label(f.label())
+                                    .tooltip(match f {
+                                        FinFilter::Off => "不做财务过滤",
+                                        FinFilter::Pe => "保留池内 PE 分位 ≤ 50%",
+                                        FinFilter::Pb => "保留池内 PB 分位 ≤ 50%",
+                                        FinFilter::Value => "PE 与 PB 分位均 ≤ 50%",
+                                    })
+                                    .on_click(cx.listener(move |this, _, _w, cx| {
+                                        this.set_treasure_fin(f, cx);
+                                    }))
+                                },
                             )),
                     ),
             )
@@ -4297,6 +4570,18 @@ impl StockApp {
                                             self.show_volume,
                                             cx,
                                         ))
+                                        .child(self.ma_toggle(
+                                            "macd",
+                                            "MACD",
+                                            self.show_macd,
+                                            cx,
+                                        ))
+                                        .child(self.ma_toggle(
+                                            "boll",
+                                            "BOLL",
+                                            self.show_boll,
+                                            cx,
+                                        ))
                                     })
                                 },
                             )
@@ -4346,7 +4631,35 @@ impl StockApp {
                                                 ))
                                         }))
                                 },
-                            ),
+                            )
+                            .when(!work, |row| {
+                                row.child(div().w(px(8.)))
+                                    .child(
+                                        Button::new("draw-toggle")
+                                            .xsmall()
+                                            .when(self.drawing_mode, |b| b.primary())
+                                            .when(!self.drawing_mode, |b| b.ghost())
+                                            .label("画线")
+                                            .tooltip(
+                                                "画线模式：拖拽画趋势线，单击画水平价格线；Esc 退出",
+                                            )
+                                            .on_click(cx.listener(|this, _, _w, cx| {
+                                                this.toggle_drawing_mode(cx);
+                                            })),
+                                    )
+                                    .when(self.drawing_mode, |row| {
+                                        row.child(
+                                            Button::new("clear-lines")
+                                                .xsmall()
+                                                .ghost()
+                                                .label("清除")
+                                                .tooltip("清除当前标的的全部画线")
+                                                .on_click(cx.listener(|this, _, _w, cx| {
+                                                    this.clear_chart_lines(cx);
+                                                })),
+                                        )
+                                    })
+                            }),
                     ),
             )
             // hover strip
@@ -4385,6 +4698,7 @@ impl StockApp {
                                     move |bounds, _, window, cx| {
                                         entity.update(cx, |this, _| {
                                             this.chart_origin = bounds.origin;
+                                            this.chart_bounds = bounds;
                                             this.chart_width = bounds.size.width.as_f32();
                                         });
                                         paint_chart(bounds, &paint, window);
@@ -4395,6 +4709,26 @@ impl StockApp {
                             .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _w, cx| {
                                 let local_x =
                                     ev.position.x.as_f32() - this.chart_origin.x.as_f32();
+                                let local_y =
+                                    ev.position.y.as_f32() - this.chart_origin.y.as_f32();
+                                if this.drawing_mode && this.drawing_anchor.is_some() {
+                                    let paint = this.chart_paint_data(cx);
+                                    let bounds = this.chart_bounds;
+                                    if let Some((ix, price)) =
+                                        this.anchor_from_local(&paint, bounds, local_x, local_y)
+                                    {
+                                        if let Some((ax, ap)) = this.drawing_anchor {
+                                            let color_ix = this.draw_color_ix;
+                                            this.draft_line = Some(TrendLine::new(
+                                                (ax, ap),
+                                                (ix, price),
+                                                color_ix,
+                                            ));
+                                            cx.notify();
+                                        }
+                                    }
+                                    return;
+                                }
                                 let (start, end) = this.chart_visible_range();
                                 let vn = end.saturating_sub(start);
                                 let local_ix = index_from_x(local_x, this.chart_width, vn);
@@ -4407,6 +4741,32 @@ impl StockApp {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                                    if this.drawing_mode {
+                                        if ev.click_count == 1 {
+                                            let local_x = ev.position.x.as_f32()
+                                                - this.chart_origin.x.as_f32();
+                                            let local_y = ev.position.y.as_f32()
+                                                - this.chart_origin.y.as_f32();
+                                            let paint = this.chart_paint_data(cx);
+                                            let bounds = this.chart_bounds;
+                                            if let Some(anchor) = this.anchor_from_local(
+                                                &paint,
+                                                bounds,
+                                                local_x,
+                                                local_y,
+                                            ) {
+                                                this.drawing_anchor = Some(anchor);
+                                                this.draft_line = Some(TrendLine::new(
+                                                    anchor,
+                                                    anchor,
+                                                    this.draw_color_ix,
+                                                ));
+                                                this.hover_ix = None;
+                                                cx.notify();
+                                            }
+                                        }
+                                        return;
+                                    }
                                     if ev.click_count >= 2 {
                                         this.reset_chart_view();
                                         this.hover_ix = None;
@@ -4415,6 +4775,52 @@ impl StockApp {
                                         } else {
                                             "已重置图表缩放"
                                         });
+                                        cx.notify();
+                                    }
+                                }),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _ev, _w, cx| {
+                                    if this.drawing_mode {
+                                        if let Some(draft) = this.draft_line.take() {
+                                            let commit = {
+                                                let from = draft.from;
+                                                let to = draft.to;
+                                                let same_bar = from.0 == to.0;
+                                                let near_price = (to.1 - from.1).abs()
+                                                    <= (from.1.abs() * 0.005).max(0.01);
+                                                if same_bar && near_price {
+                                                    // 单击 → 水平价格线，横跨当前可见区间。
+                                                    let (vs, ve) = this.chart_visible_range();
+                                                    let (a, b) =
+                                                        (vs.min(ve.saturating_sub(1)), ve.saturating_sub(1));
+                                                    Some(TrendLine::price_line(
+                                                        a,
+                                                        b,
+                                                        from.1,
+                                                        this.draw_color_ix,
+                                                    ))
+                                                } else {
+                                                    Some(draft)
+                                                }
+                                            };
+                                            if let Some(line) = commit {
+                                                this.chart_lines
+                                                    .entry(this.selected.to_string())
+                                                    .or_default()
+                                                    .push(line);
+                                                this.draw_color_ix = this.draw_color_ix.wrapping_add(1);
+                                                this.status = shared(if this.work_mode {
+                                                    "line added"
+                                                } else {
+                                                    "已添加画线"
+                                                });
+                                                this.persist();
+                                            }
+                                        }
+                                        this.drawing_anchor = None;
+                                        this.draft_line = None;
                                         cx.notify();
                                     }
                                 }),
@@ -4445,11 +4851,82 @@ impl StockApp {
                     "ma20" => this.show_ma20 = !this.show_ma20,
                     "ma60" => this.show_ma60 = !this.show_ma60,
                     "vol" => this.show_volume = !this.show_volume,
+                    "macd" => this.show_macd = !this.show_macd,
+                    "boll" => this.show_boll = !this.show_boll,
                     _ => {}
                 }
                 this.persist();
                 cx.notify();
             }))
+    }
+
+    fn toggle_drawing_mode(&mut self, cx: &mut Context<Self>) {
+        self.drawing_mode = !self.drawing_mode;
+        self.drawing_anchor = None;
+        self.draft_line = None;
+        self.hover_ix = None;
+        if self.drawing_mode {
+            self.status = shared(if self.work_mode {
+                "draw mode: drag on the chart to add a line"
+            } else {
+                "画线模式：在图上拖拽画趋势线；单击生成水平线；再点按钮退出"
+            });
+        } else {
+            self.status = shared(if self.work_mode {
+                "draw mode off"
+            } else {
+                "已退出画线模式"
+            });
+        }
+        cx.notify();
+    }
+
+    /// 清空当前标的的全部画线。
+    fn clear_chart_lines(&mut self, cx: &mut Context<Self>) {
+        let code = self.selected.to_string();
+        let removed = self.chart_lines.remove(&code).unwrap_or_default().len();
+        self.draft_line = None;
+        self.drawing_anchor = None;
+        self.status = shared(format!(
+            "{}",
+            if self.work_mode {
+                format!("removed {removed} line(s)")
+            } else {
+                format!("已清除 {removed} 条画线")
+            }
+        ));
+        self.persist();
+        cx.notify();
+    }
+
+    /// 把屏幕坐标转换为画线锚点（可见切片内的索引 + 价格）。
+    fn anchor_from_local(
+        &self,
+        paint: &ChartPaintData,
+        bounds: Bounds<Pixels>,
+        local_x: f32,
+        local_y: f32,
+    ) -> Option<(usize, f64)> {
+        if paint.candles.is_empty() {
+            return None;
+        }
+        let layout = chart_layout(paint, bounds);
+        let visible = paint.candles.len();
+        let (start, end) = self.chart_visible_range();
+        if start >= end {
+            return None;
+        }
+        let local_ix = index_from_x(local_x, bounds.size.width.as_f32(), visible)?;
+        let ix = start + local_ix;
+        if ix >= end {
+            return None;
+        }
+        // 只有价格窗格内的点击才落锚；副图区域忽略。
+        if local_y < layout.plot_top || local_y > layout.plot_top + layout.price_h {
+            return None;
+        }
+        let price = price_from_y(&layout, local_y);
+        Some((ix, price))
     }
 
     /// The minute period to select when the 分钟K button is pressed.
@@ -4522,6 +4999,8 @@ impl StockApp {
                 if let Some(c) = self.candles.get(ix) {
                     let color = self.chg_color(c.close >= c.open, cx);
                     let (m5, m10, m20, m60) = self.ma.value_at(ix);
+                    let (dif, dea, hist) = self.macd.value_at(ix);
+                    let (b_up, b_mid, b_low) = self.boll.value_at(ix);
                     let date_label = format_candle_date(c.date.as_ref());
                     if work {
                         return h_flex()
@@ -4551,7 +5030,7 @@ impl StockApp {
                             })
                             .into_any_element();
                     }
-                    return h_flex()
+                    let row = h_flex()
                         .gap_2()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
@@ -4585,12 +5064,36 @@ impl StockApp {
                         .when(m60.is_some(), |this| {
                             this.child(format!("MA60 {}", format_price(m60.unwrap())))
                         })
-                        .into_any_element();
+                        .when(
+                            self.show_macd && dif.is_some() && dea.is_some() && hist.is_some(),
+                            |this| {
+                                this.child(format!(
+                                    "MACD {:.3}/{:.3}/{:.3}",
+                                    dif.unwrap(),
+                                    dea.unwrap(),
+                                    hist.unwrap()
+                                ))
+                            },
+                        )
+                        .when(
+                            self.show_boll && b_up.is_some() && b_mid.is_some() && b_low.is_some(),
+                            |this| {
+                                this.child(format!(
+                                    "BOLL {:.2}/{:.2}/{:.2}",
+                                    b_up.unwrap(),
+                                    b_mid.unwrap(),
+                                    b_low.unwrap()
+                                ))
+                            },
+                        );
+                    return row.into_any_element();
                 }
             }
         }
         let (vs, ve) = self.chart_visible_range();
-        let zoom_hint = if matches!(self.chart_kind, ChartKind::Intraday) {
+        let zoom_hint = if self.drawing_mode && !work {
+            "画线模式：拖拽画趋势线 · 单击水平线 · Esc 退出".to_string()
+        } else if matches!(self.chart_kind, ChartKind::Intraday) {
             if let Some(m) = self.minute.as_ref() {
                 let date = if m.date.len() >= 8 {
                     format!("{}-{}-{}", &m.date[..4], &m.date[4..6], &m.date[6..8])
@@ -4827,6 +5330,8 @@ impl StockApp {
                     .child(self.render_signal_detail_col(cx))
                     .child(self.render_ai_detail_col(cx))
                     .child(self.render_treasure_detail_col(cx))
+                    .child(self.render_macd_detail_col(cx))
+                    .child(self.render_boll_detail_col(cx))
                     .child(
                         v_flex()
                             .flex_1()
@@ -4857,6 +5362,92 @@ impl StockApp {
                             }),
                     ),
             )
+    }
+
+    fn render_macd_detail_col(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let candles_match = self
+            .candles_code
+            .as_ref()
+            .is_some_and(|c| c == self.selected.as_ref())
+            && !matches!(self.chart_kind, ChartKind::Intraday);
+        let (dif, dea, hist) = self.macd.value_at(self.macd.dif.len().saturating_sub(1));
+        let fmt = |v: Option<f64>| {
+            v.map(|n| format!("{n:.3}"))
+                .unwrap_or_else(|| "--".into())
+        };
+        v_flex()
+            .gap_1()
+            .min_w(px(120.))
+            .child(
+                div()
+                    .text_xs()
+                    .font_semibold()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if self.work_mode { "MACD" } else { "MACD 12/26/9" }),
+            )
+            .child(detail_row(
+                if self.work_mode { "DIF" } else { "DIF" },
+                &if candles_match { fmt(dif) } else { "--".into() },
+                cx,
+            ))
+            .child(detail_row(
+                if self.work_mode { "DEA" } else { "DEA" },
+                &if candles_match { fmt(dea) } else { "--".into() },
+                cx,
+            ))
+            .child(detail_row(
+                if self.work_mode { "HIST" } else { "柱" },
+                &if candles_match { fmt(hist) } else { "--".into() },
+                cx,
+            ))
+            .child(detail_row(
+                if self.work_mode { "Mode" } else { "显示" },
+                if self.show_macd { "开" } else { "关" },
+                cx,
+            ))
+    }
+
+    fn render_boll_detail_col(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let candles_match = self
+            .candles_code
+            .as_ref()
+            .is_some_and(|c| c == self.selected.as_ref())
+            && !matches!(self.chart_kind, ChartKind::Intraday);
+        let (up, mid, low) = self.boll.value_at(self.boll.mid.len().saturating_sub(1));
+        let fmt = |v: Option<f64>| {
+            v.map(|n| self.format_value(n))
+                .unwrap_or_else(|| "--".into())
+        };
+        v_flex()
+            .gap_1()
+            .min_w(px(120.))
+            .child(
+                div()
+                    .text_xs()
+                    .font_semibold()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if self.work_mode { "BOLL" } else { "BOLL 20·2σ" }),
+            )
+            .child(detail_row(
+                "上轨",
+                &if candles_match { fmt(up) } else { "--".into() },
+                cx,
+            ))
+            .child(detail_row(
+                "中轨",
+                &if candles_match { fmt(mid) } else { "--".into() },
+                cx,
+            ))
+            .child(detail_row(
+                "下轨",
+                &if candles_match { fmt(low) } else { "--".into() },
+                cx,
+            ))
+            .child(detail_row(
+                if self.work_mode { "Mode" } else { "显示" },
+                if self.show_boll { "开" } else { "关" },
+                cx,
+            ))
     }
 
     fn render_signal_detail_col(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4969,7 +5560,31 @@ impl StockApp {
                             }),
                     );
                 }
-                AiPanelState::Ready { text, note } => {
+                AiPanelState::Ready { text, source, note } => {
+                    let source_color = if source.is_llm() {
+                        cx.theme().accent
+                    } else {
+                        cx.theme().muted_foreground
+                    };
+                    col = col.child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_semibold()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if work { "Source" } else { "来源" }),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_semibold()
+                                    .text_color(source_color)
+                                    .child(source.label(work)),
+                            ),
+                    );
                     col = col.child(
                         div()
                             .text_xs()
@@ -5248,6 +5863,19 @@ fn format_candle_date(raw: &str) -> String {
     }
 }
 
+/// Line color palette for user-drawn chart lines (cycles by `color_ix`).
+fn chart_line_palette(theme: &gpui_component::Theme) -> Vec<gpui::Hsla> {
+    vec![
+        theme.yellow,
+        theme.cyan,
+        theme.magenta,
+        theme.blue,
+        theme.green,
+        theme.red,
+        theme.accent,
+    ]
+}
+
 fn palette_row(
     sym: Symbol,
     in_watchlist: bool,
@@ -5475,8 +6103,24 @@ fn display_name_str(name: &str, code: &str) -> String {
 
 impl Render for StockApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let left_w = self.left_width;
-        let bottom_h = self.bottom_height;
+        // Persist the window frame whenever it changes (complete dock serialization).
+        if !window.is_fullscreen() {
+            let b = window.bounds();
+            let cur = (
+                b.origin.x.as_f32(),
+                b.origin.y.as_f32(),
+                b.size.width.as_f32(),
+                b.size.height.as_f32(),
+            );
+            if self.window_bounds != Some(cur) {
+                self.window_bounds = Some(cur);
+                self.persist();
+            }
+        }
+
+        let left_w = self.dock.main_h.first().copied().unwrap_or(self.left_width);
+        let center_w = self.dock.main_h.get(1).copied().unwrap_or(0.0);
+        let bottom_h = self.dock.main_v.get(1).copied().unwrap_or(self.bottom_height);
         let work = self.work_mode;
 
         div()
@@ -5570,21 +6214,26 @@ impl Render for StockApp {
                                     .child(self.render_left_panel(cx)),
                             )
                             .child(
-                                resizable_panel().child(
-                                    v_resizable("main-v")
-                                        .on_resize(move |state, _window, cx| {
-                                            entity_v.update(cx, |this, cx| {
-                                                this.on_main_v_resize(state, cx);
-                                            });
-                                        })
-                                        .child(resizable_panel().child(self.render_chart_area(cx)))
-                                        .child(
-                                            resizable_panel()
-                                                .size(px(bottom_h.max(160.0)))
-                                                .size_range(px(140.)..px(420.))
-                                                .child(self.render_detail_panel(cx)),
-                                        ),
-                                ),
+                                resizable_panel()
+                                    .when(center_w > 0.0, |p| p.size(px(center_w)))
+                                    .child(
+                                        v_resizable("main-v")
+                                            .on_resize(move |state, _window, cx| {
+                                                entity_v.update(cx, |this, cx| {
+                                                    this.on_main_v_resize(state, cx);
+                                                });
+                                            })
+                                            .child(
+                                                resizable_panel()
+                                                    .child(self.render_chart_area(cx)),
+                                            )
+                                            .child(
+                                                resizable_panel()
+                                                    .size(px(bottom_h.max(160.0)))
+                                                    .size_range(px(140.)..px(420.))
+                                                    .child(self.render_detail_panel(cx)),
+                                            ),
+                                    ),
                             ),
                     )
                     .into_any_element()
@@ -5647,9 +6296,20 @@ pub fn run() {
             cx.quit();
         });
 
+        // 完整 Dock 布局序列化：上次窗口位置/大小直接恢复（无记录则居中默认）。
+        let cfg = storage::load_config();
+        let window_bounds = match cfg.dock.window {
+            Some((x, y, w, h)) if w >= 800.0 && h >= 500.0 => {
+                WindowBounds::Windowed(Bounds {
+                    origin: point(px(x), px(y)),
+                    size: size(px(w), px(h)),
+                })
+            }
+            _ => WindowBounds::centered(size(px(1320.), px(860.)), cx),
+        };
         let window_options = WindowOptions {
             titlebar: Some(TitleBar::title_bar_options()),
-            window_bounds: Some(WindowBounds::centered(size(px(1320.), px(860.)), cx)),
+            window_bounds: Some(window_bounds),
             ..Default::default()
         };
 
