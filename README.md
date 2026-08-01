@@ -60,6 +60,27 @@ open "dist/Stock Analysis.app"
 
 图标资源在 `assets/logo/`（见下方）。
 
+## 自动发布（GitHub Actions）
+
+推送 `v*` tag 会触发 [release.yml](.github/workflows/release.yml) 自动打包并创建 GitHub Release：
+
+```bash
+git tag v0.0.1
+git push origin v0.0.1
+```
+
+产物：
+
+| 平台 | 文件 | 说明 |
+|------|------|------|
+| macOS | `stock-analysis-macos-universal.zip` | `Stock Analysis.app`，x86_64 + arm64 通用 |
+| Windows | `stock-analysis-windows-x64.zip` | `stock.exe` + README |
+
+说明：
+
+- 未做正式签名：macOS 首次打开需右键「打开」，Windows 可能提示 SmartScreen。
+- 在 Actions 页面手动运行该 workflow 只上传构建产物（artifacts），不会创建 Release。
+
 ## Logo
 
 主识别为几何双线 **S**（Stock），Zed 风格深色圆角 + 银白线。

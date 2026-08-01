@@ -14,8 +14,10 @@ CONTENTS="${APP_DIR}/Contents"
 MACOS_DIR="${CONTENTS}/MacOS"
 RES_DIR="${CONTENTS}/Resources"
 
-echo "==> cargo build --release"
-cargo build --release
+if [ "${SKIP_CARGO_BUILD:-0}" != "1" ]; then
+  echo "==> cargo build --release"
+  cargo build --release
+fi
 
 echo "==> assemble ${APP_NAME}.app"
 rm -rf "$APP_DIR"

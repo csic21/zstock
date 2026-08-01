@@ -3070,7 +3070,9 @@ impl StockApp {
         let sort = self.watchlist_sort;
         let display_order = self.watchlist_display_order();
         v_flex()
-            .size_full()
+            .flex_1()
+            .min_h_0()
+            .w_full()
             .child(
                 h_flex()
                     .h(px(28.))
@@ -3258,7 +3260,9 @@ impl StockApp {
         let selected = self.selected.clone();
         let work = self.work_mode;
         v_flex()
-            .size_full()
+            .flex_1()
+            .min_h_0()
+            .w_full()
             .child(
                 v_flex()
                     .px_2()
@@ -4751,6 +4755,7 @@ impl Render for StockApp {
             .flex_col()
             .bg(cx.theme().background)
             .track_focus(&self.palette_focus)
+            .key_context("stock")
             .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
                 this.toggle_palette(window, cx);
             }))
@@ -4891,13 +4896,16 @@ pub fn run() {
             #[cfg(not(target_os = "macos"))]
             KeyBinding::new("ctrl-,", ToggleSettings, None),
             KeyBinding::new("escape", DismissOverlay, None),
-            KeyBinding::new("up", SelectPrevSymbol, None),
-            KeyBinding::new("down", SelectNextSymbol, None),
-            KeyBinding::new("k", SelectPrevSymbol, None),
-            KeyBinding::new("j", SelectNextSymbol, None),
-            KeyBinding::new("backspace", RemoveSelectedSymbol, None),
-            KeyBinding::new("delete", RemoveSelectedSymbol, None),
-            KeyBinding::new("0", ResetChartZoom, None),
+            // `stock && !Input`：根节点始终带 `stock` 上下文；输入框聚焦时叠加
+            // `Input` 上下文并自动禁用这些纯按键绑定，避免吞掉输入框的
+            // 退格/删除/数字/字母/方向键。输入框有独立的 Input 上下文绑定。
+            KeyBinding::new("up", SelectPrevSymbol, Some("stock && !Input")),
+            KeyBinding::new("down", SelectNextSymbol, Some("stock && !Input")),
+            KeyBinding::new("k", SelectPrevSymbol, Some("stock && !Input")),
+            KeyBinding::new("j", SelectNextSymbol, Some("stock && !Input")),
+            KeyBinding::new("backspace", RemoveSelectedSymbol, Some("stock && !Input")),
+            KeyBinding::new("delete", RemoveSelectedSymbol, Some("stock && !Input")),
+            KeyBinding::new("0", ResetChartZoom, Some("stock && !Input")),
             #[cfg(target_os = "macos")]
             KeyBinding::new("cmd-q", Quit, None),
             #[cfg(not(target_os = "macos"))]
@@ -4926,4 +4934,61 @@ pub fn run() {
         })
         .detach();
     });
+}
+
+#[cfg(test)]
+mod keymap_tests {
+    use gpui::{actions, KeyBinding, KeyContext, Keymap, Keystroke};
+
+    actions!(keymap_test, [InputBackspace, AppBackspace, AppZero]);
+
+    fn keystrokes(s: &str) -> Vec<Keystroke> {
+        vec![Keystroke::parse(s).unwrap()]
+    }
+
+    /// 应用内的纯按键快捷键必须让位于聚焦的输入框（`!Input` 上下文）。
+    /// 注册顺序与运行时一致：组件输入框绑定在前，应用快捷键在后。
+    #[test]
+    fn plain_key_bindings_yield_to_focused_input() {
+        let km = Keymap::new(vec![
+            KeyBinding::new("backspace", InputBackspace, Some("Input")),
+            KeyBinding::new("backspace", AppBackspace, Some("stock && !Input")),
+            KeyBinding::new("0", AppZero, Some("stock && !Input")),
+        ]);
+        // 根节点带 `stock` 上下文；输入框聚焦时叠加 `Input`。
+        let input_focused = [
+            KeyContext::parse("Input").unwrap(),
+            KeyContext::parse("stock").unwrap(),
+        ];
+        let no_input = [KeyContext::parse("stock").unwrap()];
+
+        // 输入框聚焦：退格走输入框自己的绑定，应用绑定让位。
+        let (bindings, _) = km.bindings_for_input(&keystrokes("backspace"), &input_focused);
+        assert_eq!(bindings.len(), 1, "backspace while input focused");
+        assert!(
+            bindings[0].action().as_any().downcast_ref::<InputBackspace>().is_some(),
+            "input binding must win, got {}",
+            bindings[0].action().name()
+        );
+
+        // 输入框聚焦：`0` 不再触发应用动作，按键落到文本输入。
+        let (bindings, _) = km.bindings_for_input(&keystrokes("0"), &input_focused);
+        assert!(bindings.is_empty(), "0 binding must yield while input focused");
+
+        // 无输入框聚焦：应用快捷键照常生效。
+        let (bindings, _) = km.bindings_for_input(&keystrokes("backspace"), &no_input);
+        assert_eq!(bindings.len(), 1);
+        assert!(
+            bindings[0].action().as_any().downcast_ref::<AppBackspace>().is_some(),
+            "app binding must win without input focus, got {}",
+            bindings[0].action().name()
+        );
+
+        let (bindings, _) = km.bindings_for_input(&keystrokes("0"), &no_input);
+        assert_eq!(bindings.len(), 1);
+        assert!(
+            bindings[0].action().as_any().downcast_ref::<AppZero>().is_some(),
+            "app 0 binding must win without input focus"
+        );
+    }
 }
