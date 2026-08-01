@@ -3181,6 +3181,48 @@ impl StockApp {
                                             }),
                                     ),
                             )
+                            // —— About / compliance ——
+                            .child(
+                                v_flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_semibold()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(if work { "About" } else { "关于" }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground.opacity(0.9))
+                                            .child(format!(
+                                                "{} v{}",
+                                                if work { "Version" } else { "版本" },
+                                                env!("CARGO_PKG_VERSION")
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground.opacity(0.9))
+                                            .child(if work {
+                                                "Data: Eastmoney & Tencent public endpoints, personal study only."
+                                            } else {
+                                                "数据来源：东方财富 / 腾讯财经公开接口，仅供个人学习研究。"
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground.opacity(0.75))
+                                            .child(if work {
+                                                "For reference only. Quotes may be delayed or erroneous; no investment advice."
+                                            } else {
+                                                "行情可能有延迟或误差，所有指标与评分仅供参考，不构成任何投资建议。"
+                                            }),
+                                    ),
+                            )
                             .child(
                                 div()
                                     .text_xs()
