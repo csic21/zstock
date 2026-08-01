@@ -315,6 +315,11 @@ fn num_f64(v: Option<&Value>) -> f64 {
     }
 }
 
+/// Positive finite financial value → `Some`, else `None` (missing / negative).
+fn pos_fin(v: f64) -> Option<f64> {
+    (v > 0.0 && v.is_finite()).then_some(v)
+}
+
 fn urlencoding_minimal(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for b in s.bytes() {
@@ -337,6 +342,10 @@ pub struct UniverseRow {
     pub market_cap: f64,
     /// 成交额（元），接口字段 f6；休市时常为 0。
     pub amount: f64,
+    /// 市盈率（动态，f9），可能为 0 / 缺失。
+    pub pe: Option<f64>,
+    /// 市净率（f23），可能为 0 / 缺失。
+    pub pb: Option<f64>,
 }
 
 /// 按总市值降序拉取沪深 A 股（含创业板/科创板），过滤 ST / 代码异常。
@@ -350,7 +359,7 @@ pub fn fetch_liquid_a_shares(limit: usize) -> Result<Vec<UniverseRow>> {
     // 深A + 创业板 + 沪A + 科创板
     let fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23";
     // 按总市值 f20 排序（休市时成交额 f6 常为空，市值更稳）
-    let fields = "f12,f14,f2,f3,f6,f20,f21";
+    let fields = "f12,f14,f2,f3,f6,f9,f20,f21,f23";
 
     while out.len() < limit && page <= 40 {
         let path = format!(
@@ -429,6 +438,8 @@ fn parse_clist_universe(v: &Value) -> Result<Vec<UniverseRow>> {
             name,
             market_cap: num_f64(item.get("f20")),
             amount: num_f64(item.get("f6")),
+            pe: pos_fin(num_f64(item.get("f9"))),
+            pb: pos_fin(num_f64(item.get("f23"))),
         });
     }
     Ok(out)

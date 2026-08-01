@@ -1,20 +1,150 @@
-//! 寻宝鼠候选宇宙：自选 + 东财扩大池（失败则回落内置龙头表）。
+//! 寻宝鼠候选宇宙：自选 + 指数成分（动态拉取）或东财市值池，可加财务分位过滤。
 //!
 //! 全市场逐只拉多年 K 线不现实；策略是：
-//! 1. 从东财 clist 按总市值取流动性较好的一批（默认约 400）
-//! 2. 合并自选
-//! 3. 深评后只保留分数 Top N（默认 100）
+//! 1. 选择候选池：指数成分（沪深300 / 中证500 / 上证50 / 创业板指 / 科创50，
+//!    新浪 `getHQNodeData` 动态拉取，含 PE/PB）或东财按总市值取一批（默认约 400）
+//! 2. 可选按 PE / PB 分位过滤（池内横截面分位）
+//! 3. 合并自选 → 深评后只保留分数 Top N（默认 100）
 
 use std::collections::BTreeSet;
 
 use anyhow::Result;
 
-use super::eastmoney;
+use super::{eastmoney, sina};
 
 /// 扩大扫描时最多深评的只数（拉多年 K 线）。
 pub const TREASURE_SCAN_CAP: usize = 400;
 /// 最终入榜只数。
 pub const TREASURE_TOP_N: usize = 100;
+
+/// 寻宝候选池来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreasurePool {
+    /// 东财按总市值取沪深 A（默认）。
+    Mcap,
+    /// 沪深300 成分。
+    Hs300,
+    /// 中证500 成分。
+    Zz500,
+    /// 上证50 成分。
+    Sh50,
+    /// 创业板指成分。
+    Cyb,
+    /// 科创50 成分。
+    Kc50,
+}
+
+impl TreasurePool {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Mcap => "mcap",
+            Self::Hs300 => "hs300",
+            Self::Zz500 => "zz500",
+            Self::Sh50 => "sh50",
+            Self::Cyb => "cyb",
+            Self::Kc50 => "kc50",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mcap => "市值",
+            Self::Hs300 => "沪深300",
+            Self::Zz500 => "中证500",
+            Self::Sh50 => "上证50",
+            Self::Cyb => "创业板指",
+            Self::Kc50 => "科创50",
+        }
+    }
+
+    pub fn all() -> [Self; 6] {
+        [Self::Mcap, Self::Hs300, Self::Zz500, Self::Sh50, Self::Cyb, Self::Kc50]
+    }
+
+    pub fn from_id(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "hs300" => Self::Hs300,
+            "zz500" => Self::Zz500,
+            "sh50" => Self::Sh50,
+            "cyb" => Self::Cyb,
+            "kc50" => Self::Kc50,
+            _ => Self::Mcap,
+        }
+    }
+
+    /// Sina `getHQNodeData` node, when the pool is index-constituent based.
+    fn sina_node(self) -> Option<&'static str> {
+        match self {
+            Self::Mcap => None,
+            Self::Hs300 => Some("hs300"),
+            Self::Zz500 => Some("zhishu_000905"),
+            Self::Sh50 => Some("zhishu_000016"),
+            Self::Cyb => Some("zhishu_399006"),
+            Self::Kc50 => Some("zhishu_000688"),
+        }
+    }
+}
+
+/// 财务分位过滤模式（在候选池内按 PE / PB 横截面分位过滤）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinFilter {
+    /// 不过滤。
+    Off,
+    /// 保留 PE 分位 ≤ 50% 的标的。
+    Pe,
+    /// 保留 PB 分位 ≤ 50% 的标的。
+    Pb,
+    /// 同时满足 PE 与 PB 分位 ≤ 50%。
+    Value,
+}
+
+impl FinFilter {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Pe => "pe",
+            Self::Pb => "pb",
+            Self::Value => "value",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "不限",
+            Self::Pe => "PE低",
+            Self::Pb => "PB低",
+            Self::Value => "PE+PB双低",
+        }
+    }
+
+    pub fn all() -> [Self; 4] {
+        [Self::Off, Self::Pe, Self::Pb, Self::Value]
+    }
+
+    pub fn from_id(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "pe" => Self::Pe,
+            "pb" => Self::Pb,
+            "value" => Self::Value,
+            _ => Self::Off,
+        }
+    }
+}
+
+/// 候选池构建结果：代码 + 来源标签 + 过滤说明。
+pub struct PoolBuild {
+    pub codes: Vec<String>,
+    pub source: &'static str,
+    pub filter_note: String,
+}
+
+/// 带估值的一行候选（用于财务分位过滤）。
+#[derive(Clone)]
+struct PoolRow {
+    code: String,
+    pe: Option<f64>,
+    pb: Option<f64>,
+}
 
 /// 内置扩展池（东财列表失败时的兜底，约 70+ 只行业代表）。
 pub fn extended_universe_codes() -> Vec<String> {
@@ -57,22 +187,130 @@ pub fn build_scan_universe_offline(watchlist: &[String]) -> Vec<String> {
     merge_watchlist_and_extra(watchlist, &extended_universe_codes(), TREASURE_SCAN_CAP)
 }
 
-/// 在线扩大：东财按市值取一批 + 自选，上限 `TREASURE_SCAN_CAP`。
+/// 按指定候选池 + 财务分位过滤构建扫描宇宙。
 ///
-/// 成功时返回 `(codes, "eastmoney-cap")`；失败回落离线池。
-pub fn build_scan_universe_expanded(watchlist: &[String]) -> (Vec<String>, &'static str) {
-    match fetch_expanded_codes(TREASURE_SCAN_CAP) {
-        Ok(online) if online.len() >= 50 => {
-            let codes = merge_watchlist_and_extra(watchlist, &online, TREASURE_SCAN_CAP);
-            (codes, "eastmoney-mcap")
+/// - 指数成分：新浪动态拉取（沪深300 / 中证500 / 上证50 / 创业板指 / 科创50）。
+/// - 市值池：东财 clist 按总市值取一批。
+/// - 任一来源失败时回落内置龙头表（无财务数据时跳过过滤）。
+pub fn build_scan_universe_for_pool(
+    watchlist: &[String],
+    pool: TreasurePool,
+    fin: FinFilter,
+) -> PoolBuild {
+    match fetch_pool_rows(pool) {
+        Ok(rows) => {
+            let (rows, note) = apply_fin_filter(rows, fin);
+            let source = match pool {
+                TreasurePool::Mcap => "eastmoney-mcap",
+                _ => "sina-index",
+            };
+            let codes: Vec<String> = rows.into_iter().map(|r| r.code).collect();
+            PoolBuild {
+                codes: merge_watchlist_and_extra(watchlist, &codes, TREASURE_SCAN_CAP),
+                source,
+                filter_note: note,
+            }
         }
-        Ok(_) | Err(_) => (build_scan_universe_offline(watchlist), "offline-fallback"),
+        Err(_) => PoolBuild {
+            codes: build_scan_universe_offline(watchlist),
+            source: "offline-fallback",
+            filter_note: "数据源不可用 · 回落内置池（跳过财务过滤）".into(),
+        },
     }
 }
 
-fn fetch_expanded_codes(limit: usize) -> Result<Vec<String>> {
-    let rows = eastmoney::fetch_liquid_a_shares(limit)?;
-    Ok(rows.into_iter().map(|r| r.code).collect())
+/// 兼容旧入口：东财市值池、不过滤。
+#[allow(dead_code)]
+pub fn build_scan_universe_expanded(watchlist: &[String]) -> (Vec<String>, &'static str) {
+    let build = build_scan_universe_for_pool(watchlist, TreasurePool::Mcap, FinFilter::Off);
+    (build.codes, build.source)
+}
+
+fn fetch_pool_rows(pool: TreasurePool) -> Result<Vec<PoolRow>> {
+    match pool {
+        TreasurePool::Mcap => {
+            let rows = eastmoney::fetch_liquid_a_shares(TREASURE_SCAN_CAP)?;
+            Ok(rows
+                .into_iter()
+                .map(|r| PoolRow {
+                    code: r.code,
+                    pe: r.pe,
+                    pb: r.pb,
+                })
+                .collect())
+        }
+        _ => {
+            let node = pool.sina_node().ok_or_else(|| anyhow::anyhow!("无指数节点"))?;
+            let rows = sina::fetch_index_constituents(node)?;
+            Ok(rows
+                .into_iter()
+                .map(|r| PoolRow {
+                    code: r.code,
+                    pe: r.pe,
+                    pb: r.pb,
+                })
+                .collect())
+        }
+    }
+}
+
+/// 池内 PE / PB 横截面分位过滤。返回过滤后的行与说明文本。
+fn apply_fin_filter(rows: Vec<PoolRow>, fin: FinFilter) -> (Vec<PoolRow>, String) {
+    if fin == FinFilter::Off || rows.is_empty() {
+        return (rows, format!("{}", fin.label()));
+    }
+    let coverage_pe = rows.iter().filter(|r| r.pe.is_some()).count();
+    let coverage_pb = rows.iter().filter(|r| r.pb.is_some()).count();
+    if coverage_pe == 0 && coverage_pb == 0 {
+        return (rows, format!("{} · 无财务数据", fin.label()));
+    }
+    let (pe_rank, pb_rank) = (percentile_ranks(rows.iter().map(|r| r.pe)), percentile_ranks(rows.iter().map(|r| r.pb)));
+    let before = rows.len();
+    let keep = |i: usize| -> bool {
+        match fin {
+            FinFilter::Off => true,
+            FinFilter::Pe => pe_rank.get(i).copied().unwrap_or(0.5) <= 0.5,
+            FinFilter::Pb => pb_rank.get(i).copied().unwrap_or(0.5) <= 0.5,
+            FinFilter::Value => {
+                pe_rank.get(i).copied().unwrap_or(0.5) <= 0.5
+                    && pb_rank.get(i).copied().unwrap_or(0.5) <= 0.5
+            }
+        }
+    };
+    let kept: Vec<PoolRow> = rows
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, r)| keep(i).then_some(r))
+        .collect();
+    let dropped = before.saturating_sub(kept.len());
+    (
+        kept,
+        format!(
+            "{} · 过滤 {dropped}（PE样本 {coverage_pe} · PB样本 {coverage_pb}）",
+            fin.label()
+        ),
+    )
+}
+
+/// 每行在全体有效值中的分位（0..1）。无值行为 0.5（视为中性，不因缺失被过滤）。
+fn percentile_ranks(values: impl Iterator<Item = Option<f64>>) -> Vec<f64> {
+    let vals: Vec<Option<f64>> = values.collect();
+    let mut present: Vec<f64> = vals.iter().flatten().copied().collect();
+    if present.is_empty() {
+        return vec![0.5; vals.len()];
+    }
+    present.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = present.len() as f64;
+    vals.iter()
+        .map(|v| match v {
+            Some(x) => {
+                let below = present.iter().filter(|p| **p < *x).count() as f64;
+                let equal = present.iter().filter(|p| **p == *x).count() as f64;
+                (below + equal * 0.5) / n
+            }
+            None => 0.5,
+        })
+        .collect()
 }
 
 fn merge_watchlist_and_extra(watchlist: &[String], extra: &[String], cap: usize) -> Vec<String> {
@@ -96,6 +334,7 @@ fn merge_watchlist_and_extra(watchlist: &[String], extra: &[String], cap: usize)
 }
 
 /// 兼容旧名。
+#[allow(dead_code)]
 pub fn build_scan_universe(watchlist: &[String]) -> Vec<String> {
     build_scan_universe_offline(watchlist)
 }
@@ -129,5 +368,49 @@ mod tests {
         let u = merge_watchlist_and_extra(&["600519".into()], &extra, 100);
         assert_eq!(u.len(), 100);
         assert_eq!(u[0], "600519");
+    }
+
+    #[test]
+    fn fin_filter_keeps_low_percentiles() {
+        let rows: Vec<PoolRow> = (0..10)
+            .map(|i| PoolRow {
+                code: format!("{:06}", i),
+                pe: Some(i as f64),
+                pb: Some(i as f64),
+            })
+            .collect();
+        let (kept, note) = apply_fin_filter(rows.clone(), FinFilter::Pe);
+        assert_eq!(kept.len(), 5, "{note}");
+        let (kept, note) = apply_fin_filter(rows.clone(), FinFilter::Value);
+        assert_eq!(kept.len(), 5, "{note}");
+        assert!(note.contains("过滤 5"));
+        let (kept, _) = apply_fin_filter(rows.clone(), FinFilter::Off);
+        assert_eq!(kept.len(), 10);
+    }
+
+    #[test]
+    fn fin_filter_skips_when_no_data() {
+        let rows: Vec<PoolRow> = (0..6)
+            .map(|i| PoolRow {
+                code: format!("{:06}", i),
+                pe: None,
+                pb: None,
+            })
+            .collect();
+        let (kept, note) = apply_fin_filter(rows.clone(), FinFilter::Value);
+        assert_eq!(kept.len(), 6);
+        assert!(note.contains("无财务数据"));
+    }
+
+    #[test]
+    fn pool_ids_roundtrip() {
+        for p in TreasurePool::all() {
+            assert_eq!(TreasurePool::from_id(p.id()), p);
+        }
+        assert_eq!(TreasurePool::from_id("bogus"), TreasurePool::Mcap);
+        for f in FinFilter::all() {
+            assert_eq!(FinFilter::from_id(f.id()), f);
+        }
+        assert_eq!(FinFilter::from_id("bogus"), FinFilter::Off);
     }
 }

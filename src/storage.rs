@@ -8,7 +8,27 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::ai::AiConfig;
 use crate::data::treasure::TreasureCache;
-use crate::model::default_watchlist_codes;
+use crate::model::{TrendLine, default_watchlist_codes};
+
+/// Serializable window bounds (x, y, width, height in logical pixels).
+pub type WindowBounds = (f32, f32, f32, f32);
+
+/// Complete dock layout: all panel sizes + window bounds.
+///
+/// `main_h` holds the widths of the horizontal panel group (left panel,
+/// center/right region) and `main_v` the heights of the vertical group
+/// (chart, bottom detail). Older configs only persisted `left_width` /
+/// `bottom_height`; when the vectors are empty the legacy fields are used.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DockLayout {
+    #[serde(default)]
+    pub main_h: Vec<f32>,
+    #[serde(default)]
+    pub main_v: Vec<f32>,
+    /// Window frame bounds `(x, y, width, height)`.
+    #[serde(default)]
+    pub window: Option<WindowBounds>,
+}
 
 /// Candlestick / quote color convention.
 ///
@@ -93,6 +113,16 @@ pub struct AppConfig {
     /// Draw volume bars under the price chart.
     #[serde(default = "default_true")]
     pub show_volume: bool,
+    /// Draw the MACD sub-pane (DIF/DEA + histogram).
+    #[serde(default = "default_true")]
+    pub show_macd: bool,
+    /// Overlay Bollinger bands on the price pane.
+    #[serde(default)]
+    pub show_boll: bool,
+    /// Full dock layout (panel sizes + window bounds). Empty vectors fall back
+    /// to the legacy `left_width` / `bottom_height` fields.
+    #[serde(default)]
+    pub dock: DockLayout,
     /// Left panel width hint (px).
     pub left_width: f32,
     /// Bottom panel height hint (px).
@@ -112,6 +142,15 @@ pub struct AppConfig {
     /// Optional LLM settings for the AI commentary feature.
     #[serde(default)]
     pub ai_api: AiConfig,
+    /// User-drawn chart lines, keyed by symbol code.
+    #[serde(default)]
+    pub chart_lines: std::collections::HashMap<String, Vec<TrendLine>>,
+    /// Treasure scan pool id (`mcap` / `hs300` / `zz500` / `sh50` / `cyb` / `kc50`).
+    #[serde(default = "default_treasure_pool")]
+    pub treasure_pool: String,
+    /// Treasure financial-percentile filter (`off` / `pe` / `pb` / `value`).
+    #[serde(default = "default_treasure_fin")]
+    pub treasure_fin: String,
 }
 
 fn default_true() -> bool {
@@ -124,6 +163,14 @@ fn default_chart_kind() -> String {
 
 fn default_quote_interval_secs() -> u64 {
     1
+}
+
+fn default_treasure_pool() -> String {
+    "mcap".into()
+}
+
+fn default_treasure_fin() -> String {
+    "off".into()
 }
 
 /// Clamp user-facing quote interval.
@@ -145,6 +192,9 @@ impl Default for AppConfig {
             show_ma20: true,
             show_ma60: true,
             show_volume: true,
+            show_macd: true,
+            show_boll: false,
+            dock: DockLayout::default(),
             left_width: 280.0,
             bottom_height: 200.0,
             color_scheme: ColorScheme::Cn,
@@ -152,6 +202,9 @@ impl Default for AppConfig {
             quote_interval_secs: default_quote_interval_secs(),
             watchlist_sort: WatchlistSort::Manual,
             ai_api: AiConfig::default(),
+            chart_lines: std::collections::HashMap::new(),
+            treasure_pool: default_treasure_pool(),
+            treasure_fin: default_treasure_fin(),
         }
     }
 }

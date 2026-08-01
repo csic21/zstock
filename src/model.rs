@@ -109,6 +109,31 @@ pub struct Candle {
     pub volume: u64,
 }
 
+/// A user-drawn chart line (trend / price line).
+///
+/// Anchors are stored in **series space** (candle index, price) so the line
+/// stays glued to the same candles when the chart is zoomed or panned.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TrendLine {
+    /// Start anchor `(candle index, price)`.
+    pub from: (usize, f64),
+    /// End anchor `(candle index, price)`.
+    pub to: (usize, f64),
+    /// Index into the chart's line-color palette.
+    pub color_ix: usize,
+}
+
+impl TrendLine {
+    pub fn new(from: (usize, f64), to: (usize, f64), color_ix: usize) -> Self {
+        Self { from, to, color_ix }
+    }
+
+    /// Horizontal price line helper (same price at both anchors).
+    pub fn price_line(ix_a: usize, ix_b: usize, price: f64, color_ix: usize) -> Self {
+        Self::new((ix_a, price), (ix_b, price), color_ix)
+    }
+}
+
 /// 分钟 K 周期（腾讯 `mkline` 支持 m1/m5/m15/m30/m60）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
