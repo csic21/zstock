@@ -18,12 +18,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REPO="${GITHUB_REPOSITORY:-csic21/zstock}"
 VERSION="${TAG#v}"
 
+# Release notes are intentionally left empty here; the app surfaces the
+# release page URL instead of inline notes.
 NOTES=""
-if command -v gh >/dev/null 2>&1 && [ -n "${GITHUB_REPOSITORY:-}" ]; then
-  # Pull the real release notes from the just-created release; never fail the
-  # job if the release is momentarily unavailable.
-  NOTES="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null || true)"
-fi
 
 mkdir -p "$ROOT/updates"
 jq -n \

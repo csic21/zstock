@@ -157,18 +157,45 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: main
-          fetch-depth: 0
 
-      - name: Generate and publish updates/stable.json to main
+      - name: Generate updates/stable.json
         env:
           TAG: ${{ github.ref_name }}
           SHA_ARM64: ${{ needs.macos.outputs.macos_arm64_sha }}
           SHA_X64: ${{ needs.macos.outputs.macos_x64_sha }}
           SHA_WIN: ${{ needs.windows.outputs.windows_sha }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          ./scripts/update-manifest.sh "$TAG" "$SHA_ARM64" "$SHA_X64" "$SHA_WIN"
-          git add updates/stable.json
-          git commit -m "chore(update): publish stable manifest for $TAG"
-          git push origin HEAD:main
+          echo "TAG=$TAG arm64=$SHA_ARM64 x64=$SHA_X64 win=$SHA_WIN"
+          test -n "$SHA_ARM64" && test -n "$SHA_X64" && test -n "$SHA_WIN"
+          bash scripts/update-manifest.sh "$TAG" "$SHA_ARM64" "$SHA_X64" "$SHA_WIN"
+          cat updates/stable.json
+
+      - name: Commit manifest to main
+        uses: actions/github-script@v7
+        env:
+          TAG: ${{ github.ref_name }}
+        with:
+          script: |
+            const fs = require("fs");
+            const content = fs.readFileSync("updates/stable.json", "utf8");
+            let sha;
+            try {
+              const existing = await github.rest.repos.getContent({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                path: "updates/stable.json",
+                ref: "main",
+              });
+              sha = existing.data.sha;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            await github.rest.repos.createOrUpdateFileContents({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              path: "updates/stable.json",
+              message: `chore(update): publish stable manifest for ${process.env.TAG}`,
+              content: Buffer.from(content).toString("base64"),
+              ...(sha ? { sha } : {}),
+              branch: "main",
+            });
