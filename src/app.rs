@@ -1,5 +1,6 @@
 //! Root application: A-share watchlist, chart (MA + crosshair), resizable layout, persistence.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use gpui::{
@@ -23,6 +24,7 @@ use gpui_component::tooltip::Tooltip;
 use crate::chart::{
     index_from_x, paint_chart, paint_sparkline, ChartPaintData, ChartStyle, MinutePaintData,
 };
+use crate::data::ai::{self, AiConfig, AiKind};
 use crate::data::treasure::{self, fmt_dd, fmt_pos, TreasureHit, TREASURE_KLINE_LIMIT};
 use crate::data::universe::{self, TREASURE_SCAN_CAP, TREASURE_TOP_N};
 use crate::data::{indicators::MaSeries, market, signals};
@@ -158,6 +160,21 @@ enum LeftTab {
     Treasure,
 }
 
+/// 底部「AI 点评」列的展示状态。
+#[derive(Debug, Clone)]
+enum AiPanelState {
+    Idle,
+    /// LLM 请求进行中；同时保留本地规则点评供展示。
+    Loading {
+        text: SharedString,
+    },
+    Ready {
+        text: SharedString,
+        /// 附加说明（例如 LLM 失败时标注“已回退本地规则”）。
+        note: Option<SharedString>,
+    },
+}
+
 pub struct StockApp {
     symbols: Vec<Symbol>,
     selected: SharedString,
@@ -229,6 +246,19 @@ pub struct StockApp {
     index_hs300: Option<IndexSnap>,
     /// 创业板指（work 模式 disk）。
     index_cyb: Option<IndexSnap>,
+    /// LLM 配置（设置面板可编辑，写入 config.json）。
+    ai_config: AiConfig,
+    /// 底部「AI 点评」状态。
+    ai_panel: AiPanelState,
+    /// 当前展示的点评对应的缓存键 `code@date`（用于防止串股）。
+    ai_key: Option<String>,
+    /// 内存缓存：`code@date` → 点评文本（本地或 LLM）。
+    ai_cache: HashMap<String, String>,
+    /// 使过期的 LLM 响应失效。
+    ai_gen: u64,
+    ai_base_url_input: Entity<InputState>,
+    ai_model_input: Entity<InputState>,
+    ai_api_key_input: Entity<InputState>,
     _subscriptions: Vec<gpui::Subscription>,
 }
 
@@ -266,14 +296,63 @@ impl StockApp {
         let palette_focus = cx.focus_handle();
         let filtered_local: Vec<usize> = (0..symbols.len()).collect();
 
-        let _subscriptions = vec![cx.subscribe_in(&palette_query, window, {
-            move |this, state: &Entity<InputState>, event: &InputEvent, _window, cx| {
-                if matches!(event, InputEvent::Change) {
-                    let q = state.read(cx).value().to_string();
-                    this.on_palette_query_changed(&q, cx);
+        let ai_cfg = cfg.ai_api.clone();
+        let ai_base_url_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("https://api.openai.com/v1")
+        });
+        let ai_model_input = cx.new(|cx| InputState::new(window, cx).placeholder("gpt-5-mini"));
+        let ai_api_key_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("sk-…")
+                .masked(true)
+        });
+        ai_base_url_input.update(cx, |state, cx| {
+            state.set_value(ai_cfg.base_url.clone(), window, cx);
+        });
+        ai_model_input.update(cx, |state, cx| {
+            state.set_value(ai_cfg.model.clone(), window, cx);
+        });
+        ai_api_key_input.update(cx, |state, cx| {
+            state.set_value(ai_cfg.api_key.clone(), window, cx);
+        });
+
+        let _subscriptions = vec![
+            cx.subscribe_in(&palette_query, window, {
+                move |this, state: &Entity<InputState>, event: &InputEvent, _window, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        let q = state.read(cx).value().to_string();
+                        this.on_palette_query_changed(&q, cx);
+                    }
                 }
-            }
-        })];
+            }),
+            cx.subscribe_in(&ai_base_url_input, window, {
+                move |this, state: &Entity<InputState>, event: &InputEvent, _window, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        this.ai_config.base_url = state.read(cx).value().to_string();
+                        this.persist();
+                        cx.notify();
+                    }
+                }
+            }),
+            cx.subscribe_in(&ai_model_input, window, {
+                move |this, state: &Entity<InputState>, event: &InputEvent, _window, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        this.ai_config.model = state.read(cx).value().to_string();
+                        this.persist();
+                        cx.notify();
+                    }
+                }
+            }),
+            cx.subscribe_in(&ai_api_key_input, window, {
+                move |this, state: &Entity<InputState>, event: &InputEvent, _window, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        this.ai_config.api_key = state.read(cx).unmask_value().to_string();
+                        this.persist();
+                        cx.notify();
+                    }
+                }
+            }),
+        ];
 
         let treasure_cache = storage::load_treasure_cache();
         let treasure_hits = treasure_cache.hits;
@@ -341,6 +420,14 @@ impl StockApp {
             index_sh: None,
             index_hs300: None,
             index_cyb: None,
+            ai_config: ai_cfg,
+            ai_panel: AiPanelState::Idle,
+            ai_key: None,
+            ai_cache: HashMap::new(),
+            ai_gen: 0,
+            ai_base_url_input,
+            ai_model_input,
+            ai_api_key_input,
             _subscriptions,
         };
 
@@ -1099,6 +1186,7 @@ impl StockApp {
             work_mode: self.work_mode,
             quote_interval_secs: self.quote_interval_secs,
             watchlist_sort: self.watchlist_sort,
+            ai_api: self.ai_config.clone(),
         };
         let _ = storage::save_config(&cfg);
     }
@@ -1245,6 +1333,136 @@ impl StockApp {
             return;
         }
         self.quote_interval_secs = secs;
+        self.persist();
+        cx.notify();
+    }
+
+    /// 当前展示的 AI 点评对应的缓存键（`code@最后一根 K 日期`）。
+    /// 与 `ai_key` 不一致时，详情栏按「未生成」展示，避免串股。
+    fn ai_current_key(&self) -> Option<String> {
+        let matched = self
+            .candles_code
+            .as_ref()
+            .is_some_and(|c| c == self.selected.as_ref());
+        if !matched {
+            return None;
+        }
+        let date = self.candles.last()?.date.to_string();
+        Some(format!("{}@{date}", self.selected))
+    }
+
+    fn request_ai_commentary(&mut self, cx: &mut Context<Self>) {
+        let Some(last) = self.candles.last() else {
+            self.ai_panel = AiPanelState::Idle;
+            cx.notify();
+            return;
+        };
+        let matched = self
+            .candles_code
+            .as_ref()
+            .is_some_and(|c| c == self.selected.as_ref());
+        if !matched {
+            self.ai_panel = AiPanelState::Idle;
+            cx.notify();
+            return;
+        }
+        let code = self.selected.to_string();
+        let name = self
+            .symbols
+            .iter()
+            .find(|s| s.code == code)
+            .map(|s| s.name.to_string())
+            .unwrap_or_default();
+        let Some(snap) = ai::build_snapshot(&self.candles, &code, &name) else {
+            self.ai_panel = AiPanelState::Ready {
+                text: shared("数据不足：策略雷达需要至少 20 根有效日 K。"),
+                note: None,
+            };
+            self.ai_key = self.ai_current_key();
+            cx.notify();
+            return;
+        };
+        let cache_key = format!("{}@{}", code, last.date);
+
+        // 内存缓存命中（本地或 LLM 结果）直接展示。
+        if let Some(hit) = self.ai_cache.get(&cache_key).cloned() {
+            self.ai_panel = AiPanelState::Ready {
+                text: hit.into(),
+                note: None,
+            };
+            self.ai_key = Some(cache_key);
+            cx.notify();
+            return;
+        }
+
+        // 先秒出本地规则点评，LLM 结果到达后再覆盖。
+        let local = ai::local_commentary(&snap);
+        self.ai_cache.insert(cache_key.clone(), local.clone());
+        self.ai_key = Some(cache_key.clone());
+
+        if !self.ai_config.enabled {
+            self.ai_panel = AiPanelState::Ready {
+                text: local.into(),
+                note: None,
+            };
+            cx.notify();
+            return;
+        }
+
+        self.ai_panel = AiPanelState::Loading {
+            text: local.clone().into(),
+        };
+        self.ai_gen = self.ai_gen.wrapping_add(1);
+        let req_id = self.ai_gen;
+        let cfg = self.ai_config.clone();
+        cx.spawn(async move |this, cx| {
+            let res = smol::unblock(move || ai::llm_commentary(&cfg, &snap)).await;
+            let _ = this.update(cx, |app, cx| {
+                if app.ai_gen != req_id {
+                    return;
+                }
+                match res {
+                    Ok(text) if !text.trim().is_empty() => {
+                        app.ai_cache.insert(cache_key.clone(), text.clone());
+                        app.ai_panel = AiPanelState::Ready {
+                            text: text.into(),
+                            note: None,
+                        };
+                    }
+                    Ok(_) => {
+                        app.ai_panel = AiPanelState::Ready {
+                            text: local.clone().into(),
+                            note: Some(shared("本地点评（LLM 返回了空内容）")),
+                        };
+                    }
+                    Err(e) => {
+                        app.ai_panel = AiPanelState::Ready {
+                            text: local.clone().into(),
+                            note: Some(shared(format!("本地点评（LLM 请求失败：{e}）"))),
+                        };
+                    }
+                }
+                app.ai_key = Some(cache_key.clone());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn set_ai_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.ai_config.enabled == enabled {
+            return;
+        }
+        self.ai_config.enabled = enabled;
+        self.persist();
+        cx.notify();
+    }
+
+    fn set_ai_kind(&mut self, kind: AiKind, cx: &mut Context<Self>) {
+        if self.ai_config.kind == kind {
+            return;
+        }
+        self.ai_config.kind = kind;
         self.persist();
         cx.notify();
     }
@@ -3184,6 +3402,162 @@ impl StockApp {
                                             }),
                                     ),
                             )
+                            // —— AI 分析 ——
+                            .child(
+                                v_flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_semibold()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(if work {
+                                                "AI analysis"
+                                            } else {
+                                                "AI 分析"
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground.opacity(0.9))
+                                            .child(if work {
+                                                "Optional LLM brief for the selected stock. Falls back to local rules when disabled or offline."
+                                            } else {
+                                                "为当前标的生成 AI 点评；未开启或请求失败时自动使用本地规则点评。"
+                                            }),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_1()
+                                            .child(
+                                                Button::new("ai-on")
+                                                    .xsmall()
+                                                    .when(self.ai_config.enabled, |b| b.primary())
+                                                    .when(!self.ai_config.enabled, |b| b.ghost())
+                                                    .label(if work { "On" } else { "开启" })
+                                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                                        this.set_ai_enabled(true, cx);
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new("ai-off")
+                                                    .xsmall()
+                                                    .when(!self.ai_config.enabled, |b| b.primary())
+                                                    .when(self.ai_config.enabled, |b| b.ghost())
+                                                    .label(if work { "Off" } else { "关闭" })
+                                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                                        this.set_ai_enabled(false, cx);
+                                                    })),
+                                            ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_1()
+                                            .children(AiKind::all().map(|kind| {
+                                                let active = self.ai_config.kind == kind;
+                                                let id = match kind {
+                                                    AiKind::Responses => "ai-kind-responses",
+                                                    AiKind::Chat => "ai-kind-chat",
+                                                };
+                                                Button::new(id)
+                                                    .xsmall()
+                                                    .when(active, |b| b.primary())
+                                                    .when(!active, |b| b.ghost())
+                                                    .label(kind.label())
+                                                    .on_click(cx.listener(
+                                                        move |this, _, _w, cx| {
+                                                            this.set_ai_kind(kind, cx);
+                                                        },
+                                                    ))
+                                            })),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(if work {
+                                                        "Base URL"
+                                                    } else {
+                                                        "API 地址"
+                                                    }),
+                                            )
+                                            .child(
+                                                Input::new(&self.ai_base_url_input).small(),
+                                            ),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(if work {
+                                                        "Model"
+                                                    } else {
+                                                        "模型"
+                                                    }),
+                                            )
+                                            .child(Input::new(&self.ai_model_input).small()),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(if work {
+                                                        "API key"
+                                                    } else {
+                                                        "API Key"
+                                                    }),
+                                            )
+                                            .child(
+                                                Input::new(&self.ai_api_key_input)
+                                                    .small()
+                                                    .mask_toggle(),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground.opacity(0.75))
+                                            .child(if work {
+                                                "Key stays in local config.json. Only the computed metric snapshot is sent to the endpoint."
+                                            } else {
+                                                "Key 仅保存在本机 config.json；只上传本地算好的指标快照，不上传原始行情。"
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(if self.ai_config.enabled {
+                                                if self.ai_config.is_configured() {
+                                                    if work {
+                                                        "Enabled · configured."
+                                                    } else {
+                                                        "已开启 · 配置完整。"
+                                                    }
+                                                } else {
+                                                    if work {
+                                                        "Enabled · missing base URL / model / key."
+                                                    } else {
+                                                        "已开启 · 尚未填全 API 地址 / 模型 / Key。"
+                                                    }
+                                                }
+                                            } else if work {
+                                                "Disabled · local rules only."
+                                            } else {
+                                                "未开启 · 仅使用本地点评。"
+                                            }),
+                                    ),
+                            )
                             // —— About / compliance ——
                             .child(
                                 v_flex()
@@ -4451,6 +4825,7 @@ impl StockApp {
                             )),
                     )
                     .child(self.render_signal_detail_col(cx))
+                    .child(self.render_ai_detail_col(cx))
                     .child(self.render_treasure_detail_col(cx))
                     .child(
                         v_flex()
@@ -4530,6 +4905,125 @@ impl StockApp {
             );
         }
         col
+    }
+
+    fn render_ai_detail_col(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let work = self.work_mode;
+        let current = self.ai_current_key();
+        let shown = current.is_some() && self.ai_key.as_deref() == current.as_deref();
+        let loading = matches!(&self.ai_panel, AiPanelState::Loading { .. });
+        // 只有「正在分析当前标的」时才禁用按钮；其他标的可并行触发。
+        let busy = shown && loading;
+        let has_signal = self.current_signal().is_some();
+
+        let mut col = v_flex()
+            .gap_1()
+            .min_w(px(250.))
+            .max_w(px(380.))
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if work { "AI Brief" } else { "AI 点评" }),
+                    )
+                    .child(
+                        Button::new("ai-request-btn")
+                            .xsmall()
+                            .ghost()
+                            .label(if busy {
+                                if work { "Working…" } else { "分析中…" }
+                            } else if work {
+                                "Generate"
+                            } else {
+                                "生成点评"
+                            })
+                            .disabled(busy || !has_signal)
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.request_ai_commentary(cx);
+                            })),
+                    ),
+            );
+
+        if shown {
+            match &self.ai_panel {
+                AiPanelState::Loading { text } => {
+                    col = col.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().foreground)
+                            .child(text.clone()),
+                    );
+                    col = col.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if work {
+                                "LLM brief in progress…"
+                            } else {
+                                "正在请求 LLM 点评…"
+                            }),
+                    );
+                }
+                AiPanelState::Ready { text, note } => {
+                    col = col.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().foreground)
+                            .child(text.clone()),
+                    );
+                    if let Some(note) = note {
+                        col = col.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground.opacity(0.9))
+                                .child(note.clone()),
+                        );
+                    }
+                }
+                AiPanelState::Idle => {
+                    col = col.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if work { "Not generated." } else { "尚未生成。" }),
+                    );
+                }
+            }
+        } else if !has_signal {
+            col = col.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("至少需要 20 根有效日K数据。"),
+            );
+        } else {
+            col = col.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if work {
+                        "Click Generate for an AI brief."
+                    } else {
+                        "点击「生成点评」查看 AI 分析。"
+                    }),
+            );
+        }
+
+        col.child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground.opacity(0.75))
+                .child(if work {
+                    "For reference only, not investment advice."
+                } else {
+                    "仅供学习研究，不构成投资建议。"
+                }),
+        )
     }
 
     fn render_treasure_detail_col(&self, cx: &mut Context<Self>) -> impl IntoElement {

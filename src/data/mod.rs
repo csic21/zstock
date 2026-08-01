@@ -1,5 +1,6 @@
 //! Market data providers and technical indicators.
 
+pub mod ai;
 pub mod eastmoney;
 pub mod indicators;
 pub mod market;

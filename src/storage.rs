@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::data::ai::AiConfig;
 use crate::data::treasure::TreasureCache;
 use crate::model::default_watchlist_codes;
 
@@ -108,6 +109,9 @@ pub struct AppConfig {
     /// How the watchlist is ordered in the sidebar.
     #[serde(default)]
     pub watchlist_sort: WatchlistSort,
+    /// Optional LLM settings for the AI commentary feature.
+    #[serde(default)]
+    pub ai_api: AiConfig,
 }
 
 fn default_true() -> bool {
@@ -147,6 +151,7 @@ impl Default for AppConfig {
             work_mode: false,
             quote_interval_secs: default_quote_interval_secs(),
             watchlist_sort: WatchlistSort::Manual,
+            ai_api: AiConfig::default(),
         }
     }
 }
