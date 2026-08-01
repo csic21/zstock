@@ -73,7 +73,8 @@ git push origin v0.0.1
 
 | 平台 | 文件 | 说明 |
 |------|------|------|
-| macOS | `stock-analysis-macos-universal.zip` | `Stock Analysis.app`，x86_64 + arm64 通用 |
+| macOS（Apple Silicon） | `stock-analysis-macos-arm64.zip` | `Stock Analysis.app`（arm64） |
+| macOS（Intel） | `stock-analysis-macos-x64.zip` | `Stock Analysis.app`（x86_64） |
 | Windows | `stock-analysis-windows-x64.zip` | `stock.exe` + README |
 
 说明：
