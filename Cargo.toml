@@ -1,6 +1,6 @@
 [package]
 name = "stock"
-version = "0.0.10"
+version = "0.0.11"
 edition = "2024"
 description = "A-share stock analysis desktop app built with GPUI"
 license = "MIT"
