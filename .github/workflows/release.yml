@@ -23,6 +23,18 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Verify version matches tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          cargo_version="$(sed -nE 's/^version = "([^"]+)".*/\1/p' Cargo.toml | head -1)"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ -z "$cargo_version" ] || [ "$cargo_version" != "$tag_version" ]; then
+            echo "::error::Version mismatch: Cargo.toml=${cargo_version:-<missing>} tag=${tag_version}"
+            exit 1
+          fi
+          echo "OK: Cargo.toml version ${cargo_version} matches tag ${tag_version}"
+
       - name: Build release
         run: cargo build --release
 
@@ -62,6 +74,25 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
+
+      - name: Verify version matches tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          cargo_version="$(sed -nE 's/^version = "([^"]+)".*/\1/p' Cargo.toml | head -1)"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ -z "$cargo_version" ] || [ "$cargo_version" != "$tag_version" ]; then
+            echo "::error::Version mismatch: Cargo.toml=${cargo_version:-<missing>} tag=${tag_version}"
+            exit 1
+          fi
+          echo "OK: Cargo.toml version ${cargo_version} matches tag ${tag_version}"
+
+      - name: Sync Info.plist version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          plutil -replace CFBundleShortVersionString -string "$tag_version" assets/macos/Info.plist
+          plutil -replace CFBundleVersion -string "$tag_version" assets/macos/Info.plist
 
       - name: Build release (x86_64 + arm64)
         run: |

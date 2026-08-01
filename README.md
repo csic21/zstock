@@ -65,9 +65,12 @@ open "dist/Stock Analysis.app"
 推送 `v*` tag 会触发 [release.yml](.github/workflows/release.yml) 自动打包并创建 GitHub Release：
 
 ```bash
+# 发布前先把 Cargo.toml 的 version 改成目标版本（与 tag 一致，workflow 会校验）
 git tag v0.0.1
 git push origin v0.0.1
 ```
+
+macOS 的 `Info.plist` 版本会在打包时根据 tag 自动同步。
 
 产物：
 
