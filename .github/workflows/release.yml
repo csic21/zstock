@@ -13,6 +13,8 @@ jobs:
   windows:
     name: Windows (x64)
     runs-on: windows-latest
+    outputs:
+      windows_sha: ${{ steps.hash.outputs.sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,6 +48,11 @@ jobs:
           Copy-Item README.md dist\stock-windows-x64\ -ErrorAction SilentlyContinue
           Compress-Archive -Path dist\stock-windows-x64 -DestinationPath dist\stock-analysis-windows-x64.zip -Force
 
+      - name: Hash package
+        id: hash
+        shell: bash
+        run: echo "sha=$(shasum -a 256 dist/stock-analysis-windows-x64.zip | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
       - name: Upload to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
@@ -63,6 +70,9 @@ jobs:
   macos:
     name: macOS (arm64 + x64)
     runs-on: macos-latest
+    outputs:
+      macos_arm64_sha: ${{ steps.hash.outputs.arm64 }}
+      macos_x64_sha: ${{ steps.hash.outputs.x64 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -115,6 +125,12 @@ jobs:
           cd dist
           ditto -c -k --keepParent "Stock Analysis.app" stock-analysis-macos-x64.zip
 
+      - name: Hash packages
+        id: hash
+        run: |
+          echo "arm64=$(shasum -a 256 dist/stock-analysis-macos-arm64.zip | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "x64=$(shasum -a 256 dist/stock-analysis-macos-x64.zip | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
       - name: Upload to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
@@ -130,3 +146,30 @@ jobs:
         with:
           name: stock-analysis-macos
           path: dist/stock-analysis-macos-*.zip
+
+  manifest:
+    name: Update stable manifest
+    needs: [macos, windows]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate and publish updates/stable.json to main
+        env:
+          TAG: ${{ github.ref_name }}
+          SHA_ARM64: ${{ needs.macos.outputs.macos_arm64_sha }}
+          SHA_X64: ${{ needs.macos.outputs.macos_x64_sha }}
+          SHA_WIN: ${{ needs.windows.outputs.windows_sha }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout -B manifest-publish FETCH_HEAD
+          ./scripts/update-manifest.sh "$TAG" "$SHA_ARM64" "$SHA_X64" "$SHA_WIN"
+          git add updates/stable.json
+          git commit -m "chore(update): publish stable manifest for $TAG"
+          git push origin manifest-publish:main

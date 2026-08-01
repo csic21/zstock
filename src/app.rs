@@ -363,7 +363,7 @@ impl StockApp {
         // 旧缓存可能只有代码没有中文名
         self.enrich_treasure_names_if_needed(cx);
         // Auto-update: check shortly after startup, then periodically.
-        self.check_for_updates(cx);
+        self.check_for_updates(false, cx);
         cx.spawn(async move |this, cx| {
             loop {
                 Timer::after(Duration::from_secs(4 * 60 * 60)).await;
@@ -380,7 +380,8 @@ impl StockApp {
                         app.update_state = match res {
                             Ok(Some(info)) => UpdateState::Available(info),
                             Ok(None) => UpdateState::UpToDate,
-                            Err(e) => UpdateState::Error(e),
+                            // 自动检查失败保持安静（参考 Zed：离线/清单暂缺都不打扰用户）。
+                            Err(_) => UpdateState::Idle,
                         };
                         cx.notify();
                     })
@@ -1256,7 +1257,7 @@ impl StockApp {
         cx.notify();
     }
 
-    fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+    fn check_for_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
         self.update_state = UpdateState::Checking;
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -1266,7 +1267,9 @@ impl StockApp {
                     app.update_state = match res {
                         Ok(Some(info)) => UpdateState::Available(info),
                         Ok(None) => UpdateState::UpToDate,
-                        Err(e) => UpdateState::Error(e),
+                        // 只有手动点“检查更新”才把错误展示出来，自动检查静默。
+                        Err(e) if manual => UpdateState::Error(e),
+                        Err(_) => UpdateState::Idle,
                     };
                     cx.notify();
                 })
@@ -3158,7 +3161,7 @@ impl StockApp {
                                                             | UpdateState::Downloading(_)
                                                     ))
                                                     .on_click(cx.listener(|this, _, _w, cx| {
-                                                        this.check_for_updates(cx);
+                                                        this.check_for_updates(true, cx);
                                                     })),
                                             )
                                             .children(match &self.update_state {

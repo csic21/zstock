@@ -84,18 +84,25 @@ macOS 的 `Info.plist` 版本会在打包时根据 tag 自动同步。
 
 - 未做正式签名：macOS 首次打开需右键「打开」，Windows 可能提示 SmartScreen。
 - 在 Actions 页面手动运行该 workflow 只上传构建产物（artifacts），不会创建 Release。
+- 每次 tag 发布后会自动生成 `updates/stable.json`（Zed 风格更新清单，含各平台
+  SHA-256）并推送到 `main`，供客户端静默检查更新。
 
 ## 自动更新
 
-应用启动后会异步检查 [GitHub Releases](https://github.com/csic21/zstock/releases) 是否有新版本：
+更新检查参考 Zed：客户端**不调用 GitHub API**，而是轮询一个静态更新清单
+`updates/stable.json`（每次发版由 release workflow 自动生成并推送到 `main`，
+经 raw.githubusercontent 静态分发）。清单只有极小的一段 JSON：版本号、
+各平台下载直链和 SHA-256。
 
 - 有新版本时，标题栏出现「更新 vX」按钮（设置面板里也有「检查更新 / 立即更新」）。
-- 点击后自动下载当前平台（macOS arm64/x64 或 Windows x64）的安装包，替换并重启应用。
-- 检查时机：启动后约 3 秒 + 每 4 小时一次；设置面板可手动触发。
-- 版本比较基于 git tag（`v*`），需要与 release workflow 的产物命名一致。
+- 点击后从 GitHub Releases 直链下载当前平台（macOS arm64/x64 或 Windows x64）
+  的安装包，**校验 SHA-256** 后替换并重启应用。
+- 检查时机：启动后 + 每 4 小时一次；设置面板可手动触发。
+- 自动检查失败保持静默（离线 / 清单暂缺不打扰用户），手动检查会显示错误。
+- 版本比较基于清单里的 semver 版本，需要与 release workflow 的产物命名一致。
 
-注意：更新源是 GitHub Releases API，**仓库需设为 public** 客户端才能匿名访问
-（private 仓库的 API 与安装包下载都需要登录，检查会失败）。
+注意：清单与安装包均走 GitHub 静态地址，**仓库需设为 public** 客户端才能匿名访问
+（private 仓库的 raw 文件与安装包下载都需要登录）。
 
 ## Logo
 
