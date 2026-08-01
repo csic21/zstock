@@ -82,6 +82,18 @@ git push origin v0.0.1
 - 未做正式签名：macOS 首次打开需右键「打开」，Windows 可能提示 SmartScreen。
 - 在 Actions 页面手动运行该 workflow 只上传构建产物（artifacts），不会创建 Release。
 
+## 自动更新
+
+应用启动后会异步检查 [GitHub Releases](https://github.com/csic21/zstock/releases) 是否有新版本：
+
+- 有新版本时，标题栏出现「更新 vX」按钮（设置面板里也有「检查更新 / 立即更新」）。
+- 点击后自动下载当前平台（macOS arm64/x64 或 Windows x64）的安装包，替换并重启应用。
+- 检查时机：启动后约 3 秒 + 每 4 小时一次；设置面板可手动触发。
+- 版本比较基于 git tag（`v*`），需要与 release workflow 的产物命名一致。
+
+注意：更新源是 GitHub Releases API，**仓库需设为 public** 客户端才能匿名访问
+（private 仓库的 API 与安装包下载都需要登录，检查会失败）。
+
 ## Logo
 
 主识别为几何双线 **S**（Stock），Zed 风格深色圆角 + 银白线。

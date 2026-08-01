@@ -32,6 +32,7 @@ use crate::model::{
     format_volume, shared, Candle, IndexSnap, MinutePeriod, MinuteSeries, QuoteSnapshot, Symbol,
 };
 use crate::storage::{self, clamp_quote_interval_secs, AppConfig, ColorScheme, WatchlistSort};
+use crate::update::{self, UpdateState};
 
 actions!(
     stock,
@@ -192,6 +193,8 @@ pub struct StockApp {
     palette_open: bool,
     /// Settings overlay.
     settings_open: bool,
+    /// Auto-update state (GitHub Releases).
+    update_state: UpdateState,
     /// Quote poll interval (seconds), from config.
     quote_interval_secs: u64,
     palette_query: Entity<InputState>,
@@ -315,6 +318,7 @@ impl StockApp {
             data_source: shared(market::SRC_LABEL),
             palette_open: false,
             settings_open: false,
+            update_state: UpdateState::Idle,
             quote_interval_secs: clamp_quote_interval_secs(cfg.quote_interval_secs),
             palette_query,
             palette_focus,
@@ -358,6 +362,36 @@ impl StockApp {
         self.refresh_all(cx);
         // 旧缓存可能只有代码没有中文名
         self.enrich_treasure_names_if_needed(cx);
+        // Auto-update: check shortly after startup, then periodically.
+        self.check_for_updates(cx);
+        cx.spawn(async move |this, cx| {
+            loop {
+                Timer::after(Duration::from_secs(4 * 60 * 60)).await;
+                let res = smol::unblock(update::check_latest).await;
+                if this
+                    .update(cx, |app, cx| {
+                        // Never clobber an in-flight install or visible error.
+                        if matches!(
+                            app.update_state,
+                            UpdateState::Downloading(_) | UpdateState::Error(_)
+                        ) {
+                            return;
+                        }
+                        app.update_state = match res {
+                            Ok(Some(info)) => UpdateState::Available(info),
+                            Ok(None) => UpdateState::UpToDate,
+                            Err(e) => UpdateState::Error(e),
+                        };
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         // Major indices for work-mode host gauges
         cx.spawn(async move |this, cx| {
             let idx = smol::unblock(market::fetch_major_indices).await;
@@ -1220,6 +1254,105 @@ impl StockApp {
             self.palette_open = false;
         }
         cx.notify();
+    }
+
+    fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        self.update_state = UpdateState::Checking;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = smol::unblock(update::check_latest).await;
+            if this
+                .update(cx, |app, cx| {
+                    app.update_state = match res {
+                        Ok(Some(info)) => UpdateState::Available(info),
+                        Ok(None) => UpdateState::UpToDate,
+                        Err(e) => UpdateState::Error(e),
+                    };
+                    cx.notify();
+                })
+                .is_err()
+            {
+                return;
+            }
+        })
+        .detach();
+    }
+
+    fn start_update(&mut self, cx: &mut Context<Self>) {
+        let info = match &self.update_state {
+            UpdateState::Available(info) => info.clone(),
+            _ => return,
+        };
+        self.update_state = UpdateState::Downloading(info.version.clone());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = smol::unblock(move || update::download_and_install(&info)).await;
+            if let Err(e) = res {
+                let _ = this.update(cx, |app, cx| {
+                    app.update_state = UpdateState::Error(e);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn render_update_button(&self, cx: &mut Context<Self>) -> Option<Button> {
+        match &self.update_state {
+            UpdateState::Available(info) => {
+                let version = info.version.clone();
+                let notes = info.notes.clone();
+                let release_url = info.release_url.clone();
+                let tooltip = format!(
+                    "发现新版本 v{version}，点击下载并重启应用{}\n发布页：{release_url}",
+                    if notes.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n\n{}", notes.chars().take(240).collect::<String>())
+                    }
+                );
+                Some(
+                    Button::new("update-btn")
+                        .primary()
+                        .xsmall()
+                        .label(format!("更新 v{version}"))
+                        .tooltip(tooltip)
+                        .on_click(cx.listener(|this, _, _w, cx| this.start_update(cx))),
+                )
+            }
+            UpdateState::Downloading(version) => Some(
+                Button::new("update-downloading")
+                    .xsmall()
+                    .disabled(true)
+                    .label(format!("更新中 {version}…")),
+            ),
+            _ => None,
+        }
+    }
+
+    fn update_status_line(&self, work: bool) -> String {
+        match &self.update_state {
+            UpdateState::Idle | UpdateState::Checking => {
+                (if work { "Checking…" } else { "正在检查更新…" }).to_string()
+            }
+            UpdateState::UpToDate => format!(
+                "v{} · {}",
+                env!("CARGO_PKG_VERSION"),
+                if work { "up to date" } else { "已是最新版本" }
+            ),
+            UpdateState::Available(info) => format!(
+                "{} v{}（{} v{}）",
+                if work { "New version" } else { "发现新版本" },
+                info.version,
+                if work { "current" } else { "当前" },
+                env!("CARGO_PKG_VERSION")
+            ),
+            UpdateState::Downloading(version) => format!(
+                "{} v{version}…",
+                if work { "Downloading" } else { "正在下载" }
+            ),
+            UpdateState::Error(e) => e.clone(),
+        }
     }
 
     /// Color for a rising (`up`) or falling move under the active convention.
@@ -2775,6 +2908,7 @@ impl StockApp {
                                     this.toggle_palette(window, cx);
                                 })),
                         )
+                        .when(!work, |row| row.children(self.render_update_button(cx)))
                         .child(
                             Button::new("settings-btn")
                                 .ghost()
@@ -2987,6 +3121,64 @@ impl StockApp {
                                                         this.set_work_mode(true, window, cx);
                                                     })),
                                             ),
+                                    ),
+                            )
+                            // —— Update ——
+                            .child(
+                                v_flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_semibold()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(if work { "Update" } else { "更新" }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground.opacity(0.9))
+                                            .child(self.update_status_line(work)),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_1()
+                                            .child(
+                                                Button::new("check-update-btn")
+                                                    .xsmall()
+                                                    .ghost()
+                                                    .label(if work {
+                                                        "Check"
+                                                    } else {
+                                                        "检查更新"
+                                                    })
+                                                    .disabled(matches!(
+                                                        self.update_state,
+                                                        UpdateState::Checking
+                                                            | UpdateState::Downloading(_)
+                                                    ))
+                                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                                        this.check_for_updates(cx);
+                                                    })),
+                                            )
+                                            .children(match &self.update_state {
+                                                UpdateState::Available(_) => Some(
+                                                    Button::new("settings-update-now")
+                                                        .xsmall()
+                                                        .primary()
+                                                        .label(if work {
+                                                            "Update now"
+                                                        } else {
+                                                            "立即更新"
+                                                        })
+                                                        .on_click(cx.listener(
+                                                            |this, _, _w, cx| {
+                                                                this.start_update(cx);
+                                                            },
+                                                        )),
+                                                ),
+                                                _ => None,
+                                            }),
                                     ),
                             )
                             .child(
