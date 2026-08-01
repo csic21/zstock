@@ -90,9 +90,9 @@ macOS 的 `Info.plist` 版本会在打包时根据 tag 自动同步。
 ## 自动更新
 
 更新检查参考 Zed：客户端**不调用 GitHub API**，而是轮询一个静态更新清单
-`updates/stable.json`（每次发版由 release workflow 自动生成并推送到 `main`，
-经 raw.githubusercontent 静态分发）。清单只有极小的一段 JSON：版本号、
-各平台下载直链和 SHA-256。
+`updates/stable.json`（每次发版由 release workflow 自动生成并推送到 `main`）。
+清单只有极小的一段 JSON：版本号、各平台下载直链和 SHA-256。清单源依次尝试
+raw.githubusercontent 与 jsDelivr CDN（国内网络 raw 常被代理/拦截，CDN 兜底）。
 
 - 有新版本时，标题栏出现「更新 vX」按钮（设置面板里也有「检查更新 / 立即更新」）。
 - 点击后从 GitHub Releases 直链下载当前平台（macOS arm64/x64 或 Windows x64）
