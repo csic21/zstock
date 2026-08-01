@@ -161,22 +161,21 @@ jobs:
       - name: Generate updates/stable.json
         env:
           TAG: ${{ github.ref_name }}
-          SHA_ARM64: ${{ needs.macos.outputs.macos_arm64_sha }}
-          SHA_X64: ${{ needs.macos.outputs.macos_x64_sha }}
-          SHA_WIN: ${{ needs.windows.outputs.windows_sha }}
         run: |
+          cd "$RUNNER_TEMP"
+          for p in macos-arm64 macos-x64 windows-x64; do
+            curl -fsSL -o "$p.zip" "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/stock-analysis-$p.zip" \
+              || { echo "::error::failed to download $p.zip for $TAG"; exit 1; }
+          done
+          SHA_ARM64="$(shasum -a 256 macos-arm64.zip | awk '{print $1}')"
+          SHA_X64="$(shasum -a 256 macos-x64.zip | awk '{print $1}')"
+          SHA_WIN="$(shasum -a 256 windows-x64.zip | awk '{print $1}')"
           echo "TAG=$TAG arm64=$SHA_ARM64 x64=$SHA_X64 win=$SHA_WIN"
-          test -n "$SHA_ARM64" && test -n "$SHA_X64" && test -n "$SHA_WIN"
-          set +e
-          manifest_output="$(bash scripts/update-manifest.sh "$TAG" "$SHA_ARM64" "$SHA_X64" "$SHA_WIN" 2>&1)"
-          manifest_status=$?
-          set -e
-          echo "$manifest_output"
-          if [ "$manifest_status" -ne 0 ]; then
-            echo "::error::update-manifest.sh exited ${manifest_status}: ${manifest_output}"
-            exit "$manifest_status"
-          fi
-          cat updates/stable.json
+          test -n "$SHA_ARM64" && test -n "$SHA_X64" && test -n "$SHA_WIN" \
+            || { echo "::error::hash computation failed"; exit 1; }
+          bash "$GITHUB_WORKSPACE/scripts/update-manifest.sh" "$TAG" "$SHA_ARM64" "$SHA_X64" "$SHA_WIN" \
+            || { echo "::error::update-manifest.sh failed"; exit 1; }
+          cat "$GITHUB_WORKSPACE/updates/stable.json"
 
       - name: Commit manifest to main
         uses: actions/github-script@v7
@@ -184,26 +183,31 @@ jobs:
           TAG: ${{ github.ref_name }}
         with:
           script: |
-            const fs = require("fs");
-            const content = fs.readFileSync("updates/stable.json", "utf8");
-            let sha;
             try {
-              const existing = await github.rest.repos.getContent({
+              const fs = require("fs");
+              const content = fs.readFileSync("updates/stable.json", "utf8");
+              let sha;
+              try {
+                const existing = await github.rest.repos.getContent({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  path: "updates/stable.json",
+                  ref: "main",
+                });
+                sha = existing.data.sha;
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+              await github.rest.repos.createOrUpdateFileContents({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 path: "updates/stable.json",
-                ref: "main",
+                message: `chore(update): publish stable manifest for ${process.env.TAG}`,
+                content: Buffer.from(content).toString("base64"),
+                ...(sha ? { sha } : {}),
+                branch: "main",
               });
-              sha = existing.data.sha;
             } catch (error) {
-              if (error.status !== 404) throw error;
+              core.error(`manifest commit failed: ${error.message}`);
+              throw error;
             }
-            await github.rest.repos.createOrUpdateFileContents({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              path: "updates/stable.json",
-              message: `chore(update): publish stable manifest for ${process.env.TAG}`,
-              content: Buffer.from(content).toString("base64"),
-              ...(sha ? { sha } : {}),
-              branch: "main",
-            });
