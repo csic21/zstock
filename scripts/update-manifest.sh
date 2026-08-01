@@ -6,13 +6,14 @@
 # to the repo's `main` branch, where it is served statically via
 # raw.githubusercontent.
 #
-# Usage: update-manifest.sh <tag> <arm64-sha256> <x64-sha256> <windows-sha256>
+# Usage: update-manifest.sh <tag> <arm64-sha256> <x64-sha256> <windows-sha256> <linux-x64-sha256>
 set -euo pipefail
 
-TAG="${1:?usage: update-manifest.sh <tag> <arm64-sha256> <x64-sha256> <windows-sha256>}"
+TAG="${1:?usage: update-manifest.sh <tag> <arm64-sha256> <x64-sha256> <windows-sha256> <linux-x64-sha256>}"
 SHA_ARM64="${2:?missing arm64 sha256}"
 SHA_X64="${3:?missing x64 sha256}"
 SHA_WIN="${4:?missing windows sha256}"
+SHA_LINUX="${5:?missing linux-x64 sha256}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REPO="${GITHUB_REPOSITORY:-csic21/zstock}"
@@ -42,6 +43,10 @@ cat > "$ROOT/updates/stable.json" <<EOF
     "windows-x64": {
       "url": "https://github.com/$REPO/releases/download/$TAG/stock-analysis-windows-x64.zip",
       "sha256": "$SHA_WIN"
+    },
+    "linux-x64": {
+      "url": "https://github.com/$REPO/releases/download/$TAG/stock-analysis-linux-x64.zip",
+      "sha256": "$SHA_LINUX"
     }
   }
 }

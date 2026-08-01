@@ -51,6 +51,19 @@ xcodebuild -downloadComponent MetalToolchain
 
 可去掉 `Cargo.toml` 里的 `runtime_shaders` feature。
 
+### Linux
+
+依赖系统库：`libxkbcommon`、`libwayland`、`libx11`、`libxcb-*`、`libfontconfig`、
+`libfreetype`（Debian/Ubuntu 用 `-dev` 后缀，例如 `sudo apt install libxkbcommon-dev
+libwayland-dev libx11-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev
+libxcb-xfixes0-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev pkg-config`）。
+
+```bash
+cargo run --release
+```
+
+运行时需要 Vulkan 驱动（如 `mesa-vulkan-drivers`）或软件渲染（lavapipe）。
+
 ### 打包 macOS `.app`（带 S logo）
 
 ```bash
@@ -79,6 +92,7 @@ macOS 的 `Info.plist` 版本会在打包时根据 tag 自动同步。
 | macOS（Apple Silicon） | `stock-analysis-macos-arm64.zip` | `ZStock.app`（arm64） |
 | macOS（Intel） | `stock-analysis-macos-x64.zip` | `ZStock.app`（x86_64） |
 | Windows | `stock-analysis-windows-x64.zip` | `stock.exe` + README |
+| Linux | `stock-analysis-linux-x64.zip` | `stock` 二进制 + README |
 
 说明：
 
@@ -95,8 +109,8 @@ macOS 的 `Info.plist` 版本会在打包时根据 tag 自动同步。
 raw.githubusercontent 与 jsDelivr CDN（国内网络 raw 常被代理/拦截，CDN 兜底）。
 
 - 有新版本时，标题栏出现「更新 vX」按钮（设置面板里也有「检查更新 / 立即更新」）。
-- 点击后从 GitHub Releases 直链下载当前平台（macOS arm64/x64 或 Windows x64）
-  的安装包，**校验 SHA-256** 后替换并重启应用。
+- 点击后从 GitHub Releases 直链下载当前平台（macOS arm64/x64、Windows x64 或
+  Linux x64）的安装包，**校验 SHA-256** 后替换并重启应用。
 - 检查时机：启动后 + 每 4 小时一次；设置面板可手动触发。
 - 自动检查失败保持静默（离线 / 清单暂缺不打扰用户），手动检查会显示错误。
 - 版本比较基于清单里的 semver 版本，需要与 release workflow 的产物命名一致。

@@ -87,6 +87,10 @@ fn platform_key() -> &'static str {
         "macos-x64"
     } else if cfg!(target_os = "windows") {
         "windows-x64"
+    } else if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
+        "linux-x64"
+    } else if cfg!(target_os = "linux") {
+        "linux-arm64"
     } else {
         "unsupported"
     }
@@ -187,7 +191,9 @@ pub fn download_and_install(info: &UpdateInfo) -> Result<(), String> {
     install_macos(&extracted)?;
     #[cfg(target_os = "windows")]
     install_windows(&extracted)?;
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    install_linux(&extracted)?;
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     return Err("当前平台暂不支持自动更新".to_string());
 
     Ok(())
@@ -244,7 +250,7 @@ fn install_macos(extracted: &Path) -> Result<(), String> {
             .map_err(|e| format!("启动新版本失败：{e}"))?;
     } else {
         // Standalone binary (e.g. `cargo run`): replace in place.
-        replace_binary(&exe, &extracted.join(BINARY_NAME))?;
+        replace_binary(&exe, &extracted.join(BINARY_NAME), "old")?;
         Command::new(&exe)
             .spawn()
             .map_err(|e| format!("启动新版本失败：{e}"))?;
@@ -297,7 +303,21 @@ fn install_windows(extracted: &Path) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("定位当前程序失败：{e}"))?;
     let new_exe = find_named_file(extracted, "stock.exe")
         .ok_or_else(|| "更新包中缺少 stock.exe".to_string())?;
-    replace_binary(&exe, &new_exe)?;
+    replace_binary(&exe, &new_exe, "exe.old")?;
+    Command::new(&exe)
+        .spawn()
+        .map_err(|e| format!("启动新版本失败：{e}"))?;
+
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    std::process::exit(0);
+}
+
+#[cfg(target_os = "linux")]
+fn install_linux(extracted: &Path) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("定位当前程序失败：{e}"))?;
+    let new_exe = find_named_file(extracted, BINARY_NAME)
+        .ok_or_else(|| format!("更新包中缺少 {BINARY_NAME}"))?;
+    replace_binary(&exe, &new_exe, "old")?;
     Command::new(&exe)
         .spawn()
         .map_err(|e| format!("启动新版本失败：{e}"))?;
@@ -308,8 +328,8 @@ fn install_windows(extracted: &Path) -> Result<(), String> {
 
 /// Replace `current` with `new`, keeping a `.old` copy that is removed when
 /// possible (Windows keeps the running image locked, so cleanup may be deferred).
-fn replace_binary(current: &Path, new: &Path) -> Result<(), String> {
-    let backup = current.with_extension("exe.old");
+fn replace_binary(current: &Path, new: &Path, backup_suffix: &str) -> Result<(), String> {
+    let backup = current.with_extension(backup_suffix);
     let _ = fs::remove_file(&backup);
     fs::rename(current, &backup).map_err(|e| format!("无法重命名当前程序：{e}"))?;
     if let Err(e) = fs::copy(new, current) {
@@ -320,7 +340,7 @@ fn replace_binary(current: &Path, new: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn find_named_file(root: &Path, name: &str) -> Option<PathBuf> {
     fn walk(dir: &Path, name: &str, depth: usize) -> Option<PathBuf> {
         if depth > 4 {
@@ -372,7 +392,10 @@ mod tests {
     #[test]
     fn platform_key_is_one_of_supported() {
         let key = platform_key();
-        assert!(matches!(key, "macos-arm64" | "macos-x64" | "windows-x64"));
+        assert!(matches!(
+            key,
+            "macos-arm64" | "macos-x64" | "windows-x64" | "linux-x64" | "linux-arm64"
+        ));
     }
 
     #[test]

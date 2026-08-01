@@ -147,9 +147,66 @@ jobs:
           name: stock-analysis-macos
           path: dist/stock-analysis-macos-*.zip
 
+  linux:
+    name: Linux (x64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify version matches tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          cargo_version="$(sed -nE 's/^version = "([^"]+)".*/\1/p' Cargo.toml | head -1)"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ -z "$cargo_version" ] || [ "$cargo_version" != "$tag_version" ]; then
+            echo "::error::Version mismatch: Cargo.toml=${cargo_version:-<missing>} tag=${tag_version}"
+            exit 1
+          fi
+          echo "OK: Cargo.toml version ${cargo_version} matches tag ${tag_version}"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Package
+        run: |
+          mkdir -p dist/stock-linux-x64
+          cp target/release/stock dist/stock-linux-x64/
+          cp README.md dist/stock-linux-x64/
+          cd dist
+          zip -r stock-analysis-linux-x64.zip stock-linux-x64
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/stock-analysis-linux-x64.zip
+          generate_release_notes: true
+
+      - name: Upload artifact (manual run)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: stock-analysis-linux-x64
+          path: dist/stock-analysis-linux-x64.zip
+
   manifest:
     name: Update stable manifest
-    needs: [macos, windows]
+    needs: [macos, windows, linux]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
@@ -163,17 +220,18 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           cd "$RUNNER_TEMP"
-          for p in macos-arm64 macos-x64 windows-x64; do
+          for p in macos-arm64 macos-x64 windows-x64 linux-x64; do
             curl -fsSL -o "$p.zip" "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/stock-analysis-$p.zip" \
               || { echo "::error::failed to download $p.zip for $TAG"; exit 1; }
           done
           SHA_ARM64="$(shasum -a 256 macos-arm64.zip | awk '{print $1}')"
           SHA_X64="$(shasum -a 256 macos-x64.zip | awk '{print $1}')"
           SHA_WIN="$(shasum -a 256 windows-x64.zip | awk '{print $1}')"
-          echo "TAG=$TAG arm64=$SHA_ARM64 x64=$SHA_X64 win=$SHA_WIN"
-          test -n "$SHA_ARM64" && test -n "$SHA_X64" && test -n "$SHA_WIN" \
+          SHA_LINUX="$(shasum -a 256 linux-x64.zip | awk '{print $1}')"
+          echo "TAG=$TAG arm64=$SHA_ARM64 x64=$SHA_X64 win=$SHA_WIN linux=$SHA_LINUX"
+          test -n "$SHA_ARM64" && test -n "$SHA_X64" && test -n "$SHA_WIN" && test -n "$SHA_LINUX" \
             || { echo "::error::hash computation failed"; exit 1; }
-          bash "$GITHUB_WORKSPACE/scripts/update-manifest.sh" "$TAG" "$SHA_ARM64" "$SHA_X64" "$SHA_WIN" \
+          bash "$GITHUB_WORKSPACE/scripts/update-manifest.sh" "$TAG" "$SHA_ARM64" "$SHA_X64" "$SHA_WIN" "$SHA_LINUX" \
             || { echo "::error::update-manifest.sh failed"; exit 1; }
           cat "$GITHUB_WORKSPACE/updates/stable.json"
 
