@@ -23,18 +23,29 @@ VERSION="${TAG#v}"
 NOTES=""
 
 mkdir -p "$ROOT/updates"
-jq -n \
-  --arg version "$VERSION" \
-  --arg notes "$NOTES" \
-  --arg release_url "https://github.com/$REPO/releases/tag/$TAG" \
-  --arg url_arm64 "https://github.com/$REPO/releases/download/$TAG/stock-analysis-macos-arm64.zip" \
-  --arg sha_arm64 "$SHA_ARM64" \
-  --arg url_x64 "https://github.com/$REPO/releases/download/$TAG/stock-analysis-macos-x64.zip" \
-  --arg sha_x64 "$SHA_X64" \
-  --arg url_win "https://github.com/$REPO/releases/download/$TAG/stock-analysis-windows-x64.zip" \
-  --arg sha_win "$SHA_WIN" \
-  '{version:$version, notes:$notes, release_url:$release_url, platforms:{"macos-arm64":{url:$url_arm64,sha256:$sha_arm64},"macos-x64":{url:$url_x64,sha256:$sha_x64},"windows-x64":{url:$url_win,sha256:$sha_win}}}' \
-  > "$ROOT/updates/stable.json"
+# Pure-bash heredoc: no jq or other external tools, so this works on any
+# GitHub-hosted runner regardless of preinstalled software.
+cat > "$ROOT/updates/stable.json" <<EOF
+{
+  "version": "$VERSION",
+  "notes": "",
+  "release_url": "https://github.com/$REPO/releases/tag/$TAG",
+  "platforms": {
+    "macos-arm64": {
+      "url": "https://github.com/$REPO/releases/download/$TAG/stock-analysis-macos-arm64.zip",
+      "sha256": "$SHA_ARM64"
+    },
+    "macos-x64": {
+      "url": "https://github.com/$REPO/releases/download/$TAG/stock-analysis-macos-x64.zip",
+      "sha256": "$SHA_X64"
+    },
+    "windows-x64": {
+      "url": "https://github.com/$REPO/releases/download/$TAG/stock-analysis-windows-x64.zip",
+      "sha256": "$SHA_WIN"
+    }
+  }
+}
+EOF
 
 echo "==> wrote $ROOT/updates/stable.json"
 cat "$ROOT/updates/stable.json"

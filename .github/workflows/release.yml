@@ -167,7 +167,15 @@ jobs:
         run: |
           echo "TAG=$TAG arm64=$SHA_ARM64 x64=$SHA_X64 win=$SHA_WIN"
           test -n "$SHA_ARM64" && test -n "$SHA_X64" && test -n "$SHA_WIN"
-          bash scripts/update-manifest.sh "$TAG" "$SHA_ARM64" "$SHA_X64" "$SHA_WIN"
+          set +e
+          manifest_output="$(bash scripts/update-manifest.sh "$TAG" "$SHA_ARM64" "$SHA_X64" "$SHA_WIN" 2>&1)"
+          manifest_status=$?
+          set -e
+          echo "$manifest_output"
+          if [ "$manifest_status" -ne 0 ]; then
+            echo "::error::update-manifest.sh exited ${manifest_status}: ${manifest_output}"
+            exit "$manifest_status"
+          fi
           cat updates/stable.json
 
       - name: Commit manifest to main
