@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=ZStock
+Name[zh_CN]=ZStock
+GenericName=Stock Analysis
+Comment=A-share stock analysis desktop app
+Comment[zh_CN]=A股桌面分析工具
+Exec=@EXEC@ %U
+Icon=zstock
+Terminal=false
+Categories=Finance;Office;
+Keywords=stock;finance;kline;treasure;

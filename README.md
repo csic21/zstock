@@ -73,6 +73,23 @@ open "dist/ZStock.app"
 
 图标资源在 `assets/logo/`（见下方）。
 
+### 安装 Linux（桌面集成）
+
+Linux 安装包内含二进制、`.desktop` 入口、hicolor 图标和一键安装脚本：
+
+```bash
+tar -xzf stock-analysis-linux-x64.zip
+cd stock-linux-x64
+./install.sh              # 安装到 ~/.local，注册应用菜单与图标
+./install.sh --uninstall  # 卸载（保留应用配置）
+```
+
+### 安装 Windows
+
+直接运行 `stock-analysis-windows-x64-setup.exe`（Inno Setup 安装器，按用户安装无需
+管理员权限，自动创建开始菜单快捷方式与卸载入口；桌面快捷方式为可选）。
+安装后的自动更新仍走 zip 包就地替换 `stock.exe`。
+
 ## 自动发布（GitHub Actions）
 
 推送 `v*` tag 会触发 [release.yml](.github/workflows/release.yml) 自动打包并创建 GitHub Release：
@@ -91,8 +108,8 @@ macOS 的 `Info.plist` 版本会在打包时根据 tag 自动同步。
 |------|------|------|
 | macOS（Apple Silicon） | `stock-analysis-macos-arm64.zip` | `ZStock.app`（arm64） |
 | macOS（Intel） | `stock-analysis-macos-x64.zip` | `ZStock.app`（x86_64） |
-| Windows | `stock-analysis-windows-x64.zip` | `stock.exe` + README |
-| Linux | `stock-analysis-linux-x64.zip` | `stock` 二进制 + README |
+| Windows | `stock-analysis-windows-x64.zip` | `stock.exe` + README；另产出 `stock-analysis-windows-x64-setup.exe`（Inno Setup 安装器） |
+| Linux | `stock-analysis-linux-x64.zip` | `stock` + README + `.desktop`/图标/`install.sh`（安装到 `~/.local`） |
 
 说明：
 
@@ -110,7 +127,8 @@ raw.githubusercontent 与 jsDelivr CDN（国内网络 raw 常被代理/拦截，
 
 - 有新版本时，标题栏出现「更新 vX」按钮（设置面板里也有「检查更新 / 立即更新」）。
 - 点击后从 GitHub Releases 直链下载当前平台（macOS arm64/x64、Windows x64 或
-  Linux x64）的安装包，**校验 SHA-256** 后替换并重启应用。
+  Linux x64）的安装包，**校验 SHA-256** 后安装并重启应用（macOS 用 rsync
+  就地同步 `.app` 内容，避免整体替换目录；Windows/Linux 直接替换二进制）。
 - 检查时机：启动后 + 每 4 小时一次；设置面板可手动触发。
 - 自动检查失败保持静默（离线 / 清单暂缺不打扰用户），手动检查会显示错误。
 - 版本比较基于清单里的 semver 版本，需要与 release workflow 的产物命名一致。

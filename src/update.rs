@@ -2,7 +2,9 @@
 //! (Zed-style). The release workflow regenerates `updates/stable.json` on
 //! every `v*` tag; the app fetches it from raw.githubusercontent, compares the
 //! semver version, then downloads the platform package from a direct release
-//! URL, verifies its SHA-256, replaces the running app and relaunches.
+//! URL, verifies its SHA-256, installs it in place and relaunches. On macOS
+//! the new .app contents are synced over the installed bundle with rsync
+//! (the running process is untouched), with a whole-bundle swap as fallback.
 
 use std::collections::HashMap;
 use std::fs;
@@ -219,30 +221,23 @@ fn install_macos(extracted: &Path) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("定位当前程序失败：{e}"))?;
 
     if let Some(bundle) = bundle_dir(&exe) {
-        // Running inside a .app bundle: swap the whole bundle.
+        // Running inside a .app bundle: prefer Zed-style in-place sync with
+        // rsync, falling back to a whole-bundle swap if rsync is unavailable
+        // or the sync does not leave a valid binary behind.
         let new_bundle = find_new_bundle(extracted)
             .ok_or_else(|| format!("更新包中缺少 {APP_BUNDLE_NAME} 或 {LEGACY_BUNDLE_NAME}"))?;
-        let parent = bundle.parent().ok_or_else(|| "应用目录无效".to_string())?;
-        let file_name = bundle
-            .file_name()
-            .ok_or_else(|| "应用目录无效".to_string())?;
-        let backup = parent.join(format!("{}.old-update", file_name.to_string_lossy()));
 
-        let _ = fs::remove_dir_all(&backup);
-        fs::rename(&bundle, &backup).map_err(|e| format!("无法移动旧应用（目录只读？）：{e}"))?;
-        if let Err(e) = fs::rename(&new_bundle, &bundle) {
-            // Fallback for cross-volume moves.
-            if let Err(copy_err) = copy_dir_all(&new_bundle, &bundle) {
-                let _ = fs::rename(&backup, &bundle); // roll back
-                return Err(format!("替换应用失败：{e} / {copy_err}"));
-            }
+        if rsync_into(&new_bundle, &bundle).is_ok()
+            && bundle.join("Contents").join("MacOS").join(BINARY_NAME).is_file()
+        {
+            // Re-sign ad-hoc so the bundle stays consistent after the sync.
+            let _ = Command::new("codesign")
+                .args(["--force", "-s", "-"])
+                .arg(&bundle)
+                .output();
+        } else {
+            swap_bundle(&bundle, &new_bundle)?;
         }
-        // Re-sign ad-hoc so the bundle stays consistent after the swap.
-        let _ = Command::new("codesign")
-            .args(["--force", "-s", "-"])
-            .arg(&bundle)
-            .output();
-        let _ = fs::remove_dir_all(&backup);
 
         Command::new("open")
             .arg(&bundle)
@@ -259,6 +254,63 @@ fn install_macos(extracted: &Path) -> Result<(), String> {
     // Give the new process a moment to start, then quit.
     std::thread::sleep(std::time::Duration::from_millis(800));
     std::process::exit(0);
+}
+
+/// Sync the contents of `src` (a fresh .app bundle) over `dst` (the installed
+/// bundle), Zed-style. Works while the app is running because macOS allows
+/// open files to be replaced; the running image is unaffected. A trailing
+/// slash on the source copies the bundle *contents* into `dst`.
+#[cfg(target_os = "macos")]
+fn rsync_into(src: &Path, dst: &Path) -> Result<(), String> {
+    let mut src_arg = src.as_os_str().to_os_string();
+    src_arg.push("/");
+    let output = Command::new("rsync")
+        .arg("-a")
+        // Compare by content, not just size+mtime: two builds can produce a
+        // binary with the same size and mtime, which rsync would otherwise
+        // skip even though the code changed.
+        .arg("--checksum")
+        .arg("--delete")
+        .arg("--exclude")
+        .arg("Icon?")
+        .arg(&src_arg)
+        .arg(dst)
+        .output()
+        .map_err(|e| format!("无法运行 rsync（macOS 自带，无需安装）：{e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// Whole-bundle swap: move the installed bundle aside, put the new one in
+/// place, re-sign, then clean up the backup. Kept as a fallback when rsync
+/// is unavailable or the sync leaves the bundle in a bad state.
+#[cfg(target_os = "macos")]
+fn swap_bundle(bundle: &Path, new_bundle: &Path) -> Result<(), String> {
+    let parent = bundle.parent().ok_or_else(|| "应用目录无效".to_string())?;
+    let file_name = bundle
+        .file_name()
+        .ok_or_else(|| "应用目录无效".to_string())?;
+    let backup = parent.join(format!("{}.old-update", file_name.to_string_lossy()));
+
+    let _ = fs::remove_dir_all(&backup);
+    fs::rename(bundle, &backup).map_err(|e| format!("无法移动旧应用（目录只读？）：{e}"))?;
+    if let Err(e) = fs::rename(new_bundle, bundle) {
+        // Fallback for cross-volume moves.
+        if let Err(copy_err) = copy_dir_all(new_bundle, bundle) {
+            let _ = fs::rename(&backup, bundle); // roll back
+            return Err(format!("替换应用失败：{e} / {copy_err}"));
+        }
+    }
+    // Re-sign ad-hoc so the bundle stays consistent after the swap.
+    let _ = Command::new("codesign")
+        .args(["--force", "-s", "-"])
+        .arg(bundle)
+        .output();
+    let _ = fs::remove_dir_all(&backup);
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]

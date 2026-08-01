@@ -48,6 +48,28 @@ jobs:
           Copy-Item README.md dist\stock-windows-x64\ -ErrorAction SilentlyContinue
           Compress-Archive -Path dist\stock-windows-x64 -DestinationPath dist\stock-analysis-windows-x64.zip -Force
 
+      - name: Compute version
+        id: version
+        shell: bash
+        run: |
+          cargo_version="$(sed -nE 's/^version = "([^"]+)".*/\1/p' Cargo.toml | head -1)"
+          test -n "$cargo_version" || { echo "::error::could not read version from Cargo.toml"; exit 1; }
+          echo "ver=${cargo_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = Get-ChildItem "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" -ErrorAction Stop
+          & $iscc.FullName "/DAppVersion=${{ steps.version.outputs.ver }}" "assets\windows\installer.iss"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "ISCC failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+          if (-not (Test-Path "dist\stock-analysis-windows-x64-setup.exe")) {
+            Write-Error "installer was not produced"
+            exit 1
+          }
+
       - name: Hash package
         id: hash
         shell: bash
@@ -57,7 +79,9 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/stock-analysis-windows-x64.zip
+          files: |
+            dist/stock-analysis-windows-x64.zip
+            dist/stock-analysis-windows-x64-setup.exe
           generate_release_notes: true
 
       - name: Upload artifact (manual run)
@@ -65,7 +89,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: stock-analysis-windows-x64
-          path: dist/stock-analysis-windows-x64.zip
+          path: |
+            dist/stock-analysis-windows-x64.zip
+            dist/stock-analysis-windows-x64-setup.exe
 
   macos:
     name: macOS (arm64 + x64)
@@ -184,9 +210,15 @@ jobs:
 
       - name: Package
         run: |
-          mkdir -p dist/stock-linux-x64
+          mkdir -p dist/stock-linux-x64/icons/hicolor/256x256/apps
+          mkdir -p dist/stock-linux-x64/icons/hicolor/512x512/apps
           cp target/release/stock dist/stock-linux-x64/
           cp README.md dist/stock-linux-x64/
+          cp assets/linux/zstock.desktop dist/stock-linux-x64/
+          cp scripts/install-linux.sh dist/stock-linux-x64/install.sh
+          chmod +x dist/stock-linux-x64/install.sh
+          cp assets/linux/icons/hicolor/256x256/apps/zstock.png dist/stock-linux-x64/icons/hicolor/256x256/apps/
+          cp assets/linux/icons/hicolor/512x512/apps/zstock.png dist/stock-linux-x64/icons/hicolor/512x512/apps/
           cd dist
           zip -r stock-analysis-linux-x64.zip stock-linux-x64
 
