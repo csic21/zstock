@@ -1,13 +1,13 @@
 [package]
 name = "stock"
-version = "0.0.7"
+version = "0.0.8"
 edition = "2024"
 description = "A-share stock analysis desktop app built with GPUI"
 license = "MIT"
 
 # Optional: cargo install cargo-bundle && cargo bundle --release
 [package.metadata.bundle]
-name = "Stock Analysis"
+name = "ZStock"
 identifier = "com.karl.stock-analysis"
 icon = ["assets/logo/app-icon.png"]
 category = "Finance"

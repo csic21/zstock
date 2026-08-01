@@ -24,7 +24,10 @@ const UPDATE_MANIFEST_URLS: &[&str] = &[
     "https://cdn.jsdelivr.net/gh/csic21/zstock@main/updates/stable.json",
 ];
 const UPDATE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-const APP_BUNDLE_NAME: &str = "Stock Analysis.app";
+const APP_BUNDLE_NAME: &str = "ZStock.app";
+/// Bundle name used before the v0.0.8 rename; still accepted when installing
+/// so packages from either naming era can be applied.
+const LEGACY_BUNDLE_NAME: &str = "Stock Analysis.app";
 const BINARY_NAME: &str = "stock";
 
 /// UI state of the auto-updater.
@@ -211,10 +214,8 @@ fn install_macos(extracted: &Path) -> Result<(), String> {
 
     if let Some(bundle) = bundle_dir(&exe) {
         // Running inside a .app bundle: swap the whole bundle.
-        let new_bundle = extracted.join(APP_BUNDLE_NAME);
-        if !new_bundle.is_dir() {
-            return Err(format!("更新包中缺少 {APP_BUNDLE_NAME}"));
-        }
+        let new_bundle = find_new_bundle(extracted)
+            .ok_or_else(|| format!("更新包中缺少 {APP_BUNDLE_NAME} 或 {LEGACY_BUNDLE_NAME}"))?;
         let parent = bundle.parent().ok_or_else(|| "应用目录无效".to_string())?;
         let file_name = bundle
             .file_name()
@@ -259,6 +260,17 @@ fn bundle_dir(exe: &Path) -> Option<PathBuf> {
     exe.ancestors()
         .find(|p| p.extension().map_or(false, |e| e == "app"))
         .map(Path::to_path_buf)
+}
+
+/// Locate the app bundle inside an extracted update, preferring the current
+/// bundle name and falling back to the pre-rename one.
+fn find_new_bundle(extracted: &Path) -> Option<PathBuf> {
+    let primary = extracted.join(APP_BUNDLE_NAME);
+    if primary.is_dir() {
+        return Some(primary);
+    }
+    let legacy = extracted.join(LEGACY_BUNDLE_NAME);
+    legacy.is_dir().then_some(legacy)
 }
 
 #[cfg(target_os = "macos")]
@@ -361,6 +373,23 @@ mod tests {
     fn platform_key_is_one_of_supported() {
         let key = platform_key();
         assert!(matches!(key, "macos-arm64" | "macos-x64" | "windows-x64"));
+    }
+
+    #[test]
+    fn finds_new_bundle_preferring_current_name() {
+        let dir = std::env::temp_dir().join(format!("stock-bundle-new-{}", std::process::id()));
+        fs::create_dir_all(dir.join(APP_BUNDLE_NAME)).unwrap();
+        fs::create_dir_all(dir.join(LEGACY_BUNDLE_NAME)).unwrap();
+        let found = find_new_bundle(&dir).unwrap();
+        assert_eq!(found.file_name().unwrap(), APP_BUNDLE_NAME);
+        fs::remove_dir_all(&dir).unwrap();
+
+        let legacy =
+            std::env::temp_dir().join(format!("stock-bundle-legacy-{}", std::process::id()));
+        fs::create_dir_all(legacy.join(LEGACY_BUNDLE_NAME)).unwrap();
+        let found = find_new_bundle(&legacy).unwrap();
+        assert_eq!(found.file_name().unwrap(), LEGACY_BUNDLE_NAME);
+        fs::remove_dir_all(&legacy).unwrap();
     }
 
     #[test]

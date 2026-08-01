@@ -1,4 +1,4 @@
-# Stock Analysis · A股（GPUI）
+# ZStock · A股（GPUI）
 
 跨平台桌面 A 股分析原型：Zed 风格深色 UI + 东方财富免费公开行情 + MA/十字线 + 可拖拽多面板 + 本地自选持久化。
 
@@ -55,7 +55,7 @@ xcodebuild -downloadComponent MetalToolchain
 
 ```bash
 ./scripts/package-macos.sh
-open "dist/Stock Analysis.app"
+open "dist/ZStock.app"
 ```
 
 图标资源在 `assets/logo/`（见下方）。
@@ -76,8 +76,8 @@ macOS 的 `Info.plist` 版本会在打包时根据 tag 自动同步。
 
 | 平台 | 文件 | 说明 |
 |------|------|------|
-| macOS（Apple Silicon） | `stock-analysis-macos-arm64.zip` | `Stock Analysis.app`（arm64） |
-| macOS（Intel） | `stock-analysis-macos-x64.zip` | `Stock Analysis.app`（x86_64） |
+| macOS（Apple Silicon） | `stock-analysis-macos-arm64.zip` | `ZStock.app`（arm64） |
+| macOS（Intel） | `stock-analysis-macos-x64.zip` | `ZStock.app`（x86_64） |
 | Windows | `stock-analysis-windows-x64.zip` | `stock.exe` + README |
 
 说明：

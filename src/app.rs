@@ -52,7 +52,7 @@ actions!(
 );
 
 /// Window title in normal vs work mode.
-const TITLE_NORMAL: &str = "Stock Analysis · A股";
+const TITLE_NORMAL: &str = "ZStock · A股";
 const TITLE_WORK: &str = "Notes";
 
 /// Preset quote poll intervals offered in Settings (seconds).

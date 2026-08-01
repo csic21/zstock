@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-APP_NAME="Stock Analysis"
+APP_NAME="ZStock"
 BUNDLE_ID="com.karl.stock-analysis"
 BINARY_NAME="stock"
 DIST="${ROOT}/dist"
