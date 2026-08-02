@@ -16,7 +16,7 @@ if [ -z "$ARCH_LABEL" ]; then
 fi
 
 DIST="${ROOT}/dist"
-OUT="${DIST}/stock-analysis-macos-${ARCH_LABEL}.dmg"
+OUT="${DIST}/zstock-macos-${ARCH_LABEL}.dmg"
 STAGE="${DIST}/dmg-staging"
 RW_IMG="${DIST}/.zstock-raw.dmg"
 

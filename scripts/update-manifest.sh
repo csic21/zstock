@@ -33,19 +33,19 @@ cat > "$ROOT/updates/stable.json" <<EOF
   "release_url": "https://github.com/$REPO/releases/tag/$TAG",
   "platforms": {
     "macos-arm64": {
-      "url": "https://github.com/$REPO/releases/download/$TAG/stock-analysis-macos-arm64.zip",
+      "url": "https://github.com/$REPO/releases/download/$TAG/zstock-macos-arm64.zip",
       "sha256": "$SHA_ARM64"
     },
     "macos-x64": {
-      "url": "https://github.com/$REPO/releases/download/$TAG/stock-analysis-macos-x64.zip",
+      "url": "https://github.com/$REPO/releases/download/$TAG/zstock-macos-x64.zip",
       "sha256": "$SHA_X64"
     },
     "windows-x64": {
-      "url": "https://github.com/$REPO/releases/download/$TAG/stock-analysis-windows-x64.zip",
+      "url": "https://github.com/$REPO/releases/download/$TAG/zstock-windows-x64.zip",
       "sha256": "$SHA_WIN"
     },
     "linux-x64": {
-      "url": "https://github.com/$REPO/releases/download/$TAG/stock-analysis-linux-x64.zip",
+      "url": "https://github.com/$REPO/releases/download/$TAG/zstock-linux-x64.zip",
       "sha256": "$SHA_LINUX"
     }
   }

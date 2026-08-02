@@ -88,8 +88,8 @@ open "dist/ZStock.app"
 ./scripts/package-dmg.sh x64
 ```
 
-产物在 `dist/` 下：`stock-analysis-macos-<arch>.pkg` 与
-`stock-analysis-macos-<arch>.dmg`。
+产物在 `dist/` 下：`zstock-macos-<arch>.pkg` 与
+`zstock-macos-<arch>.dmg`。
 
 图标资源在 `assets/logo/`（见下方）。
 
@@ -98,15 +98,15 @@ open "dist/ZStock.app"
 Linux 安装包内含二进制、`.desktop` 入口、hicolor 图标和一键安装脚本：
 
 ```bash
-tar -xzf stock-analysis-linux-x64.zip
-cd stock-linux-x64
+tar -xzf zstock-linux-x64.zip
+cd zstock-linux-x64
 ./install.sh              # 安装到 ~/.local，注册应用菜单与图标
 ./install.sh --uninstall  # 卸载（保留应用配置）
 ```
 
 ### 安装 Windows
 
-直接运行 `stock-analysis-windows-x64-setup.exe`（Inno Setup 安装器，按用户安装无需
+直接运行 `zstock-windows-x64-setup.exe`（Inno Setup 安装器，按用户安装无需
 管理员权限，自动创建开始菜单快捷方式与卸载入口；桌面快捷方式为可选）。
 安装后的自动更新仍走 zip 包就地替换 `stock.exe`。
 
@@ -126,10 +126,10 @@ macOS 的 `Info.plist` 版本会在打包时根据 tag 自动同步。
 
 | 平台 | 文件 | 说明 |
 |------|------|------|
-| macOS（Apple Silicon） | `stock-analysis-macos-arm64.zip` / `.dmg` / `.pkg` | `ZStock.app`（arm64）；`.pkg` 免拖拽安装，`.dmg` 拖拽安装 |
-| macOS（Intel） | `stock-analysis-macos-x64.zip` / `.dmg` / `.pkg` | `ZStock.app`（x86_64）；同上 |
-| Windows | `stock-analysis-windows-x64.zip` | `stock.exe` + README；另产出 `stock-analysis-windows-x64-setup.exe`（Inno Setup 安装器） |
-| Linux | `stock-analysis-linux-x64.zip` | `stock` + README + `.desktop`/图标/`install.sh`（安装到 `~/.local`） |
+| macOS（Apple Silicon） | `zstock-macos-arm64.zip` / `.dmg` / `.pkg` | `ZStock.app`（arm64）；`.pkg` 免拖拽安装，`.dmg` 拖拽安装 |
+| macOS（Intel） | `zstock-macos-x64.zip` / `.dmg` / `.pkg` | `ZStock.app`（x86_64）；同上 |
+| Windows | `zstock-windows-x64.zip` | `stock.exe` + README；另产出 `zstock-windows-x64-setup.exe`（Inno Setup 安装器） |
+| Linux | `zstock-linux-x64.zip` | `stock` + README + `.desktop`/图标/`install.sh`（安装到 `~/.local`） |
 
 说明：
 

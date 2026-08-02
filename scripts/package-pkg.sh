@@ -22,7 +22,7 @@ test -n "$VERSION" || { echo "::error::could not read version from Cargo.toml" >
 DIST="${ROOT}/dist"
 PAYLOAD="${DIST}/pkg-payload"
 COMPONENT="${DIST}/stock-component.pkg"
-OUT="${DIST}/stock-analysis-macos-${ARCH_LABEL}.pkg"
+OUT="${DIST}/zstock-macos-${ARCH_LABEL}.pkg"
 
 # 1. Build / refresh the .app bundle.
 SKIP_CARGO_BUILD="${SKIP_CARGO_BUILD:-0}" ./scripts/package-macos.sh

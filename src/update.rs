@@ -426,7 +426,7 @@ mod tests {
             "release_url": "https://github.com/csic21/zstock/releases/tag/v0.0.3",
             "platforms": {
                 "macos-arm64": {
-                    "url": "https://github.com/csic21/zstock/releases/download/v0.0.3/stock-analysis-macos-arm64.zip",
+                    "url": "https://github.com/csic21/zstock/releases/download/v0.0.3/zstock-macos-arm64.zip",
                     "sha256": "abc123"
                 }
             }

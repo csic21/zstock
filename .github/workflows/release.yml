@@ -43,10 +43,10 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist\stock-windows-x64 | Out-Null
-          Copy-Item target\release\stock.exe dist\stock-windows-x64\
-          Copy-Item README.md dist\stock-windows-x64\ -ErrorAction SilentlyContinue
-          Compress-Archive -Path dist\stock-windows-x64 -DestinationPath dist\stock-analysis-windows-x64.zip -Force
+          New-Item -ItemType Directory -Force dist\zstock-windows-x64 | Out-Null
+          Copy-Item target\release\stock.exe dist\zstock-windows-x64\
+          Copy-Item README.md dist\zstock-windows-x64\ -ErrorAction SilentlyContinue
+          Compress-Archive -Path dist\zstock-windows-x64 -DestinationPath dist\zstock-windows-x64.zip -Force
 
       - name: Compute version
         id: version
@@ -65,7 +65,7 @@ jobs:
             Write-Error "ISCC failed with exit code $LASTEXITCODE"
             exit $LASTEXITCODE
           }
-          if (-not (Test-Path "dist\stock-analysis-windows-x64-setup.exe")) {
+          if (-not (Test-Path "dist\zstock-windows-x64-setup.exe")) {
             Write-Error "installer was not produced"
             exit 1
           }
@@ -73,25 +73,25 @@ jobs:
       - name: Hash package
         id: hash
         shell: bash
-        run: echo "sha=$(shasum -a 256 dist/stock-analysis-windows-x64.zip | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(shasum -a 256 dist/zstock-windows-x64.zip | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
       - name: Upload to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/stock-analysis-windows-x64.zip
-            dist/stock-analysis-windows-x64-setup.exe
+            dist/zstock-windows-x64.zip
+            dist/zstock-windows-x64-setup.exe
           generate_release_notes: true
 
       - name: Upload artifact (manual run)
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@v4
         with:
-          name: stock-analysis-windows-x64
+          name: zstock-windows-x64
           path: |
-            dist/stock-analysis-windows-x64.zip
-            dist/stock-analysis-windows-x64-setup.exe
+            dist/zstock-windows-x64.zip
+            dist/zstock-windows-x64-setup.exe
 
   macos:
     name: macOS (arm64 + x64)
@@ -141,7 +141,7 @@ jobs:
           cp target/aarch64-apple-darwin/release/stock target/release/stock
           SKIP_CARGO_BUILD=1 ./scripts/package-macos.sh
           cd dist
-          ditto -c -k --keepParent "ZStock.app" stock-analysis-macos-arm64.zip
+          ditto -c -k --keepParent "ZStock.app" zstock-macos-arm64.zip
           cd ..
           SKIP_CARGO_BUILD=1 ./scripts/package-dmg.sh arm64
           SKIP_CARGO_BUILD=1 ./scripts/package-pkg.sh arm64
@@ -152,7 +152,7 @@ jobs:
           cp target/x86_64-apple-darwin/release/stock target/release/stock
           SKIP_CARGO_BUILD=1 ./scripts/package-macos.sh
           cd dist
-          ditto -c -k --keepParent "ZStock.app" stock-analysis-macos-x64.zip
+          ditto -c -k --keepParent "ZStock.app" zstock-macos-x64.zip
           cd ..
           SKIP_CARGO_BUILD=1 ./scripts/package-dmg.sh x64
           SKIP_CARGO_BUILD=1 ./scripts/package-pkg.sh x64
@@ -160,28 +160,28 @@ jobs:
       - name: Hash packages
         id: hash
         run: |
-          echo "arm64=$(shasum -a 256 dist/stock-analysis-macos-arm64.zip | awk '{print $1}')" >> "$GITHUB_OUTPUT"
-          echo "x64=$(shasum -a 256 dist/stock-analysis-macos-x64.zip | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "arm64=$(shasum -a 256 dist/zstock-macos-arm64.zip | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "x64=$(shasum -a 256 dist/zstock-macos-x64.zip | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
       - name: Upload to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/stock-analysis-macos-arm64.zip
-            dist/stock-analysis-macos-arm64.dmg
-            dist/stock-analysis-macos-arm64.pkg
-            dist/stock-analysis-macos-x64.zip
-            dist/stock-analysis-macos-x64.dmg
-            dist/stock-analysis-macos-x64.pkg
+            dist/zstock-macos-arm64.zip
+            dist/zstock-macos-arm64.dmg
+            dist/zstock-macos-arm64.pkg
+            dist/zstock-macos-x64.zip
+            dist/zstock-macos-x64.dmg
+            dist/zstock-macos-x64.pkg
           generate_release_notes: true
 
       - name: Upload artifact (manual run)
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@v4
         with:
-          name: stock-analysis-macos
-          path: dist/stock-analysis-macos-*
+          name: zstock-macos
+          path: dist/zstock-macos-*
 
   linux:
     name: Linux (x64)
@@ -220,31 +220,31 @@ jobs:
 
       - name: Package
         run: |
-          mkdir -p dist/stock-linux-x64/icons/hicolor/256x256/apps
-          mkdir -p dist/stock-linux-x64/icons/hicolor/512x512/apps
-          cp target/release/stock dist/stock-linux-x64/
-          cp README.md dist/stock-linux-x64/
-          cp assets/linux/zstock.desktop dist/stock-linux-x64/
-          cp scripts/install-linux.sh dist/stock-linux-x64/install.sh
-          chmod +x dist/stock-linux-x64/install.sh
-          cp assets/linux/icons/hicolor/256x256/apps/zstock.png dist/stock-linux-x64/icons/hicolor/256x256/apps/
-          cp assets/linux/icons/hicolor/512x512/apps/zstock.png dist/stock-linux-x64/icons/hicolor/512x512/apps/
+          mkdir -p dist/zstock-linux-x64/icons/hicolor/256x256/apps
+          mkdir -p dist/zstock-linux-x64/icons/hicolor/512x512/apps
+          cp target/release/stock dist/zstock-linux-x64/
+          cp README.md dist/zstock-linux-x64/
+          cp assets/linux/zstock.desktop dist/zstock-linux-x64/
+          cp scripts/install-linux.sh dist/zstock-linux-x64/install.sh
+          chmod +x dist/zstock-linux-x64/install.sh
+          cp assets/linux/icons/hicolor/256x256/apps/zstock.png dist/zstock-linux-x64/icons/hicolor/256x256/apps/
+          cp assets/linux/icons/hicolor/512x512/apps/zstock.png dist/zstock-linux-x64/icons/hicolor/512x512/apps/
           cd dist
-          zip -r stock-analysis-linux-x64.zip stock-linux-x64
+          zip -r zstock-linux-x64.zip zstock-linux-x64
 
       - name: Upload to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/stock-analysis-linux-x64.zip
+          files: dist/zstock-linux-x64.zip
           generate_release_notes: true
 
       - name: Upload artifact (manual run)
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@v4
         with:
-          name: stock-analysis-linux-x64
-          path: dist/stock-analysis-linux-x64.zip
+          name: zstock-linux-x64
+          path: dist/zstock-linux-x64.zip
 
   manifest:
     name: Update stable manifest
@@ -263,7 +263,7 @@ jobs:
         run: |
           cd "$RUNNER_TEMP"
           for p in macos-arm64 macos-x64 windows-x64 linux-x64; do
-            curl -fsSL -o "$p.zip" "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/stock-analysis-$p.zip" \
+            curl -fsSL -o "$p.zip" "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/zstock-$p.zip" \
               || { echo "::error::failed to download $p.zip for $TAG"; exit 1; }
           done
           SHA_ARM64="$(shasum -a 256 macos-arm64.zip | awk '{print $1}')"
