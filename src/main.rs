@@ -7,6 +7,8 @@ mod update;
 
 #[cfg(target_os = "macos")]
 mod mac_gesture;
+#[cfg(target_os = "macos")]
+mod mac_status_bar;
 
 fn main() {
     app::run();

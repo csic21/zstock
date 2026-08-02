@@ -95,13 +95,14 @@
 
 ```
 Watchlist codes ──► market::fetch_quotes (东财→腾讯, 1s)      ──► 左侧列表报价
+                   └─► status_bar_codes (macOS NSStatusItem)  ──► 菜单栏现价/涨跌
 Selected code  ──► market::fetch_klines (东财→腾讯)          ──► 日 K + MA
 Selected code  ──► market::fetch_minute_series (腾讯)       ──► 分时（价格/均价/基准线/量）
 Selected code  ──► market::fetch_minute_klines (腾讯)       ──► 1/5/15/30/60 分 K + MA
 ⌘K 搜索       ──► market::search (东财→腾讯 SmartBox)        ──► 添加自选
 寻宝鼠扫描    ──► market::fetch_klines_adjusted (东财→腾讯)  ──► treasure 评分
               ──► treasure_cache.json
-自选 / 偏好   ──► config.json
+自选 / 偏好   ──► config.json（含 status_bar_enabled / codes）
 ```
 
 macOS 配置路径示例：

@@ -39,7 +39,8 @@ use crate::model::{
     TrendLine,
 };
 use crate::storage::{
-    self, clamp_quote_interval_secs, AppConfig, ColorScheme, DockLayout, WatchlistSort,
+    self, clamp_quote_interval_secs, normalize_status_bar, AppConfig, ColorScheme, DockLayout,
+    WatchlistSort, STATUS_BAR_MAX_CODES,
 };
 use crate::update::{self, UpdateState};
 
@@ -367,6 +368,12 @@ pub struct StockApp {
     ai_base_url_input: Entity<InputState>,
     ai_model_input: Entity<InputState>,
     ai_api_key_input: Entity<InputState>,
+    /// macOS menu bar: show live quotes for pinned watchlist codes.
+    status_bar_enabled: bool,
+    /// Codes pinned to the status bar menu (subset of watchlist, max 5).
+    status_bar_codes: Vec<String>,
+    /// Code currently shown in the status bar title.
+    status_bar_active: String,
     _subscriptions: Vec<gpui::Subscription>,
 }
 
@@ -488,6 +495,14 @@ impl StockApp {
         }
         let window_bounds = dock.window;
 
+        let watchlist_codes: Vec<String> = symbols.iter().map(|s| s.code.clone()).collect();
+        let (status_bar_enabled, status_bar_codes, status_bar_active) = normalize_status_bar(
+            cfg.status_bar_enabled,
+            &cfg.status_bar_codes,
+            &cfg.status_bar_active,
+            &watchlist_codes,
+        );
+
         let mut app = Self {
             symbols,
             selected,
@@ -561,6 +576,9 @@ impl StockApp {
             ai_base_url_input,
             ai_model_input,
             ai_api_key_input,
+            status_bar_enabled,
+            status_bar_codes,
+            status_bar_active,
             _subscriptions,
         };
 
@@ -657,6 +675,15 @@ impl StockApp {
             .detach();
         }
 
+        // macOS menu bar quotes — install only when enabled (avoids AppKit
+        // crashes in headless / unit-test windows that never open a real bar).
+        #[cfg(target_os = "macos")]
+        {
+            if self.status_bar_enabled {
+                self.ensure_status_bar_installed(cx);
+            }
+        }
+
         // Quote polling loop with backoff on failure (interval from settings).
         cx.spawn(async move |this, cx| {
             let mut delay = Duration::from_secs(1);
@@ -740,6 +767,7 @@ impl StockApp {
                                     chrono::Local::now().format("%H:%M:%S")
                                 ));
                             }
+                            app.sync_status_bar();
                             cx.notify();
                             Duration::from_secs(app.quote_interval_secs)
                         }
@@ -1332,6 +1360,9 @@ impl StockApp {
             chart_lines: self.chart_lines.clone(),
             treasure_pool: self.treasure_pool.id().into(),
             treasure_fin: self.treasure_fin.id().into(),
+            status_bar_enabled: self.status_bar_enabled,
+            status_bar_codes: self.status_bar_codes.clone(),
+            status_bar_active: self.status_bar_active.clone(),
         };
         let _ = storage::save_config(&cfg);
     }
@@ -1470,6 +1501,7 @@ impl StockApp {
         });
         window.set_window_title(self.window_title());
         self.persist();
+        self.sync_status_bar();
         cx.notify();
     }
 
@@ -1493,6 +1525,244 @@ impl StockApp {
         self.quote_interval_secs = secs;
         self.persist();
         cx.notify();
+    }
+
+    fn set_status_bar_enabled(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.status_bar_enabled == on {
+            return;
+        }
+        self.status_bar_enabled = on;
+        // Auto-pin current selection when turning on with an empty list.
+        if on && self.status_bar_codes.is_empty() {
+            let code = self.selected.to_string();
+            if !code.is_empty() {
+                self.status_bar_codes.push(code.clone());
+                self.status_bar_active = code;
+            }
+        }
+        self.normalize_status_bar_state();
+        if on {
+            self.ensure_status_bar_installed(cx);
+        }
+        self.persist();
+        self.sync_status_bar();
+        cx.notify();
+    }
+
+    /// Install the native status item once and start polling menu actions.
+    #[cfg(target_os = "macos")]
+    fn ensure_status_bar_installed(&mut self, cx: &mut Context<Self>) {
+        use crate::mac_status_bar;
+        if mac_status_bar::is_installed() {
+            self.sync_status_bar();
+            return;
+        }
+        let action_rx = mac_status_bar::install();
+        self.sync_status_bar();
+        cx.spawn(async move |this, cx| {
+            loop {
+                Timer::after(Duration::from_millis(50)).await;
+                let mut actions = Vec::new();
+                while let Ok(a) = action_rx.try_recv() {
+                    actions.push(a);
+                }
+                if actions.is_empty() {
+                    continue;
+                }
+                let ok = this.update(cx, |app, cx| {
+                    for a in actions {
+                        app.handle_status_bar_action(a, cx);
+                    }
+                });
+                if ok.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn ensure_status_bar_installed(&mut self, _cx: &mut Context<Self>) {}
+
+    fn toggle_status_bar_code(&mut self, code: &str, cx: &mut Context<Self>) {
+        if let Some(ix) = self.status_bar_codes.iter().position(|c| c == code) {
+            self.status_bar_codes.remove(ix);
+            if self.status_bar_active == code {
+                self.status_bar_active = self
+                    .status_bar_codes
+                    .first()
+                    .cloned()
+                    .unwrap_or_default();
+            }
+        } else {
+            if self.status_bar_codes.len() >= STATUS_BAR_MAX_CODES {
+                self.status = shared(if self.work_mode {
+                    format!("Status bar max {STATUS_BAR_MAX_CODES}")
+                } else {
+                    format!("状态栏最多固定 {STATUS_BAR_MAX_CODES} 只")
+                });
+                cx.notify();
+                return;
+            }
+            if !self.symbols.iter().any(|s| s.code == code) {
+                return;
+            }
+            self.status_bar_codes.push(code.to_string());
+            if self.status_bar_active.is_empty() {
+                self.status_bar_active = code.to_string();
+            }
+        }
+        self.normalize_status_bar_state();
+        self.persist();
+        self.sync_status_bar();
+        cx.notify();
+    }
+
+    fn set_status_bar_active(&mut self, code: &str, cx: &mut Context<Self>) {
+        if !self.status_bar_codes.iter().any(|c| c == code) {
+            return;
+        }
+        if self.status_bar_active == code {
+            return;
+        }
+        self.status_bar_active = code.to_string();
+        self.persist();
+        self.sync_status_bar();
+        cx.notify();
+    }
+
+    fn normalize_status_bar_state(&mut self) {
+        let watchlist: Vec<String> = self.symbols.iter().map(|s| s.code.clone()).collect();
+        let (enabled, codes, active) = normalize_status_bar(
+            self.status_bar_enabled,
+            &self.status_bar_codes,
+            &self.status_bar_active,
+            &watchlist,
+        );
+        self.status_bar_enabled = enabled;
+        self.status_bar_codes = codes;
+        self.status_bar_active = active;
+    }
+
+    /// Push current status-bar state to the native menu bar item (macOS only).
+    fn sync_status_bar(&self) {
+        #[cfg(target_os = "macos")]
+        {
+            use crate::mac_status_bar::{self, MenuEntry};
+
+            if !mac_status_bar::is_installed() {
+                return;
+            }
+            mac_status_bar::set_visible(self.status_bar_enabled);
+            if !self.status_bar_enabled {
+                return;
+            }
+
+            let active = if self.status_bar_active.is_empty() {
+                self.selected.as_ref()
+            } else {
+                self.status_bar_active.as_str()
+            };
+
+            let title = self
+                .symbols
+                .iter()
+                .find(|s| s.code == active)
+                .map(|s| self.status_bar_title_for(s))
+                .unwrap_or_else(|| {
+                    if self.work_mode {
+                        "ZStock".into()
+                    } else {
+                        "ZStock · 无行情".into()
+                    }
+                });
+            mac_status_bar::set_title(&title);
+
+            let entries: Vec<MenuEntry> = self
+                .status_bar_codes
+                .iter()
+                .filter_map(|code| {
+                    let sym = self.symbols.iter().find(|s| s.code == *code)?;
+                    Some(MenuEntry {
+                        code: code.clone(),
+                        label: self.status_bar_menu_label_for(sym),
+                        active: *code == active,
+                    })
+                })
+                .collect();
+            mac_status_bar::rebuild_menu(&entries, self.work_mode);
+        }
+    }
+
+    fn status_bar_title_for(&self, sym: &Symbol) -> String {
+        if self.work_mode {
+            let alias = disguise_label(&sym.code, sym.name.as_ref());
+            if sym.last > 0.0 {
+                format!("{alias} {:+.2}%", sym.change_pct)
+            } else {
+                alias
+            }
+        } else {
+            let name = short_status_name(sym.name.as_ref(), &sym.code);
+            if sym.last > 0.0 {
+                format!(
+                    "{name} {} {}",
+                    format_price(sym.last),
+                    format_pct(sym.change_pct)
+                )
+            } else {
+                format!("{name} …")
+            }
+        }
+    }
+
+    fn status_bar_menu_label_for(&self, sym: &Symbol) -> String {
+        if self.work_mode {
+            let alias = disguise_label(&sym.code, sym.name.as_ref());
+            if sym.last > 0.0 {
+                format!("{alias}  {:+.2}%", sym.change_pct)
+            } else {
+                alias
+            }
+        } else {
+            let name = short_status_name(sym.name.as_ref(), &sym.code);
+            if sym.last > 0.0 {
+                format!(
+                    "{}  {}  {}",
+                    name,
+                    format_price(sym.last),
+                    format_pct(sym.change_pct)
+                )
+            } else {
+                format!("{name}  ({})", sym.code)
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn handle_status_bar_action(
+        &mut self,
+        action: crate::mac_status_bar::StatusBarAction,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::mac_status_bar::StatusBarAction;
+        match action {
+            StatusBarAction::SelectCode(code) => {
+                self.set_status_bar_active(&code, cx);
+            }
+            StatusBarAction::ShowWindow => {
+                cx.activate(true);
+                for handle in cx.windows() {
+                    let _ = handle.update(cx, |_root, window, _cx| {
+                        window.activate_window();
+                    });
+                }
+            }
+            StatusBarAction::Quit => {
+                cx.quit();
+            }
+        }
     }
 
     /// 当前展示的 AI 点评对应的缓存键（`code@最后一根 K 日期`）。
@@ -2191,7 +2461,20 @@ impl StockApp {
                     .unwrap_or_default(),
             );
         }
+        // Drop from status-bar pins if present.
+        if let Some(ix) = self.status_bar_codes.iter().position(|c| c == code) {
+            self.status_bar_codes.remove(ix);
+            if self.status_bar_active == code {
+                self.status_bar_active = self
+                    .status_bar_codes
+                    .first()
+                    .cloned()
+                    .unwrap_or_default();
+            }
+        }
+        self.normalize_status_bar_state();
         self.persist();
+        self.sync_status_bar();
         if was_selected {
             self.reload_klines(cx);
         }
@@ -3419,6 +3702,131 @@ impl StockApp {
         )
     }
 
+    fn render_settings_status_bar(
+        &self,
+        work: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let enabled = self.status_bar_enabled;
+        let pinned = self.status_bar_codes.clone();
+        let active = self.status_bar_active.clone();
+        let pin_count = pinned.len();
+
+        v_flex()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .font_semibold()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if work {
+                        "Menu bar"
+                    } else {
+                        "菜单栏行情"
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground.opacity(0.9))
+                    .child(if work {
+                        format!(
+                            "Pin up to {STATUS_BAR_MAX_CODES} watchlist symbols to the macOS menu bar. Click the title to switch."
+                        )
+                    } else {
+                        format!(
+                            "从自选固定最多 {STATUS_BAR_MAX_CODES} 只到 macOS 菜单栏；点击菜单栏标题可切换展示。Windows/Linux 暂不支持。"
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new("set-statusbar-off")
+                            .xsmall()
+                            .when(!enabled, |b| b.primary())
+                            .when(enabled, |b| b.ghost())
+                            .label(if work { "Off" } else { "关闭" })
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.set_status_bar_enabled(false, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("set-statusbar-on")
+                            .xsmall()
+                            .when(enabled, |b| b.primary())
+                            .when(!enabled, |b| b.ghost())
+                            .label(if work { "On" } else { "开启" })
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.set_status_bar_enabled(true, cx);
+                            })),
+                    ),
+            )
+            .when(enabled, |col| {
+                col.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if work {
+                            format!("Pinned {pin_count}/{STATUS_BAR_MAX_CODES} · click to pin/unpin")
+                        } else {
+                            format!("已固定 {pin_count}/{STATUS_BAR_MAX_CODES} · 点击自选切换固定")
+                        }),
+                )
+                .child(
+                    h_flex().gap_1().flex_wrap().children(
+                        self.symbols.iter().map(|sym| {
+                            let code = sym.code.clone();
+                            let is_pinned = pinned.iter().any(|c| c == &code);
+                            let is_active = active == code && is_pinned;
+                            let label = if work {
+                                disguise_label(&sym.code, sym.name.as_ref())
+                            } else if is_real_name(sym.name.as_ref(), &sym.code) {
+                                format!(
+                                    "{} {}",
+                                    short_status_name(sym.name.as_ref(), &sym.code),
+                                    sym.code
+                                )
+                            } else {
+                                sym.code.clone()
+                            };
+                            let btn_id = format!("sb-pin-{}", sym.code);
+                            Button::new(SharedString::from(btn_id))
+                                .xsmall()
+                                .when(is_active, |b| b.primary())
+                                .when(is_pinned && !is_active, |b| b.outline())
+                                .when(!is_pinned, |b| b.ghost())
+                                .label(label)
+                                .on_click(cx.listener(move |this, _, _w, cx| {
+                                    // Already pinned & active → unpin; pinned but not active → make active;
+                                    // not pinned → pin (and keep current active if any).
+                                    if this.status_bar_codes.iter().any(|c| c == &code) {
+                                        if this.status_bar_active == code {
+                                            this.toggle_status_bar_code(&code, cx);
+                                        } else {
+                                            this.set_status_bar_active(&code, cx);
+                                        }
+                                    } else {
+                                        this.toggle_status_bar_code(&code, cx);
+                                    }
+                                }))
+                        }),
+                    ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground.opacity(0.75))
+                        .child(if work {
+                            "Primary = shown in menu bar · Outline = pinned · Ghost = not pinned. Click primary again to unpin."
+                        } else {
+                            "主色 = 菜单栏当前展示 · 描边 = 已固定 · 幽灵 = 未固定。再点主色可取消固定。"
+                        }),
+                )
+            })
+    }
+
     fn render_settings(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let work = self.work_mode;
         let interval = self.quote_interval_secs;
@@ -3627,6 +4035,8 @@ impl StockApp {
                                             ),
                                     ),
                             )
+                            // —— Status bar (macOS menu bar) ——
+                            .child(self.render_settings_status_bar(work, cx))
                             // —— Update ——
                             .child(
                                 v_flex()
@@ -6588,6 +6998,24 @@ fn display_name_str(name: &str, code: &str) -> String {
         name.trim().to_string()
     } else {
         String::new()
+    }
+}
+
+/// Compact label for the macOS menu bar (space is tight).
+fn short_status_name(name: &str, code: &str) -> String {
+    if is_real_name(name, code) {
+        let n = name.trim();
+        // Prefer short Chinese names; fall back to code for long titles.
+        let chars: Vec<char> = n.chars().collect();
+        if chars.len() <= 4 {
+            n.to_string()
+        } else if chars.len() <= 6 {
+            n.to_string()
+        } else {
+            code.to_string()
+        }
+    } else {
+        code.to_string()
     }
 }
 

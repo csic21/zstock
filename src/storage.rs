@@ -151,6 +151,15 @@ pub struct AppConfig {
     /// Treasure financial-percentile filter (`off` / `pe` / `pb` / `value`).
     #[serde(default = "default_treasure_fin")]
     pub treasure_fin: String,
+    /// Show live quotes in the macOS menu bar (no-op on other platforms).
+    #[serde(default)]
+    pub status_bar_enabled: bool,
+    /// Watchlist codes pinned to the status bar menu (max 5). Title shows `status_bar_active`.
+    #[serde(default)]
+    pub status_bar_codes: Vec<String>,
+    /// Code currently shown in the status bar title.
+    #[serde(default)]
+    pub status_bar_active: String,
 }
 
 fn default_true() -> bool {
@@ -205,7 +214,66 @@ impl Default for AppConfig {
             chart_lines: std::collections::HashMap::new(),
             treasure_pool: default_treasure_pool(),
             treasure_fin: default_treasure_fin(),
+            status_bar_enabled: false,
+            status_bar_codes: Vec::new(),
+            status_bar_active: String::new(),
         }
+    }
+}
+
+/// Max codes that can be pinned to the status bar (menu bar space is limited).
+pub const STATUS_BAR_MAX_CODES: usize = 5;
+
+/// Keep only watchlist members, preserve order, cap length, and fix active.
+pub fn normalize_status_bar(
+    enabled: bool,
+    codes: &[String],
+    active: &str,
+    watchlist: &[String],
+) -> (bool, Vec<String>, String) {
+    let mut out = Vec::new();
+    for c in codes {
+        if watchlist.iter().any(|w| w == c) && !out.iter().any(|x| x == c) {
+            out.push(c.clone());
+            if out.len() >= STATUS_BAR_MAX_CODES {
+                break;
+            }
+        }
+    }
+    let active = if out.iter().any(|c| c == active) {
+        active.to_string()
+    } else {
+        out.first().cloned().unwrap_or_default()
+    };
+    // Enabling with no pins is allowed; UI can auto-pin selected on toggle.
+    (enabled, out, active)
+}
+
+#[cfg(test)]
+mod status_bar_tests {
+    use super::{normalize_status_bar, STATUS_BAR_MAX_CODES};
+
+    #[test]
+    fn drops_codes_not_in_watchlist_and_caps() {
+        let watch: Vec<String> = (0..10).map(|i| format!("60000{i}")).collect();
+        let codes: Vec<String> = (0..8)
+            .map(|i| format!("60000{i}"))
+            .chain(std::iter::once("999999".into()))
+            .collect();
+        let (en, out, active) = normalize_status_bar(true, &codes, "600003", &watch);
+        assert!(en);
+        assert_eq!(out.len(), STATUS_BAR_MAX_CODES);
+        assert_eq!(active, "600003");
+        assert!(!out.iter().any(|c| c == "999999"));
+    }
+
+    #[test]
+    fn resets_active_when_missing() {
+        let watch = vec!["600519".into(), "000001".into()];
+        let codes = vec!["600519".into()];
+        let (_, out, active) = normalize_status_bar(true, &codes, "000001", &watch);
+        assert_eq!(out, vec!["600519".to_string()]);
+        assert_eq!(active, "600519");
     }
 }
 
