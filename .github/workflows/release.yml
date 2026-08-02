@@ -135,21 +135,27 @@ jobs:
           cargo build --release --target x86_64-apple-darwin
           cargo build --release --target aarch64-apple-darwin
 
-      - name: Package .app (arm64)
+      - name: Package .app + DMG + PKG (arm64)
         run: |
           mkdir -p target/release
           cp target/aarch64-apple-darwin/release/stock target/release/stock
           SKIP_CARGO_BUILD=1 ./scripts/package-macos.sh
           cd dist
           ditto -c -k --keepParent "ZStock.app" stock-analysis-macos-arm64.zip
+          cd ..
+          SKIP_CARGO_BUILD=1 ./scripts/package-dmg.sh arm64
+          SKIP_CARGO_BUILD=1 ./scripts/package-pkg.sh arm64
 
-      - name: Package .app (x86_64)
+      - name: Package .app + DMG + PKG (x86_64)
         run: |
           mkdir -p target/release
           cp target/x86_64-apple-darwin/release/stock target/release/stock
           SKIP_CARGO_BUILD=1 ./scripts/package-macos.sh
           cd dist
           ditto -c -k --keepParent "ZStock.app" stock-analysis-macos-x64.zip
+          cd ..
+          SKIP_CARGO_BUILD=1 ./scripts/package-dmg.sh x64
+          SKIP_CARGO_BUILD=1 ./scripts/package-pkg.sh x64
 
       - name: Hash packages
         id: hash
@@ -163,7 +169,11 @@ jobs:
         with:
           files: |
             dist/stock-analysis-macos-arm64.zip
+            dist/stock-analysis-macos-arm64.dmg
+            dist/stock-analysis-macos-arm64.pkg
             dist/stock-analysis-macos-x64.zip
+            dist/stock-analysis-macos-x64.dmg
+            dist/stock-analysis-macos-x64.pkg
           generate_release_notes: true
 
       - name: Upload artifact (manual run)
@@ -171,7 +181,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: stock-analysis-macos
-          path: dist/stock-analysis-macos-*.zip
+          path: dist/stock-analysis-macos-*
 
   linux:
     name: Linux (x64)

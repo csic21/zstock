@@ -1,0 +1,5 @@
+#!/bin/sh
+# Remove any previous installation so the payload can be written cleanly.
+rm -rf "/Applications/ZStock.app"
+rm -rf "/Applications/Stock Analysis.app"
+exit 0

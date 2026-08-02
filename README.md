@@ -73,6 +73,24 @@ cargo run --release
 open "dist/ZStock.app"
 ```
 
+### 打包 macOS 安装包（DMG / PKG）
+
+用户安装建议直接用安装包，两个脚本都会先调用 `package-macos.sh` 生成最新的
+`ZStock.app`：
+
+```bash
+# .pkg 安装器：双击后走安装向导，自动装进「应用程序」，无需拖拽
+./scripts/package-pkg.sh            # 默认当前架构（arm64 / x64）
+./scripts/package-pkg.sh arm64      # 指定架构
+
+# .dmg 安装包：经典拖拽到「应用程序」的体验
+./scripts/package-dmg.sh
+./scripts/package-dmg.sh x64
+```
+
+产物在 `dist/` 下：`stock-analysis-macos-<arch>.pkg` 与
+`stock-analysis-macos-<arch>.dmg`。
+
 图标资源在 `assets/logo/`（见下方）。
 
 ### 安装 Linux（桌面集成）
@@ -108,14 +126,18 @@ macOS 的 `Info.plist` 版本会在打包时根据 tag 自动同步。
 
 | 平台 | 文件 | 说明 |
 |------|------|------|
-| macOS（Apple Silicon） | `stock-analysis-macos-arm64.zip` | `ZStock.app`（arm64） |
-| macOS（Intel） | `stock-analysis-macos-x64.zip` | `ZStock.app`（x86_64） |
+| macOS（Apple Silicon） | `stock-analysis-macos-arm64.zip` / `.dmg` / `.pkg` | `ZStock.app`（arm64）；`.pkg` 免拖拽安装，`.dmg` 拖拽安装 |
+| macOS（Intel） | `stock-analysis-macos-x64.zip` / `.dmg` / `.pkg` | `ZStock.app`（x86_64）；同上 |
 | Windows | `stock-analysis-windows-x64.zip` | `stock.exe` + README；另产出 `stock-analysis-windows-x64-setup.exe`（Inno Setup 安装器） |
 | Linux | `stock-analysis-linux-x64.zip` | `stock` + README + `.desktop`/图标/`install.sh`（安装到 `~/.local`） |
 
 说明：
 
-- 未做正式签名：macOS 首次打开需右键「打开」，Windows 可能提示 SmartScreen。
+- 未做正式签名：macOS 首次打开安装包或 App 需右键「打开」（或先
+  `xattr -dr com.apple.quarantine`），Windows 可能提示 SmartScreen。
+- `.pkg` 安装器内置 preinstall 脚本，会先移除旧版本（含更名前的
+  `Stock Analysis.app`）再写入新版本。
+- `.zip` 仍保留给应用内自动更新使用（更新时只同步 `.app` 内容，不重装）。
 - 在 Actions 页面手动运行该 workflow 只上传构建产物（artifacts），不会创建 Release。
 - 每次 tag 发布后会自动生成 `updates/stable.json`（Zed 风格更新清单，含各平台
   SHA-256）并推送到 `main`，供客户端静默检查更新。

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="1">
+  <title>ZStock 安装器</title>
+  <welcome file="welcome.html"/>
+  <pkg-ref id="com.karl.stock-analysis"/>
+  <options customize="never" require-scripts="false" hostArchitectures="arm64,x86_64"/>
+  <domains enable_localSystem="true"/>
+  <choices-outline>
+    <line choice="default">
+      <line choice="com.karl.stock-analysis"/>
+    </line>
+  </choices-outline>
+  <choice id="default"/>
+  <choice id="com.karl.stock-analysis" visible="false">
+    <pkg-ref id="com.karl.stock-analysis"/>
+  </choice>
+  <pkg-ref id="com.karl.stock-analysis" version="__VERSION__" onConclusion="none">stock-component.pkg</pkg-ref>
+</installer-gui-script>
