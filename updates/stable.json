@@ -1,23 +1,23 @@
 {
-  "version": "0.0.9",
+  "version": "0.0.15",
   "notes": "",
-  "release_url": "https://github.com/csic21/zstock/releases/tag/v0.0.9",
+  "release_url": "https://github.com/csic21/zstock/releases/tag/v0.0.15",
   "platforms": {
     "macos-arm64": {
-      "url": "https://github.com/csic21/zstock/releases/download/v0.0.9/stock-analysis-macos-arm64.zip",
-      "sha256": "79b76b1679f2f48829ace0cdce2a870e11e200b2091285570f3bffe49289ef22"
+      "url": "https://github.com/csic21/zstock/releases/download/v0.0.15/zstock-macos-arm64.zip",
+      "sha256": "eeb197051f52cf3058baf7efbdf2c65c113a29df059e2ece0a45c45a71c6403e"
     },
     "macos-x64": {
-      "url": "https://github.com/csic21/zstock/releases/download/v0.0.9/stock-analysis-macos-x64.zip",
-      "sha256": "454bd79a19e0085862c0d49c4f755fe42f9bbeb8fceb5ba3725e026896666813"
+      "url": "https://github.com/csic21/zstock/releases/download/v0.0.15/zstock-macos-x64.zip",
+      "sha256": "a119cfc149c9ec19d04508afc7068b7ccf42ea87b708745fb0c807ffce765200"
     },
     "windows-x64": {
-      "url": "https://github.com/csic21/zstock/releases/download/v0.0.9/stock-analysis-windows-x64.zip",
-      "sha256": "e28e95a3bbc5a48996254fcb2cc66919f74875a2538e8c715b3de396858cbd02"
+      "url": "https://github.com/csic21/zstock/releases/download/v0.0.15/zstock-windows-x64.zip",
+      "sha256": "c2691164501c62806686cc9150268dcb00ef1c4a90f56f30da9a15494a895a53"
     },
     "linux-x64": {
-      "url": "https://github.com/csic21/zstock/releases/download/v0.0.9/stock-analysis-linux-x64.zip",
-      "sha256": "1a41cde7ac816a685f9031d51576e4e3989b78488d7d3a39a1a6cabf3828e4eb"
+      "url": "https://github.com/csic21/zstock/releases/download/v0.0.15/zstock-linux-x64.zip",
+      "sha256": "6a498cdfc194f0bd156080c8691dae19fc3604277278c68a552734dd730d87e6"
     }
   }
 }
