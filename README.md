@@ -94,6 +94,27 @@ open "dist/ZStock.app"
 
 图标资源在 `assets/logo/`（见下方）。
 
+### macOS：避免 Launchpad / Spotlight 出现两个 ZStock
+
+`dist/ZStock.app` 与装进 `/Applications` 的正式版是**两份独立的 `.app`**。
+macOS 会把磁盘上找到的应用都编进索引，所以在已安装正式版的同时保留
+`dist/` 里的构建产物时，搜索 `zstock` 会看到两个同名图标（不是程序 bug）。
+
+建议习惯：
+
+1. **日常使用**只打开 `/Applications/ZStock.app`（或通过 `.pkg` / `.dmg` 安装）。
+2. **本地试跑**可用 `open "dist/ZStock.app"`，测完后清理产物，避免被索引：
+   ```bash
+   rm -rf dist/*
+   ```
+3. 若只想去掉应用包、保留安装器：
+   ```bash
+   rm -rf dist/*.app
+   ```
+4. 仓库里若还残留旧名 `Stock Analysis.app`，同样会被索引，可一并删掉。
+
+清理后若 Launchpad 仍短暂显示旧结果，稍等索引刷新或重新打开搜索即可。
+
 ### 安装 Linux（桌面集成）
 
 Linux 安装包内含二进制、`.desktop` 入口、hicolor 图标和一键安装脚本：

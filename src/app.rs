@@ -5034,17 +5034,23 @@ impl StockApp {
 
         v_flex()
             .size_full()
+            .min_h_0()
             .bg(cx.theme().background)
+            // Used by the layout regression test; no-op outside test builds.
+            .debug_selector(|| "chart-area-root".into())
             // Quote identity + price + OHLC（原两行合并为一行）
             .child(
                 h_flex()
+                    .id("chart-quote-header")
                     .h(px(48.))
+                    .flex_shrink_0()
                     .px_4()
                     .items_center()
                     .justify_between()
                     .gap_3()
                     .border_b_1()
                     .border_color(cx.theme().border)
+                    .debug_selector(|| "chart-quote-header".into())
                     .child(
                         h_flex()
                             .gap_2()
@@ -5103,6 +5109,7 @@ impl StockApp {
             .child(
                 h_flex()
                     .h(px(34.))
+                    .flex_shrink_0()
                     .px_3()
                     .items_center()
                     .justify_between()
@@ -5240,6 +5247,7 @@ impl StockApp {
             .child(
                 h_flex()
                     .h(px(26.))
+                    .flex_shrink_0()
                     .px_3()
                     .items_center()
                     .gap_3()
@@ -5255,6 +5263,7 @@ impl StockApp {
                 div()
                     .id("chart-body")
                     .flex_1()
+                    .min_h_0()
                     .min_h(px(220.))
                     .p_2()
                     .child(
@@ -7290,6 +7299,10 @@ impl Render for StockApp {
             } else {
                 let entity_h = cx.entity().clone();
                 let entity_v = cx.entity().clone();
+                // Same definite-height trick as the left sidebar: resizable panels
+                // center their children when height is unresolved, which left a
+                // black band above the chart quote header.
+                let avail_h = (window.bounds().size.height - TITLE_BAR_HEIGHT).max(px(0.));
                 div()
                     .flex_1()
                     .min_h_0()
@@ -7312,22 +7325,34 @@ impl Render for StockApp {
                                 resizable_panel()
                                     .when(center_w > 0.0, |p| p.size(px(center_w)))
                                     .child(
-                                        v_resizable("main-v")
-                                            .on_resize(move |state, _window, cx| {
-                                                entity_v.update(cx, |this, cx| {
-                                                    this.on_main_v_resize(state, cx);
-                                                });
-                                            })
+                                        // Pin the right column to the full content height so
+                                        // the chart header aligns with the sidebar top.
+                                        v_flex()
+                                            .size_full()
+                                            .h(avail_h)
+                                            .min_h_0()
+                                            .overflow_hidden()
+                                            .debug_selector(|| "right-panel-root".into())
                                             .child(
-                                                resizable_panel()
-                                                    .child(self.render_chart_area(cx)),
-                                            )
-                                            .child(
-                                                resizable_panel()
-                                                    // Slightly shorter default so overview isn't floating in empty space.
-                                                    .size(px(bottom_h.max(148.0)))
-                                                    .size_range(px(128.)..px(420.))
-                                                    .child(self.render_detail_panel(cx)),
+                                                v_resizable("main-v")
+                                                    .on_resize(move |state, _window, cx| {
+                                                        entity_v.update(cx, |this, cx| {
+                                                            this.on_main_v_resize(state, cx);
+                                                        });
+                                                    })
+                                                    .child(
+                                                        resizable_panel().child(
+                                                            self.render_chart_area(cx),
+                                                        ),
+                                                    )
+                                                    .child(
+                                                        resizable_panel()
+                                                            // Slightly shorter default so overview
+                                                            // isn't floating in empty space.
+                                                            .size(px(bottom_h.max(148.0)))
+                                                            .size_range(px(128.)..px(420.))
+                                                            .child(self.render_detail_panel(cx)),
+                                                    ),
                                             ),
                                     ),
                             ),
@@ -7551,6 +7576,45 @@ mod layout_regression_tests {
             (root.size.height.as_f32() - 826.0).abs() < 1.0,
             "sidebar should span the full content height (826px), got {}",
             root.size.height.as_f32()
+        );
+    }
+
+    /// Regression test: chart quote header must sit flush under the title bar
+    /// (same y as the left sidebar), not centered with a black band above it.
+    #[gpui::test]
+    fn chart_header_aligns_with_sidebar_top(cx: &mut TestAppContext) {
+        let mut window = test_window(cx, 1320.0, 860.0);
+        window.run_until_parked();
+        window.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let left = window
+            .debug_bounds("left-panel-root")
+            .expect("left-panel-root bounds");
+        let right = window
+            .debug_bounds("right-panel-root")
+            .expect("right-panel-root bounds");
+        let header = window
+            .debug_bounds("chart-quote-header")
+            .expect("chart-quote-header bounds");
+        eprintln!("left={left:?} right={right:?} header={header:?}");
+
+        assert!(
+            (right.origin.y.as_f32() - 34.0).abs() < 1.0,
+            "right column should start under title bar, got y={}",
+            right.origin.y.as_f32()
+        );
+        assert!(
+            (header.origin.y.as_f32() - 34.0).abs() < 1.0,
+            "chart quote header should be flush under title bar (no top band), got y={}",
+            header.origin.y.as_f32()
+        );
+        assert!(
+            (left.origin.y.as_f32() - header.origin.y.as_f32()).abs() < 1.0,
+            "chart header and sidebar tops should align, left y={} header y={}",
+            left.origin.y.as_f32(),
+            header.origin.y.as_f32()
         );
     }
 
