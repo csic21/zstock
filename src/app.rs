@@ -26,6 +26,8 @@ use crate::chart::{
     ChartPaintData, ChartStyle, MacdPaintData, MinutePaintData,
 };
 use crate::data::ai::{self, AiConfig, AiKind};
+use crate::data::levels;
+use crate::data::scout::{self, ScoutPick, ScoutVerdict, SCOUT_CANDIDATE_N};
 use crate::data::treasure::{self, fmt_dd, fmt_pos, TreasureHit, TREASURE_KLINE_LIMIT};
 use crate::data::universe::{self, FinFilter, TreasurePool, TREASURE_SCAN_CAP, TREASURE_TOP_N};
 use crate::data::{
@@ -390,6 +392,21 @@ pub struct StockApp {
     treasure_status: SharedString,
     /// 取消过期扫描。
     treasure_gen: u64,
+    /// AI/本地批量「可买观察」结果（按可买分排序）。
+    scout_picks: Vec<ScoutPick>,
+    /// 整榜摘要（本地规则或 LLM）。
+    scout_summary: SharedString,
+    scout_running: bool,
+    scout_done: usize,
+    scout_total: usize,
+    /// 取消过期筛分。
+    scout_gen: u64,
+    /// 摘要来源说明。
+    scout_source: SharedString,
+    /// 可买清单过滤：true = 只显示「可关注」，隐藏「观察」。
+    scout_only_buy_watch: bool,
+    /// 有可买清单时，完整寻宝榜默认折叠，减少干扰。
+    treasure_list_expanded: bool,
     /// 上证综指（work 模式 cpu）。
     index_sh: Option<IndexSnap>,
     /// 沪深300（work 模式 mem）。
@@ -513,10 +530,10 @@ impl StockApp {
         let treasure_cache = storage::load_treasure_cache();
         let treasure_hits = treasure_cache.hits;
         let treasure_status = if treasure_hits.is_empty() {
-            shared("点「开始寻宝」扫描自选+扩展池的多年低位")
+            shared("点「开始搜罗」扫描历史低位，再用「AI 筛可买」批量出观察清单")
         } else {
             shared(format!(
-                "缓存 {} 只 · {}",
+                "缓存 {} 只 · {} · 可点「AI 筛可买」",
                 treasure_hits.len(),
                 if treasure_cache.updated_at.is_empty() {
                     "—".into()
@@ -607,6 +624,16 @@ impl StockApp {
             treasure_total: 0,
             treasure_status,
             treasure_gen: 0,
+            scout_picks: Vec::new(),
+            scout_summary: shared(""),
+            scout_running: false,
+            scout_done: 0,
+            scout_total: 0,
+            scout_gen: 0,
+            scout_source: shared(""),
+            // 默认只看「可关注」；若本轮为零会自动回退到「全部」。
+            scout_only_buy_watch: true,
+            treasure_list_expanded: false,
             index_sh: None,
             index_hs300: None,
             index_cyb: None,
@@ -1709,8 +1736,18 @@ impl StockApp {
             }
 
             // All pinned symbols appear together in the menu-bar title.
-            let title = self.status_bar_multi_title();
-            mac_status_bar::set_title(&title);
+            // No pins → show the S logo instead of "ZStock · 未固定".
+            let syms: Vec<&Symbol> = self
+                .status_bar_codes
+                .iter()
+                .filter_map(|code| self.symbols.iter().find(|s| s.code == *code))
+                .collect();
+            if syms.is_empty() {
+                mac_status_bar::set_logo();
+            } else {
+                let title = self.status_bar_multi_title_for(&syms);
+                mac_status_bar::set_title(&title);
+            }
 
             let selected = self.selected.as_ref();
             let entries: Vec<MenuEntry> = self
@@ -1731,19 +1768,8 @@ impl StockApp {
     }
 
     /// Menu-bar title: one symbol full, many symbols compact side-by-side.
-    fn status_bar_multi_title(&self) -> String {
-        let syms: Vec<&Symbol> = self
-            .status_bar_codes
-            .iter()
-            .filter_map(|code| self.symbols.iter().find(|s| s.code == *code))
-            .collect();
-        if syms.is_empty() {
-            return if self.work_mode {
-                "ZStock".into()
-            } else {
-                "ZStock · 未固定".into()
-            };
-        }
+    /// Caller guarantees `syms` is non-empty.
+    fn status_bar_multi_title_for(&self, syms: &[&Symbol]) -> String {
         if syms.len() == 1 {
             return self.status_bar_title_for(syms[0]);
         }
@@ -2335,8 +2361,17 @@ impl StockApp {
         self.treasure_done = 0;
         self.treasure_total = 0;
         self.treasure_hits.clear();
+        // 新扫描作废旧的可买清单
+        self.scout_gen = self.scout_gen.wrapping_add(1);
+        self.scout_picks.clear();
+        self.scout_summary = shared("");
+        self.scout_source = shared("");
+        self.scout_running = false;
+        self.scout_done = 0;
+        self.scout_total = 0;
+        self.treasure_list_expanded = false;
         self.treasure_status = shared(format!(
-            "拉取 {} 池（{}）· 将取 Top {TREASURE_TOP_N}…",
+            "① 拉取 {} 池（{}）· 入榜 Top {TREASURE_TOP_N}…",
             pool.label(),
             fin.label()
         ));
@@ -2499,14 +2534,307 @@ impl StockApp {
                     app.treasure_hits.len(),
                 ));
                 app.status = shared(format!(
-                    "🐭 寻宝完成 · Top {} / 扫描 {total}（多窗口·上行中继降权）",
+                    "🐭 寻宝完成 · Top {} / 扫描 {total} · 正在筛可买…",
                     app.treasure_hits.len(),
                 ));
                 app.persist();
                 cx.notify();
+                // 扫完自动批量筛「可买观察」，避免用户一只只点
+                if !app.treasure_hits.is_empty() {
+                    app.start_scout_picks(cx);
+                }
             });
         })
         .detach();
+    }
+
+    /// 从当前寻宝榜批量深评，筛出「可关注 / 观察」清单（本地规则；可选 LLM 整榜摘要）。
+    fn start_scout_picks(&mut self, cx: &mut Context<Self>) {
+        if self.scout_running {
+            self.status = shared("可买筛分进行中…");
+            cx.notify();
+            return;
+        }
+        if self.treasure_scanning {
+            self.status = shared("请等寻宝扫描结束后再筛可买");
+            cx.notify();
+            return;
+        }
+        if self.treasure_hits.is_empty() {
+            self.scout_summary = shared("请先「开始搜罗」生成寻宝榜，再筛可买。");
+            self.status = shared("无可筛标的 · 先搜罗");
+            cx.notify();
+            return;
+        }
+
+        let mut candidates: Vec<TreasureHit> = self.treasure_hits.clone();
+        candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if candidates.len() > SCOUT_CANDIDATE_N {
+            candidates.truncate(SCOUT_CANDIDATE_N);
+        }
+
+        self.scout_gen = self.scout_gen.wrapping_add(1);
+        let run_id = self.scout_gen;
+        let total = candidates.len();
+        self.scout_running = true;
+        self.scout_done = 0;
+        self.scout_total = total;
+        self.scout_picks.clear();
+        self.scout_summary = shared(format!(
+            "对寻宝 Top {total} 做可买深评（位置+雷达+价位带）…"
+        ));
+        self.scout_source = shared(if self.work_mode {
+            "Scoring…"
+        } else {
+            "本地规则筛分中"
+        });
+        self.left_tab = LeftTab::Treasure;
+        self.status = shared(format!("🎯 筛可买 0/{total}"));
+        cx.notify();
+
+        let ai_cfg = self.ai_config.clone();
+        let want_llm = ai_cfg.is_configured();
+
+        cx.spawn(async move |this, cx| {
+            let mut raw: Vec<ScoutPick> = Vec::new();
+            for (i, hit) in candidates.into_iter().enumerate() {
+                let cancelled = this
+                    .read_with(cx, |app, _| app.scout_gen != run_id)
+                    .unwrap_or(true);
+                if cancelled {
+                    return;
+                }
+
+                let code = hit.code.clone();
+                let result = smol::unblock(move || {
+                    market::fetch_klines_adjusted(&code, TREASURE_KLINE_LIMIT)
+                })
+                .await;
+
+                if let Ok(sourced) = result {
+                    let (_c, name, candles) = sourced.data;
+                    let mut hit = hit;
+                    if is_real_name(&name, &hit.code) {
+                        hit.name = name;
+                    }
+                    if let Some(pick) = scout::evaluate(&hit, &candles) {
+                        raw.push(pick);
+                    }
+                }
+
+                let done = i + 1;
+                let _ = this.update(cx, |app, cx| {
+                    if app.scout_gen != run_id {
+                        return;
+                    }
+                    app.scout_done = done;
+                    app.scout_total = total;
+                    // 边评边展示中间结果（Skip 不进列表）
+                    app.scout_picks = scout::finalize_results(raw.clone());
+                    app.scout_summary = shared(format!(
+                        "深评 {done}/{total} · 暂定可关注/观察 {} 只",
+                        app.scout_picks.len()
+                    ));
+                    if done == total || done % 5 == 0 {
+                        app.status = shared(format!("🎯 筛可买 {done}/{total}"));
+                    }
+                    cx.notify();
+                });
+
+                if done < total {
+                    Timer::after(TREASURE_SCAN_GAP).await;
+                }
+            }
+
+            let picks = scout::finalize_results(raw);
+            let local = scout::local_summary(&picks);
+
+            let _ = this.update(cx, |app, cx| {
+                if app.scout_gen != run_id {
+                    return;
+                }
+                app.scout_picks = picks.clone();
+                app.scout_summary = shared(local.clone());
+                app.scout_source = shared(if app.work_mode {
+                    "Local rules"
+                } else {
+                    "本地规则"
+                });
+                app.scout_done = total;
+                if !want_llm {
+                    app.scout_running = false;
+                    let buy_n = app
+                        .scout_picks
+                        .iter()
+                        .filter(|p| p.verdict == ScoutVerdict::BuyWatch)
+                        .count();
+                    app.status = shared(format!(
+                        "🎯 可关注 {buy_n} / 共 {} · 本地规则",
+                        app.scout_picks.len()
+                    ));
+                    app.treasure_status = shared(format!(
+                        "② 可买清单就绪 · 可关注 {buy_n} · 观察 {} · 本地",
+                        app.scout_picks.len().saturating_sub(buy_n)
+                    ));
+                    app.finish_scout_ux(cx);
+                } else {
+                    app.scout_summary = shared(format!("{local}\n\n（LLM 整榜摘要生成中…）"));
+                    app.status = shared("🎯 本地清单已出 · 请求 LLM 摘要…");
+                    // 先应用 UX（打开第一只），摘要回来后再刷新文案
+                    app.finish_scout_ux(cx);
+                }
+            });
+
+            if !want_llm {
+                return;
+            }
+
+            let picks_for_llm = picks.clone();
+            let cfg = ai_cfg;
+            let llm_model = cfg.model.clone();
+            let res = smol::unblock(move || scout::llm_summary(&cfg, &picks_for_llm)).await;
+
+            let _ = this.update(cx, |app, cx| {
+                if app.scout_gen != run_id {
+                    return;
+                }
+                app.scout_running = false;
+                let buy_n = app
+                    .scout_picks
+                    .iter()
+                    .filter(|p| p.verdict == ScoutVerdict::BuyWatch)
+                    .count();
+                match res {
+                    Ok(text) if !text.trim().is_empty() => {
+                        app.scout_summary = shared(text);
+                        app.scout_source = shared(format!("LLM · {llm_model}"));
+                        app.status = shared(format!(
+                            "🎯 可关注 {buy_n} / 共 {} · LLM",
+                            app.scout_picks.len()
+                        ));
+                    }
+                    Ok(_) => {
+                        app.scout_summary = shared(local.clone());
+                        app.scout_source = shared("本地规则 · LLM 空响应");
+                        app.status = shared(format!(
+                            "🎯 可关注 {buy_n} / 共 {} · 本地",
+                            app.scout_picks.len()
+                        ));
+                    }
+                    Err(e) => {
+                        app.scout_summary = shared(format!(
+                            "{local}\n\n（LLM 摘要失败：{e} · 已保留本地清单）"
+                        ));
+                        app.scout_source = shared("本地规则 · LLM 失败回退");
+                        app.status = shared(format!(
+                            "🎯 可关注 {buy_n} / 共 {} · 本地回退",
+                            app.scout_picks.len()
+                        ));
+                    }
+                }
+                app.treasure_status = shared(format!(
+                    "② 可买清单就绪 · 可关注 {buy_n} · 观察 {} · {}",
+                    app.scout_picks.len().saturating_sub(buy_n),
+                    app.scout_source
+                ));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn cancel_scout_picks(&mut self, cx: &mut Context<Self>) {
+        if !self.scout_running {
+            return;
+        }
+        self.scout_gen = self.scout_gen.wrapping_add(1);
+        self.scout_running = false;
+        self.scout_summary = shared(format!(
+            "已取消筛分 · 保留 {} 条中间结果",
+            self.scout_picks.len()
+        ));
+        self.status = shared("已取消可买筛分");
+        cx.notify();
+    }
+
+    fn select_scout_pick(&mut self, pick: &ScoutPick, cx: &mut Context<Self>) {
+        // 若在寻宝榜中，走完整寻宝选中（含 3Y 视图）；否则直接选代码
+        if let Some(hit) = self
+            .treasure_hits
+            .iter()
+            .find(|h| h.code == pick.code)
+            .cloned()
+        {
+            self.select_treasure_hit(&hit, cx);
+        } else {
+            self.left_tab = LeftTab::Treasure;
+            self.detail_tab = DetailTab::Treasure;
+            self.select_symbol(shared(pick.code.clone()), cx);
+        }
+    }
+
+    fn set_scout_only_buy_watch(&mut self, only: bool, cx: &mut Context<Self>) {
+        if self.scout_only_buy_watch == only {
+            return;
+        }
+        self.scout_only_buy_watch = only;
+        cx.notify();
+    }
+
+    fn set_treasure_list_expanded(&mut self, expanded: bool, cx: &mut Context<Self>) {
+        if self.treasure_list_expanded == expanded {
+            return;
+        }
+        self.treasure_list_expanded = expanded;
+        cx.notify();
+    }
+
+    /// 当前过滤后的可买清单（视图用；不改动 `scout_picks` 源数据）。
+    fn visible_scout_picks(&self) -> Vec<&ScoutPick> {
+        self.scout_picks
+            .iter()
+            .filter(|p| {
+                if self.scout_only_buy_watch {
+                    p.verdict == ScoutVerdict::BuyWatch
+                } else {
+                    true
+                }
+            })
+            .collect()
+    }
+
+    /// 筛分结束后的 UX：过滤回退、默认打开第一只、切到底栏寻宝。
+    fn finish_scout_ux(&mut self, cx: &mut Context<Self>) {
+        let buy_n = self
+            .scout_picks
+            .iter()
+            .filter(|p| p.verdict == ScoutVerdict::BuyWatch)
+            .count();
+        // 没有「可关注」时别留空列表，自动显示观察。
+        if buy_n == 0 {
+            self.scout_only_buy_watch = false;
+        } else {
+            self.scout_only_buy_watch = true;
+        }
+        self.treasure_list_expanded = false;
+        self.detail_tab = DetailTab::Treasure;
+        self.left_tab = LeftTab::Treasure;
+
+        let first = self
+            .visible_scout_picks()
+            .first()
+            .map(|p| (*p).clone())
+            .or_else(|| self.scout_picks.first().cloned());
+        if let Some(pick) = first {
+            // 自动打开第一只，图表与底栏价位立刻可读。
+            self.select_scout_pick(&pick, cx);
+        } else {
+            cx.notify();
+        }
     }
 
     fn cancel_treasure_scan(&mut self, cx: &mut Context<Self>) {
@@ -4662,6 +4990,14 @@ impl StockApp {
     fn render_treasure_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.selected.clone();
         let work = self.work_mode;
+        // 主按钮：空榜 → 搜罗；有榜无清单/重跑 → 筛可买；两边都不抢 primary。
+        let has_hits = !self.treasure_hits.is_empty();
+        let has_picks = !self.scout_picks.is_empty();
+        let busy = self.treasure_scanning || self.scout_running;
+        let scan_is_primary = !busy && !has_hits;
+        let pick_is_primary = !busy && has_hits && !has_picks;
+        let show_full_list = !has_picks || self.treasure_list_expanded;
+
         v_flex()
             .flex_1()
             .min_h_0()
@@ -4677,36 +5013,80 @@ impl StockApp {
                         h_flex()
                             .gap_1()
                             .items_center()
+                            .flex_wrap()
                             .child(
                                 Button::new("treasure-scan")
                                     .xsmall()
-                                    .primary()
+                                    .when(scan_is_primary, |b| b.primary())
+                                    .when(!scan_is_primary, |b| b.ghost())
                                     .label(if self.treasure_scanning {
                                         if work {
-                                            "Running…"
+                                            "① Running…"
                                         } else {
-                                            "扫描中…"
+                                            "① 扫描中…"
                                         }
                                     } else if work {
-                                        "Start"
+                                        "① Scout pool"
                                     } else {
-                                        "开始寻宝"
+                                        "① 开始搜罗"
                                     })
-                                    .disabled(self.treasure_scanning)
+                                    .disabled(busy)
+                                    .tooltip(if work {
+                                        "Scan historical lows (then auto AI picks)"
+                                    } else {
+                                        "扫描历史低位；完成后自动筛可买"
+                                    })
                                     .on_click(cx.listener(|this, _, _w, cx| {
                                         this.start_treasure_scan(cx);
                                     })),
                             )
                             .child(
-                                Button::new("treasure-cancel")
+                                Button::new("treasure-ai-scout")
                                     .xsmall()
-                                    .ghost()
-                                    .label(if work { "Cancel" } else { "取消" })
-                                    .disabled(!self.treasure_scanning)
+                                    .when(pick_is_primary, |b| b.primary())
+                                    .when(!pick_is_primary, |b| b.ghost())
+                                    .label(if self.scout_running {
+                                        if work {
+                                            "② Picking…"
+                                        } else {
+                                            "② 筛可买中…"
+                                        }
+                                    } else if has_picks {
+                                        if work {
+                                            "② Re-pick"
+                                        } else {
+                                            "② 重新筛可买"
+                                        }
+                                    } else if work {
+                                        "② AI picks"
+                                    } else {
+                                        "② 筛可买"
+                                    })
+                                    .disabled(busy || !has_hits)
+                                    .tooltip(if work {
+                                        "Batch-rank buy-watch names from the scan list"
+                                    } else {
+                                        "从寻宝榜批量给出可关注清单与建仓价（不必一只只点）"
+                                    })
                                     .on_click(cx.listener(|this, _, _w, cx| {
-                                        this.cancel_treasure_scan(cx);
+                                        this.start_scout_picks(cx);
                                     })),
-                            ),
+                            )
+                            .when(busy, |row| {
+                                row.child(
+                                    Button::new("treasure-cancel")
+                                        .xsmall()
+                                        .ghost()
+                                        .label(if work { "Cancel" } else { "取消" })
+                                        .on_click(cx.listener(|this, _, _w, cx| {
+                                            if this.scout_running {
+                                                this.cancel_scout_picks(cx);
+                                            } else {
+                                                this.cancel_treasure_scan(cx);
+                                            }
+                                        })),
+                                )
+                            }),
                     )
                     .child(
                         div()
@@ -4718,11 +5098,19 @@ impl StockApp {
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground.opacity(0.85))
-                            .child(format!(
-                                "{}池 · {} · ≤{TREASURE_SCAN_CAP} · Top{TREASURE_TOP_N} · 1Y/3Y/全 · 前复权",
-                                self.treasure_pool.label(),
-                                self.treasure_fin.label(),
-                            )),
+                            .child(if work {
+                                format!(
+                                    "{} · {} · ≤{TREASURE_SCAN_CAP} · Top{TREASURE_TOP_N}",
+                                    self.treasure_pool.label(),
+                                    self.treasure_fin.label(),
+                                )
+                            } else {
+                                format!(
+                                    "流程：①搜罗低位 → ②筛可买（自动）→ 点可关注看图 · {}池 · {} · Top{TREASURE_TOP_N}",
+                                    self.treasure_pool.label(),
+                                    self.treasure_fin.label(),
+                                )
+                            }),
                     )
                     .child(
                         h_flex()
@@ -4773,31 +5161,407 @@ impl StockApp {
                     ),
             )
             .child(
-                h_flex()
-                    .h(px(26.))
-                    .px_3()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("标的 / 位置"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("分"),
-                    ),
-            )
-            .child(
                 v_flex()
                     .id("treasure-scroll")
                     .flex_1()
                     .overflow_y_scroll()
+                    // —— 可买观察清单（批量筛结果，优先展示）——
+                    .when(
+                        !self.scout_picks.is_empty()
+                            || self.scout_running
+                            || !self.scout_summary.as_ref().is_empty(),
+                        |el| {
+                            let visible = self.visible_scout_picks();
+                            let buy_n = self
+                                .scout_picks
+                                .iter()
+                                .filter(|p| p.verdict == ScoutVerdict::BuyWatch)
+                                .count();
+                            let watch_n = self
+                                .scout_picks
+                                .iter()
+                                .filter(|p| p.verdict == ScoutVerdict::Watch)
+                                .count();
+                            let only_buy = self.scout_only_buy_watch;
+                            let count_label = if self.scout_running {
+                                format!("{}/{}", self.scout_done, self.scout_total)
+                            } else if only_buy {
+                                format!("{}/{} 可关注", visible.len(), self.scout_picks.len())
+                            } else {
+                                format!("{} 只", self.scout_picks.len())
+                            };
+
+                            el.child(
+                                v_flex()
+                                    .border_b_1()
+                                    .border_color(cx.theme().border)
+                                    .child(
+                                        h_flex()
+                                            .h(px(26.))
+                                            .px_3()
+                                            .items_center()
+                                            .gap_2()
+                                            .bg(cx.theme().accent.opacity(0.08))
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .text_xs()
+                                                    .font_semibold()
+                                                    .text_color(cx.theme().foreground)
+                                                    .child(if work {
+                                                        "Buy watchlist"
+                                                    } else {
+                                                        "🎯 可买观察"
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(count_label),
+                                            ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .px_3()
+                                            .py_1()
+                                            .gap_1()
+                                            .items_center()
+                                            .border_b_1()
+                                            .border_color(cx.theme().border.opacity(0.5))
+                                            .child(
+                                                Button::new("scout-filter-all")
+                                                    .xsmall()
+                                                    .when(!only_buy, |b| b.primary())
+                                                    .when(only_buy, |b| b.ghost())
+                                                    .label(if work {
+                                                        "All"
+                                                    } else {
+                                                        "全部"
+                                                    })
+                                                    .tooltip(if work {
+                                                        "Show BuyWatch + Watch"
+                                                    } else {
+                                                        "显示可关注与观察"
+                                                    })
+                                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                                        this.set_scout_only_buy_watch(false, cx);
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new("scout-filter-buy")
+                                                    .xsmall()
+                                                    .when(only_buy, |b| b.primary())
+                                                    .when(!only_buy, |b| b.ghost())
+                                                    .label(if work {
+                                                        "Buy only"
+                                                    } else {
+                                                        "仅可关注"
+                                                    })
+                                                    .tooltip(if work {
+                                                        "Hide Watch rows"
+                                                    } else {
+                                                        "只显示可关注，隐藏观察"
+                                                    })
+                                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                                        this.set_scout_only_buy_watch(true, cx);
+                                                    })),
+                                            )
+                                            .when(!self.scout_running && !work, |row| {
+                                                row.child(
+                                                    div()
+                                                        .ml_1()
+                                                        .text_xs()
+                                                        .text_color(
+                                                            cx.theme().muted_foreground.opacity(0.85),
+                                                        )
+                                                        .child(format!(
+                                                            "可关注 {buy_n} · 观察 {watch_n}"
+                                                        )),
+                                                )
+                                            }),
+                                    )
+                                    .when(!self.scout_summary.as_ref().is_empty(), |c| {
+                                        c.child(
+                                            div()
+                                                .px_3()
+                                                .py_2()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(self.scout_summary.clone()),
+                                        )
+                                        .when(!self.scout_source.as_ref().is_empty(), |c2| {
+                                            c2.child(
+                                                div()
+                                                    .px_3()
+                                                    .pb_1()
+                                                    .text_xs()
+                                                    .text_color(
+                                                        cx.theme().muted_foreground.opacity(0.8),
+                                                    )
+                                                    .child(self.scout_source.clone()),
+                                            )
+                                        })
+                                    })
+                                    .when(
+                                        visible.is_empty()
+                                            && !self.scout_running
+                                            && !self.scout_picks.is_empty()
+                                            && only_buy,
+                                        |c| {
+                                            c.child(
+                                                div()
+                                                    .px_3()
+                                                    .py_2()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(if work {
+                                                        "No BuyWatch rows. Switch to All to see Watch."
+                                                    } else {
+                                                        "当前没有「可关注」；点「全部」可查看观察名单。"
+                                                    }),
+                                            )
+                                        },
+                                    )
+                                    .children(visible.into_iter().enumerate().map(
+                                        |(ix, pick)| {
+                                            let is_selected =
+                                                pick.code == selected.as_ref();
+                                            let pick_owned = pick.clone();
+                                            let code_label = if work {
+                                                disguise_label(&pick.code, &pick.name)
+                                            } else {
+                                                pick.code.clone()
+                                            };
+                                            let name =
+                                                display_name_str(&pick.name, &pick.code);
+                                            let show_name =
+                                                !work && is_real_name(&name, &pick.code);
+                                            let verdict_color = match pick.verdict {
+                                                ScoutVerdict::BuyWatch => {
+                                                    cx.theme().success
+                                                }
+                                                ScoutVerdict::Watch => {
+                                                    cx.theme().warning
+                                                }
+                                                ScoutVerdict::Skip => {
+                                                    cx.theme().muted_foreground
+                                                }
+                                            };
+                                            let band = format!(
+                                                "建仓 {} · 减仓 {}",
+                                                pick.buy_band_text(),
+                                                pick.sell_band_text()
+                                            );
+                                            let why = pick
+                                                .reasons
+                                                .iter()
+                                                .take(2)
+                                                .cloned()
+                                                .collect::<Vec<_>>()
+                                                .join(" · ");
+
+                                            div()
+                                                .id(("scout-row", ix as u64))
+                                                .px_3()
+                                                .py_2()
+                                                .flex()
+                                                .items_start()
+                                                .gap_2()
+                                                .cursor_pointer()
+                                                .border_b_1()
+                                                .border_color(
+                                                    cx.theme().border.opacity(0.35),
+                                                )
+                                                .when(is_selected, |this| {
+                                                    this.bg(cx.theme().accent.opacity(0.18))
+                                                })
+                                                .hover(|this| {
+                                                    this.bg(cx.theme().accent.opacity(0.10))
+                                                })
+                                                .on_click(cx.listener(
+                                                    move |this, _, _w, cx| {
+                                                        this.select_scout_pick(
+                                                            &pick_owned, cx,
+                                                        );
+                                                    },
+                                                ))
+                                                .child(
+                                                    v_flex()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .gap_1()
+                                                        .child(
+                                                            h_flex()
+                                                                .gap_2()
+                                                                .items_center()
+                                                                .child(
+                                                                    div()
+                                                                        .text_sm()
+                                                                        .font_semibold()
+                                                                        .text_color(
+                                                                            cx.theme()
+                                                                                .foreground,
+                                                                        )
+                                                                        .child(code_label),
+                                                                )
+                                                                .when(show_name, |row| {
+                                                                    row.child(
+                                                                        div()
+                                                                            .text_xs()
+                                                                            .text_color(
+                                                                                cx.theme()
+                                                                                    .muted_foreground,
+                                                                            )
+                                                                            .child(name),
+                                                                    )
+                                                                })
+                                                                .child(
+                                                                    div()
+                                                                        .text_xs()
+                                                                        .font_semibold()
+                                                                        .text_color(
+                                                                            verdict_color,
+                                                                        )
+                                                                        .child(
+                                                                            pick.verdict
+                                                                                .label(),
+                                                                        ),
+                                                                ),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(
+                                                                    cx.theme().foreground
+                                                                        .opacity(0.9),
+                                                                )
+                                                                .child(if work {
+                                                                    format!(
+                                                                        "buy {} / sell {}",
+                                                                        pick.buy_band_text(),
+                                                                        pick.sell_band_text()
+                                                                    )
+                                                                } else {
+                                                                    band
+                                                                }),
+                                                        )
+                                                        .when(!why.is_empty() && !work, |r| {
+                                                            r.child(
+                                                                div()
+                                                                    .text_xs()
+                                                                    .text_color(
+                                                                        cx.theme()
+                                                                            .muted_foreground,
+                                                                    )
+                                                                    .child(why),
+                                                            )
+                                                        }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .font_semibold()
+                                                        .text_color(verdict_color)
+                                                        .child(format!(
+                                                            "{:.0}",
+                                                            pick.buy_score
+                                                        )),
+                                                )
+                                        },
+                                    )),
+                            )
+                        },
+                    )
+                    // 完整寻宝榜：有可买清单时默认折叠，避免抢注意力
+                    .when(has_picks, |el| {
+                        el.child(
+                            h_flex()
+                                .id("treasure-list-fold")
+                                .h(px(28.))
+                                .px_3()
+                                .items_center()
+                                .gap_2()
+                                .border_b_1()
+                                .border_color(cx.theme().border)
+                                .cursor_pointer()
+                                .hover(|this| this.bg(cx.theme().accent.opacity(0.06)))
+                                .on_click(cx.listener(|this, _, _w, cx| {
+                                    let next = !this.treasure_list_expanded;
+                                    this.set_treasure_list_expanded(next, cx);
+                                }))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(if work {
+                                            format!(
+                                                "{} full list ({})",
+                                                if self.treasure_list_expanded {
+                                                    "▾"
+                                                } else {
+                                                    "▸"
+                                                },
+                                                self.treasure_hits.len()
+                                            )
+                                        } else {
+                                            format!(
+                                                "{} 完整寻宝榜（{} 只，参考用）",
+                                                if self.treasure_list_expanded {
+                                                    "▾"
+                                                } else {
+                                                    "▸"
+                                                },
+                                                self.treasure_hits.len()
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(if self.treasure_list_expanded {
+                                            if work {
+                                                "Hide"
+                                            } else {
+                                                "收起"
+                                            }
+                                        } else if work {
+                                            "Show"
+                                        } else {
+                                            "展开"
+                                        }),
+                                ),
+                        )
+                    })
+                    .when(!has_picks, |el| {
+                        el.child(
+                            h_flex()
+                                .h(px(26.))
+                                .px_3()
+                                .items_center()
+                                .border_b_1()
+                                .border_color(cx.theme().border)
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(if work {
+                                            "Scan list / position"
+                                        } else {
+                                            "寻宝榜 / 位置（筛可买后会出现上方清单）"
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(if work { "Scr" } else { "分" }),
+                                ),
+                        )
+                    })
                     .when(self.treasure_hits.is_empty() && !self.treasure_scanning, |el| {
                         el.child(
                             div()
@@ -4805,13 +5569,14 @@ impl StockApp {
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(format!(
-                                    "尚无结果。将从东财按市值扩大候选（最多 {TREASURE_SCAN_CAP} 只，含自选），\
-                                     多窗口评分后取 Top {TREASURE_TOP_N}。\
-                                     「上行中继回撤」表示一年低但多年仍高。"
+                                    "三步：①「开始搜罗」扫历史低位（≤{TREASURE_SCAN_CAP}）→ \
+                                     ②自动筛可买清单与建仓价 → ③点「可关注」看图。\
+                                     有缓存榜时可直接点「② 筛可买」。"
                                 )),
                         )
                     })
-                    .children(self.treasure_hits.iter().enumerate().map(|(ix, hit)| {
+                    .when(show_full_list, |el| {
+                        el.children(self.treasure_hits.iter().enumerate().map(|(ix, hit)| {
                         let is_selected = hit.code == selected.as_ref();
                         let hit_owned = hit.clone();
                         let code_label = if work {
@@ -4925,7 +5690,8 @@ impl StockApp {
                                     })
                                     .child(score),
                             )
-                    })),
+                        }))
+                    }),
             )
     }
 
@@ -6647,14 +7413,69 @@ impl StockApp {
             .find(|h| h.code == self.selected.as_ref())
             .cloned();
 
+        // 参考建仓/减仓带：优先用当前图表日 K（与选中标的匹配时）。
+        let levels = self
+            .candles_code
+            .as_ref()
+            .filter(|c| c.as_str() == self.selected.as_ref())
+            .and_then(|_| levels::compute(&self.candles));
+
         let mut col = v_flex().gap_2().w_full().max_w(px(640.)).child(section_title(
             if work {
-                "Scan · multi-window"
+                "Scout · levels"
             } else {
-                "寻宝鼠 · 多窗口"
+                "寻宝鼠 · 搜罗价位"
             },
             cx,
         ));
+
+        if let Some(lv) = levels.as_ref() {
+            col = col
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .flex_wrap()
+                        .child(metric_chip(
+                            if work { "Spot" } else { "现价" },
+                            &format_price(lv.close),
+                            cx,
+                        ))
+                        .child(metric_chip(
+                            if work { "Buy band" } else { "建仓带" },
+                            &lv.buy_band_text(),
+                            cx,
+                        ))
+                        .child(metric_chip(
+                            if work { "Sell band" } else { "减仓带" },
+                            &lv.sell_band_text(),
+                            cx,
+                        )),
+                )
+                .child(detail_kv(
+                    if work { "Buy (ref)" } else { "参考建仓" },
+                    &format!("{} 元（支撑侧分批观察）", lv.buy_band_text()),
+                    cx,
+                ))
+                .child(detail_kv(
+                    if work { "Sell (ref)" } else { "参考减仓" },
+                    &format!("{} 元（阻力侧反弹观察）", lv.sell_band_text()),
+                    cx,
+                ));
+            if let Some(atr) = lv.atr14 {
+                col = col.child(detail_kv(
+                    "ATR14",
+                    &format!("{} 元", format_price(atr)),
+                    cx,
+                ));
+            }
+            if !lv.notes.is_empty() {
+                col = col.child(detail_kv(
+                    if work { "Basis" } else { "依据" },
+                    &lv.notes.join("；"),
+                    cx,
+                ));
+            }
+        }
 
         if let Some(h) = hit {
             let tags = h
@@ -6722,11 +7543,11 @@ impl StockApp {
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(
-                                "1Y/3Y/全样本评分；「上行中继回撤」= 一年低但多年仍高。仅供学习，非投资建议。",
+                                "搜罗：低位扫描 + 技术参考价位。建仓/减仓带为本地指标推算，非买卖指令。仅供学习研究。",
                             ),
                     )
                 });
-        } else {
+        } else if levels.is_none() {
             col = col
                 .child(
                     div()
@@ -6735,7 +7556,7 @@ impl StockApp {
                         .child(if work {
                             "Not in latest scan. Open the left Scan tab."
                         } else {
-                            "当前标的不在最近寻宝结果中。可打开左侧「寻宝」扫描。"
+                            "当前标的不在最近寻宝结果中。可打开左侧「寻宝」扫描；加载日 K 后也会显示参考价位。"
                         }),
                 )
                 .child(
@@ -6747,6 +7568,16 @@ impl StockApp {
                             this.set_left_tab(LeftTab::Treasure, cx);
                         })),
                 );
+        } else if !work {
+            col = col.child(
+                div()
+                    .mt_1()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        "当前不在寻宝榜内，仍可根据日 K 显示技术参考价位。左侧「寻宝」可扩大搜罗。仅供学习，非投资建议。",
+                    ),
+            );
         }
         col
     }

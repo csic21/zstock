@@ -19,6 +19,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::data::levels::{self, ReferenceLevels};
 use crate::data::signals;
 use crate::model::Candle;
 
@@ -174,6 +175,9 @@ pub struct AiSnapshot {
     pub up_days_5: u8,
     /// Close within 1.5% of the 20-bar high.
     pub near_20d_high: bool,
+    /// 本地推算的参考建仓 / 减仓价位带（元）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub levels: Option<ReferenceLevels>,
 }
 
 /// Build the analysis snapshot for the given daily series.
@@ -209,6 +213,7 @@ pub fn build_snapshot(candles: &[Candle], code: &str, name: &str) -> Option<AiSn
         macd: macd_snapshot(candles),
         up_days_5: up_days(candles, 5),
         near_20d_high: near_high(candles, 20, 0.015),
+        levels: levels::compute(candles),
     })
 }
 
@@ -302,6 +307,14 @@ pub fn local_commentary(snap: &AiSnapshot) -> String {
         lines.push("【节奏】近 5 日多数收跌，短线情绪偏弱。".to_string());
     }
 
+    if let Some(lv) = &snap.levels {
+        lines.push(format!(
+            "【参考建仓带】{} 元 · 【参考减仓带】{} 元（技术位推算，非交易指令）。",
+            lv.buy_band_text(),
+            lv.sell_band_text()
+        ));
+    }
+
     lines.push("以上为本地规则生成 · 仅供学习研究，不构成任何投资建议。".to_string());
     lines.join("\n")
 }
@@ -338,8 +351,10 @@ pub fn llm_commentary(cfg: &AiConfig, snap: &AiSnapshot) -> Result<String> {
     let body = serde_json::to_string(snap).context("序列化分析快照失败")?;
     let user_prompt = format!(
         "请基于以下本地计算好的 A 股技术面量化快照进行分析：\n```json\n{body}\n```\n\
-         要求：输出一段结构化中文点评（趋势 / 动量 / 量能 / 位置 / 风险），\
-         不超过 400 字，不要编造快照之外的数据，结尾必须包含“不构成投资建议”提示。"
+         要求：输出结构化中文点评，覆盖趋势 / 动量 / 量能 / 位置 / 风险；\
+         若快照含 levels（参考建仓带 buy_low–buy_high、减仓带 sell_low–sell_high），\
+         必须用「约 X–Y 元」明确写出参考买入观察价与减仓观察价，并说明仅为技术位、非买卖指令；\
+         不超过 450 字，不要编造快照之外的数据或新闻基本面，结尾必须包含“不构成投资建议”提示。"
     );
 
     let timeout = Duration::from_secs(cfg.timeout_secs.clamp(5, 120));
@@ -397,12 +412,13 @@ pub fn llm_commentary(cfg: &AiConfig, snap: &AiSnapshot) -> Result<String> {
 }
 
 const SYSTEM_PROMPT: &str = "你是一名严谨的 A 股技术面分析助手。\
-你只会获得一份由本地程序计算好的量化快照 JSON（技术指标与形态特征，不含原始行情）。\
+你只会获得一份由本地程序计算好的量化快照 JSON（技术指标、形态特征与可选参考价位带，不含原始行情）。\
 请：1) 基于快照写一段客观、结构化的中文点评，覆盖趋势、动量、量能与风险；\
-2) 指出这些数据仅代表技术面统计，不代表基本面；\
-3) 结尾必须包含“不构成投资建议”提示；\
-4) 全文不超过 400 字；\
-5) 不得编造快照之外的数据，数值必须与快照一致。";
+2) 若有 levels 字段，用其中 buy_low/buy_high、sell_low/sell_high 给出「参考建仓带 / 参考减仓带」元价位，并强调只是技术观察位；\
+3) 指出这些数据仅代表技术面统计，不代表基本面；\
+4) 结尾必须包含“不构成投资建议”提示；\
+5) 全文不超过 450 字；\
+6) 不得编造快照之外的数据，数值必须与快照一致。";
 
 fn friendly_http_error(e: ureq::Error) -> anyhow::Error {
     match e {
@@ -679,6 +695,9 @@ mod tests {
         assert!(text.contains("【综合】"));
         assert!(text.contains("不构成任何投资建议"));
         assert!(text.contains(snap.regime.as_str()));
+        assert!(snap.levels.is_some(), "levels expected on long series");
+        assert!(text.contains("【参考建仓带】"));
+        assert!(text.contains("【参考减仓带】"));
     }
 
     #[test]

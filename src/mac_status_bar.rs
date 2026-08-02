@@ -3,6 +3,9 @@
 //! Install once on the main thread. UI updates (title / menu) must also run on
 //! the main thread — GPUI's AppKit run loop satisfies that when called from
 //! `cx.update` / bootstrap.
+//!
+//! When no symbols are pinned, the status item shows the embedded S logo
+//! (template image) instead of the "ZStock · 未固定" text placeholder.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -11,11 +14,15 @@ use std::sync::{Mutex, OnceLock};
 use cocoa::appkit::{
     NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
 };
-use cocoa::base::{id, nil, NO};
-use cocoa::foundation::NSString;
+use cocoa::base::{id, nil, NO, YES};
+use cocoa::foundation::{NSData, NSSize, NSString};
 use objc::declare::ClassDecl;
 use objc::runtime::{Object, Sel};
 use objc::{class, msg_send, sel, sel_impl};
+
+/// Embedded menu-bar mark (template PNG, black + alpha).
+const STATUS_BAR_LOGO_PNG: &[u8] =
+    include_bytes!("../assets/logo/status-bar-mark.png");
 
 /// Actions sent from menu item clicks back into the GPUI app.
 #[derive(Debug, Clone)]
@@ -33,7 +40,10 @@ pub enum StatusBarAction {
 struct StatusBarState {
     item: usize,
     target: usize,
+    /// Retained `NSImage*` for the idle logo.
+    logo: usize,
     last_title: String,
+    showing_logo: bool,
 }
 
 impl StatusBarState {
@@ -43,6 +53,10 @@ impl StatusBarState {
 
     fn target(&self) -> id {
         self.target as id
+    }
+
+    fn logo(&self) -> id {
+        self.logo as id
     }
 }
 
@@ -71,8 +85,9 @@ pub fn install() -> Receiver<StatusBarAction> {
         let _: id = msg_send![item, retain];
         let _: id = msg_send![target, retain];
 
-        // Placeholder title until the first quote sync.
-        set_button_title(item, "ZStock");
+        let logo = load_logo_image();
+        // Start with logo (no pins yet).
+        apply_logo(item, logo);
 
         let menu = NSMenu::new(nil);
         let _: () = msg_send![menu, setAutoenablesItems: NO];
@@ -81,7 +96,9 @@ pub fn install() -> Receiver<StatusBarAction> {
         *STATE.lock().unwrap() = Some(StatusBarState {
             item: item as usize,
             target: target as usize,
-            last_title: "ZStock".into(),
+            logo: logo as usize,
+            last_title: String::new(),
+            showing_logo: true,
         });
     }
     INSTALLED.store(true, Ordering::SeqCst);
@@ -110,18 +127,35 @@ pub fn set_visible(visible: bool) {
     }
 }
 
-/// Update the button title (skips if unchanged to reduce AppKit churn).
+/// Update the button title and clear the logo (skips if unchanged).
 pub fn set_title(title: &str) {
     let mut guard = STATE.lock().unwrap();
     let Some(st) = guard.as_mut() else {
         return;
     };
-    if st.last_title == title {
+    if !st.showing_logo && st.last_title == title {
         return;
     }
     st.last_title = title.to_string();
+    st.showing_logo = false;
     unsafe {
-        set_button_title(st.item(), title);
+        apply_title(st.item(), title);
+    }
+}
+
+/// Show the app logo and clear the title text (idle / no pins).
+pub fn set_logo() {
+    let mut guard = STATE.lock().unwrap();
+    let Some(st) = guard.as_mut() else {
+        return;
+    };
+    if st.showing_logo {
+        return;
+    }
+    st.showing_logo = true;
+    st.last_title.clear();
+    unsafe {
+        apply_logo(st.item(), st.logo());
     }
 }
 
@@ -198,15 +232,79 @@ pub fn uninstall() {
             let bar = NSStatusBar::systemStatusBar(nil);
             let item = st.item();
             let target = st.target();
+            let logo = st.logo();
             bar.removeStatusItem_(item);
             let _: () = msg_send![item, release];
             let _: () = msg_send![target, release];
+            if logo != nil {
+                let _: () = msg_send![logo, release];
+            }
         }
     }
     INSTALLED.store(false, Ordering::SeqCst);
 }
 
 // —— ObjC helpers ————————————————————————————————————————————————————————
+
+unsafe fn load_logo_image() -> id {
+    unsafe {
+        let data = NSData::dataWithBytes_length_(
+            nil,
+            STATUS_BAR_LOGO_PNG.as_ptr() as *const std::os::raw::c_void,
+            STATUS_BAR_LOGO_PNG.len() as u64,
+        );
+        if data == nil {
+            return nil;
+        }
+        let image: id = msg_send![class!(NSImage), alloc];
+        let image: id = msg_send![image, initWithData: data];
+        if image == nil {
+            return nil;
+        }
+        // Template: menu bar tints for light/dark appearance.
+        let _: () = msg_send![image, setTemplate: YES];
+        // Point size ~18 matches typical menu-bar glyph.
+        let size = NSSize::new(18.0, 18.0);
+        let _: () = msg_send![image, setSize: size];
+        image
+    }
+}
+
+unsafe fn apply_logo(item: id, logo: id) {
+    unsafe {
+        let button: id = item.button();
+        if button == nil {
+            set_button_title(item, "ZStock");
+            return;
+        }
+        let empty = NSString::alloc(nil).init_str("");
+        let _: () = msg_send![button, setTitle: empty];
+        if logo != nil {
+            let _: () = msg_send![button, setImage: logo];
+            // NSImageOnly = 1
+            let _: () = msg_send![button, setImagePosition: 1isize];
+        } else {
+            // Fallback if image failed to load.
+            set_button_title(item, "ZStock");
+        }
+    }
+}
+
+unsafe fn apply_title(item: id, title: &str) {
+    unsafe {
+        let button: id = item.button();
+        if button == nil {
+            set_button_title(item, title);
+            return;
+        }
+        // Clear image so multi-quote text is not squeezed beside a glyph.
+        let _: () = msg_send![button, setImage: nil];
+        // NSNoImage = 0
+        let _: () = msg_send![button, setImagePosition: 0isize];
+        let ns = NSString::alloc(nil).init_str(title);
+        let _: () = msg_send![button, setTitle: ns];
+    }
+}
 
 unsafe fn set_button_title(item: id, title: &str) {
     unsafe {
