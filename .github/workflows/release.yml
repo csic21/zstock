@@ -252,20 +252,22 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-      # Checkout the *tag* (default ref for this job), not main.
-      # update-manifest.sh must match the asset names just published by this
-      # run; main may still have an older naming scheme until it is merged.
+      # Checkout the *tag* (default ref), not main. Asset naming lives in the
+      # tagged tree (workflow + update-manifest.sh); writing stable.json to
+      # main is done via the contents API below.
       - name: Checkout release tag
         uses: actions/checkout@v4
 
       - name: Generate updates/stable.json
         env:
           TAG: ${{ github.ref_name }}
+          ASSET_PREFIX: zstock
         run: |
           cd "$RUNNER_TEMP"
           for p in macos-arm64 macos-x64 windows-x64 linux-x64; do
-            curl -fsSL -o "$p.zip" "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/zstock-$p.zip" \
-              || { echo "::error::failed to download $p.zip for $TAG"; exit 1; }
+            curl -fsSL -o "$p.zip" \
+              "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/${ASSET_PREFIX}-$p.zip" \
+              || { echo "::error::failed to download ${ASSET_PREFIX}-$p.zip for $TAG"; exit 1; }
           done
           SHA_ARM64="$(shasum -a 256 macos-arm64.zip | awk '{print $1}')"
           SHA_X64="$(shasum -a 256 macos-x64.zip | awk '{print $1}')"
@@ -274,8 +276,15 @@ jobs:
           echo "TAG=$TAG arm64=$SHA_ARM64 x64=$SHA_X64 win=$SHA_WIN linux=$SHA_LINUX"
           test -n "$SHA_ARM64" && test -n "$SHA_X64" && test -n "$SHA_WIN" && test -n "$SHA_LINUX" \
             || { echo "::error::hash computation failed"; exit 1; }
-          bash "$GITHUB_WORKSPACE/scripts/update-manifest.sh" "$TAG" "$SHA_ARM64" "$SHA_X64" "$SHA_WIN" "$SHA_LINUX" \
+          ASSET_PREFIX="$ASSET_PREFIX" bash "$GITHUB_WORKSPACE/scripts/update-manifest.sh" \
+            "$TAG" "$SHA_ARM64" "$SHA_X64" "$SHA_WIN" "$SHA_LINUX" \
             || { echo "::error::update-manifest.sh failed"; exit 1; }
+          # Guard against a future script/workflow naming drift.
+          if ! grep -q "\"url\".*/${ASSET_PREFIX}-macos-arm64.zip\"" "$GITHUB_WORKSPACE/updates/stable.json"; then
+            echo "::error::stable.json asset URLs do not match ASSET_PREFIX=${ASSET_PREFIX}"
+            cat "$GITHUB_WORKSPACE/updates/stable.json"
+            exit 1
+          fi
           cat "$GITHUB_WORKSPACE/updates/stable.json"
 
       - name: Commit manifest to main

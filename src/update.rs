@@ -75,7 +75,7 @@ struct PlatformAsset {
 
 fn user_agent() -> String {
     format!(
-        "stock-updater/{} (+github.com/{}/{})",
+        "zstock-updater/{} (+github.com/{}/{})",
         env!("CARGO_PKG_VERSION"),
         REPO_OWNER,
         REPO_NAME

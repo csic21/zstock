@@ -21,7 +21,7 @@ test -n "$VERSION" || { echo "::error::could not read version from Cargo.toml" >
 
 DIST="${ROOT}/dist"
 PAYLOAD="${DIST}/pkg-payload"
-COMPONENT="${DIST}/stock-component.pkg"
+COMPONENT="${DIST}/zstock-component.pkg"
 OUT="${DIST}/zstock-macos-${ARCH_LABEL}.pkg"
 
 # 1. Build / refresh the .app bundle.

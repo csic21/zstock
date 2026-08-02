@@ -18,6 +18,8 @@ SHA_LINUX="${5:?missing linux-x64 sha256}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REPO="${GITHUB_REPOSITORY:-csic21/zstock}"
 VERSION="${TAG#v}"
+# Must match the artifact prefix used by .github/workflows/release.yml.
+ASSET_PREFIX="${ASSET_PREFIX:-zstock}"
 
 # Release notes are intentionally left empty here; the app surfaces the
 # release page URL instead of inline notes.
@@ -33,19 +35,19 @@ cat > "$ROOT/updates/stable.json" <<EOF
   "release_url": "https://github.com/$REPO/releases/tag/$TAG",
   "platforms": {
     "macos-arm64": {
-      "url": "https://github.com/$REPO/releases/download/$TAG/zstock-macos-arm64.zip",
+      "url": "https://github.com/$REPO/releases/download/$TAG/${ASSET_PREFIX}-macos-arm64.zip",
       "sha256": "$SHA_ARM64"
     },
     "macos-x64": {
-      "url": "https://github.com/$REPO/releases/download/$TAG/zstock-macos-x64.zip",
+      "url": "https://github.com/$REPO/releases/download/$TAG/${ASSET_PREFIX}-macos-x64.zip",
       "sha256": "$SHA_X64"
     },
     "windows-x64": {
-      "url": "https://github.com/$REPO/releases/download/$TAG/zstock-windows-x64.zip",
+      "url": "https://github.com/$REPO/releases/download/$TAG/${ASSET_PREFIX}-windows-x64.zip",
       "sha256": "$SHA_WIN"
     },
     "linux-x64": {
-      "url": "https://github.com/$REPO/releases/download/$TAG/zstock-linux-x64.zip",
+      "url": "https://github.com/$REPO/releases/download/$TAG/${ASSET_PREFIX}-linux-x64.zip",
       "sha256": "$SHA_LINUX"
     }
   }

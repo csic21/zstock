@@ -14,5 +14,5 @@
   <choice id="com.karl.stock-analysis" visible="false">
     <pkg-ref id="com.karl.stock-analysis"/>
   </choice>
-  <pkg-ref id="com.karl.stock-analysis" version="__VERSION__" onConclusion="none">stock-component.pkg</pkg-ref>
+  <pkg-ref id="com.karl.stock-analysis" version="__VERSION__" onConclusion="none">zstock-component.pkg</pkg-ref>
 </installer-gui-script>
