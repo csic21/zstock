@@ -3372,10 +3372,17 @@ impl StockApp {
         )
     }
 
-    fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_settings(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let work = self.work_mode;
         let interval = self.quote_interval_secs;
         let scheme = self.color_scheme;
+
+        // Responsive panel: fit inside the current window with comfortable
+        // margins on both axes (narrow/tall windows included) instead of a
+        // fixed 440x520 that overflows small windows and wastes tall ones.
+        let viewport = window.bounds().size;
+        let panel_w = (viewport.width - px(48.)).clamp(px(240.), px(440.));
+        let panel_max_h = (viewport.height - px(96.)).clamp(px(320.), px(680.));
 
         div()
             .absolute()
@@ -3383,13 +3390,18 @@ impl StockApp {
             .flex()
             .items_start()
             .justify_center()
-            .pt(px(72.))
+            .pt(px(48.))
             .bg(gpui::hsla(0., 0., 0., 0.55))
+            // Block wheel/scroll and hover from leaking into the app behind
+            // the modal; the panel itself stays fully interactive.
+            .occlude()
             .child(
                 v_flex()
                     .id("settings-panel")
-                    .w(px(440.))
-                    .max_h(px(520.))
+                    // Used by the layout regression test; no-op outside test builds.
+                    .debug_selector(|| "settings-panel-root".into())
+                    .w(panel_w)
+                    .max_h(panel_max_h)
                     .rounded(cx.theme().radius_lg)
                     .border_1()
                     .border_color(cx.theme().border)
@@ -3838,11 +3850,19 @@ impl StockApp {
             )
     }
 
-    fn render_left_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_left_panel(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let work = self.work_mode;
+        let avail_h = (window.bounds().size.height - TITLE_BAR_HEIGHT).max(px(0.));
         v_flex()
             .size_full()
+            // Definite height: the resizable group's panels are centered
+            // (align-items: center) and percentage heights are not resolved on
+            // the very first layout, which otherwise leaves the sidebar
+            // collapsed to its content height with empty bands above/below.
+            .h(avail_h)
             .bg(cx.theme().sidebar)
+            // Used by the layout regression test; no-op outside test builds.
+            .debug_selector(|| "left-panel-root".into())
             .child(
                 h_flex()
                     .h(px(36.))
@@ -5732,6 +5752,9 @@ impl StockApp {
             .justify_center()
             .pt(px(72.))
             .bg(gpui::hsla(0., 0., 0., 0.55))
+            // Same modal isolation as the settings overlay: don't let wheel
+            // scrolling or hover styles reach the app behind the palette.
+            .occlude()
             .child(
                 v_flex()
                     .id("palette-panel")
@@ -6211,7 +6234,7 @@ impl Render for StockApp {
                                 resizable_panel()
                                     .size(px(left_w))
                                     .size_range(px(200.)..px(440.))
-                                    .child(self.render_left_panel(cx)),
+                                    .child(self.render_left_panel(window, cx)),
                             )
                             .child(
                                 resizable_panel()
@@ -6239,7 +6262,9 @@ impl Render for StockApp {
                     .into_any_element()
             })
             .when(self.palette_open, |this| this.child(self.render_palette(cx)))
-            .when(self.settings_open, |this| this.child(self.render_settings(cx)))
+            .when(self.settings_open, |this| {
+                this.child(self.render_settings(window, cx))
+            })
             .children(Root::render_dialog_layer(window, cx))
     }
 }
@@ -6380,6 +6405,133 @@ mod keymap_tests {
         assert!(
             bindings[0].action().as_any().downcast_ref::<AppZero>().is_some(),
             "app 0 binding must win without input focus"
+        );
+    }
+}
+
+#[cfg(test)]
+mod layout_regression_tests {
+    use super::StockApp;
+    use gpui::{
+        px, size, AnyWindowHandle, AppContext, TestAppContext, VisualContext, VisualTestContext,
+    };
+    use gpui_component::PixelsExt;
+
+    /// Shared window/App setup for the layout regression tests: a throwaway
+    /// HOME with a copy of the real config, so the persisted dock state is
+    /// reproduced without mutating the user's config.
+    fn test_window(
+        cx: &mut TestAppContext,
+        w: f32,
+        h: f32,
+    ) -> VisualTestContext {
+        let tmp = std::env::temp_dir().join(format!("stock-analysis-test-{}", std::process::id()));
+        let cfg_dir = tmp.join("Library/Application Support/stock-analysis");
+        std::fs::create_dir_all(&cfg_dir).expect("create temp config dir");
+        if let Some(data_dir) = dirs::data_dir() {
+            let src = data_dir.join("stock-analysis/config.json");
+            if src.exists() {
+                std::fs::copy(&src, cfg_dir.join("config.json")).expect("copy config");
+            }
+        }
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+        }
+
+        cx.update(|cx| gpui_component::init(cx));
+        let window = cx.update(|cx| {
+            cx.open_window(
+                gpui::WindowOptions {
+                    titlebar: Some(gpui_component::TitleBar::title_bar_options()),
+                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
+                        origin: gpui::point(px(75.), px(47.)),
+                        size: size(px(w), px(h)),
+                    })),
+                    ..Default::default()
+                },
+                |window, cx| cx.new(|cx| StockApp::new(window, cx)),
+            )
+            .expect("open window")
+        });
+        let window: AnyWindowHandle = window.into();
+        VisualTestContext::from_window(window, cx)
+    }
+
+    /// Regression test: opening the window directly at its persisted size must
+    /// not leave the left sidebar collapsed to content height and centered
+    /// (gpui-component's resizable group centers its panels, and percentage
+    /// heights are not resolved on the very first layout).
+    #[gpui::test]
+    fn sidebar_fills_height_on_first_layout(cx: &mut TestAppContext) {
+        let mut window = test_window(cx, 1320.0, 860.0);
+        window.run_until_parked();
+
+        let root = window
+            .debug_bounds("left-panel-root")
+            .expect("left-panel-root bounds");
+        eprintln!("left-panel-root bounds: {root:?}");
+        assert!(
+            (root.origin.y.as_f32() - 34.0).abs() < 1.0,
+            "sidebar should start right below the 34px title bar, got y={}",
+            root.origin.y.as_f32()
+        );
+        assert!(
+            (root.size.height.as_f32() - 826.0).abs() < 1.0,
+            "sidebar should span the full content height (826px), got {}",
+            root.size.height.as_f32()
+        );
+    }
+
+    /// Regression test: the settings modal must size itself to the current
+    /// window (capped at 440x680 on large windows, squeezed on small ones) and
+    /// stay horizontally centered with a top margin, instead of overflowing
+    /// narrow windows or leaving the body too short on tall ones.
+    #[gpui::test]
+    fn settings_panel_is_responsive_and_centered(cx: &mut TestAppContext) {
+        let mut window = test_window(cx, 1320.0, 860.0);
+        window.run_until_parked();
+        let handle = window.window_handle();
+        window.cx.update_window(handle, |view, _window, cx| {
+            view.downcast::<StockApp>()
+                .expect("window root view")
+                .update(cx, |this, cx| this.toggle_settings(cx));
+        });
+        window.run_until_parked();
+        window.update(|window, cx| {
+            window.draw(cx);
+        });
+
+        let panel = window
+            .debug_bounds("settings-panel-root")
+            .expect("settings-panel-root bounds");
+        eprintln!("settings panel bounds (1320x860): {panel:?}");
+        assert!(
+            (panel.origin.x.as_f32() - 440.0).abs() < 1.0
+                && (panel.size.width.as_f32() - 440.0).abs() < 1.0,
+            "panel should be 440 wide and centered in a 1320 window, got {panel:?}"
+        );
+        assert!(
+            (panel.origin.y.as_f32() - 48.0).abs() < 1.0
+                && (panel.size.height.as_f32() - 680.0).abs() < 1.0,
+            "panel should cap at 680 tall starting at y=48, got {panel:?}"
+        );
+
+        // Narrow/short window: panel must stay inside the window bounds.
+        window.simulate_resize(size(px(640.), px(600.)));
+        window.run_until_parked();
+        let panel = window
+            .debug_bounds("settings-panel-root")
+            .expect("settings-panel-root bounds");
+        eprintln!("settings panel bounds (640x600): {panel:?}");
+        assert!(
+            (panel.origin.x.as_f32() - 100.0).abs() < 1.0
+                && (panel.size.width.as_f32() - 440.0).abs() < 1.0,
+            "panel should stay 440 wide and centered in a 640 window, got {panel:?}"
+        );
+        assert!(
+            (panel.origin.y.as_f32() - 48.0).abs() < 1.0
+                && (panel.size.height.as_f32() - 504.0).abs() < 1.0,
+            "panel should shrink to 504 tall (600-96) on a short window, got {panel:?}"
         );
     }
 }

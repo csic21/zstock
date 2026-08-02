@@ -31,6 +31,9 @@ smol = "2"
 ureq = { version = "2", features = ["json"] }
 zip = "2"
 
+[dev-dependencies]
+gpui = { version = "0.2.2", features = ["runtime_shaders", "test-support"] }
+
 [profile.dev]
 opt-level = 1
 
