@@ -17,8 +17,36 @@ fi
 
 DIST="${ROOT}/dist"
 OUT="${DIST}/zstock-macos-${ARCH_LABEL}.dmg"
-STAGE="${DIST}/dmg-staging"
-RW_IMG="${DIST}/.zstock-raw.dmg"
+# Arch-specific staging so arm64 + x64 packaging in one CI job cannot collide.
+STAGE="${DIST}/dmg-staging-${ARCH_LABEL}"
+RW_IMG="${DIST}/.zstock-raw-${ARCH_LABEL}.dmg"
+# Final volume name shown to users. Must stay "ZStock" for the Finder layout
+# script below; we carefully detach leftovers before/after each run.
+VOL_NAME="ZStock"
+
+detach_volume() {
+  local mp="$1"
+  [ -n "$mp" ] || return 0
+  if [ -e "$mp" ] || mount | grep -Fq "$mp"; then
+    hdiutil detach "$mp" >/dev/null 2>&1 \
+      || hdiutil detach -force "$mp" >/dev/null 2>&1 \
+      || diskutil unmount force "$mp" >/dev/null 2>&1 \
+      || true
+  fi
+}
+
+# Clear any leftover ZStock volume from a previous arch package in this job.
+detach_volume "/Volumes/${VOL_NAME}"
+# Also detach anything still attached to our temp image if present.
+if [ -f "$RW_IMG" ]; then
+  while IFS= read -r mp; do
+    [ -n "$mp" ] || continue
+    detach_volume "$mp"
+  done < <(hdiutil info 2>/dev/null | awk -v img="$RW_IMG" '
+    $0 ~ img { hit=1 }
+    hit && /\/Volumes\// { print $NF; hit=0 }
+  ')
+fi
 
 # 1. Build / refresh the .app bundle.
 SKIP_CARGO_BUILD="${SKIP_CARGO_BUILD:-0}" ./scripts/package-macos.sh
@@ -30,7 +58,25 @@ cp -R "${DIST}/${APP_NAME}.app" "${STAGE}/${APP_NAME}.app"
 ln -s /Applications "${STAGE}/Applications"
 
 # 3. Create a writable image, then try to lay out icons nicely (best effort).
-hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDRW "$RW_IMG" >/dev/null
+# Retry: CI runners occasionally hit "Resource busy" if a prior volume is slow
+# to release after detach.
+create_ok=0
+for attempt in 1 2 3; do
+  detach_volume "/Volumes/${VOL_NAME}"
+  if hdiutil create -volname "$VOL_NAME" -srcfolder "$STAGE" -ov -format UDRW "$RW_IMG" >/dev/null 2> "${DIST}/.hdiutil-create-${ARCH_LABEL}.err"; then
+    create_ok=1
+    break
+  fi
+  echo "==> hdiutil create attempt ${attempt} failed:" >&2
+  cat "${DIST}/.hdiutil-create-${ARCH_LABEL}.err" >&2 || true
+  sleep 2
+done
+rm -f "${DIST}/.hdiutil-create-${ARCH_LABEL}.err"
+if [ "$create_ok" -ne 1 ]; then
+  echo "error: hdiutil create failed for ${ARCH_LABEL} after retries" >&2
+  exit 1
+fi
+
 MOUNT_POINT="$(hdiutil attach -readwrite -noverify -noautoopen "$RW_IMG" 2>/dev/null \
   | awk -F '\t' '/\/Volumes\// {print $NF; exit}')"
 if [ -n "$MOUNT_POINT" ]; then
@@ -63,8 +109,9 @@ APPLESCRIPT
     SetFile -a C "${MOUNT_POINT}/.VolumeIcon.icns" || true
   fi
   sync
-  hdiutil detach "$MOUNT_POINT" >/dev/null 2>&1 \
-    || hdiutil detach -force "$MOUNT_POINT" >/dev/null 2>&1 || true
+  detach_volume "$MOUNT_POINT"
+  # Brief pause so macOS fully releases the image before convert.
+  sleep 1
 fi
 
 # 4. Compress to the final DMG.
@@ -72,6 +119,7 @@ rm -f "$OUT"
 hdiutil convert "$RW_IMG" -format UDZO -o "$OUT" >/dev/null
 rm -f "$RW_IMG"
 rm -rf "$STAGE"
+detach_volume "/Volumes/${VOL_NAME}"
 
 echo "==> done: ${OUT}"
 echo "    open \"${OUT}\""
