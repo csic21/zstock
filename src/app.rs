@@ -168,6 +168,45 @@ enum LeftTab {
     Treasure,
 }
 
+/// Full-page settings navigation (replaces the old modal dialog).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u32)]
+enum SettingsSection {
+    #[default]
+    General = 0,
+    StatusBar = 1,
+    Ai = 2,
+    Update = 3,
+    About = 4,
+}
+
+impl SettingsSection {
+    fn all() -> [Self; 5] {
+        [
+            Self::General,
+            Self::StatusBar,
+            Self::Ai,
+            Self::Update,
+            Self::About,
+        ]
+    }
+
+    fn label(self, work: bool) -> &'static str {
+        match (self, work) {
+            (Self::General, true) => "General",
+            (Self::General, false) => "常规",
+            (Self::StatusBar, true) => "Menu bar",
+            (Self::StatusBar, false) => "菜单栏",
+            (Self::Ai, true) => "AI",
+            (Self::Ai, false) => "AI 分析",
+            (Self::Update, true) => "Update",
+            (Self::Update, false) => "更新",
+            (Self::About, true) => "About",
+            (Self::About, false) => "关于",
+        }
+    }
+}
+
 /// 底部分析台分区：一次只聚焦一个任务，避免横向信息堆叠。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u32)]
@@ -307,8 +346,10 @@ pub struct StockApp {
     loading: bool,
     data_source: SharedString,
     palette_open: bool,
-    /// Settings overlay.
+    /// Full-page settings (not a modal).
     settings_open: bool,
+    /// Active section inside the settings page.
+    settings_section: SettingsSection,
     /// Auto-update state (GitHub Releases).
     update_state: UpdateState,
     /// Quote poll interval (seconds), from config.
@@ -540,6 +581,7 @@ impl StockApp {
             data_source: shared(market::SRC_LABEL),
             palette_open: false,
             settings_open: false,
+            settings_section: SettingsSection::General,
             update_state: UpdateState::Idle,
             quote_interval_secs: clamp_quote_interval_secs(cfg.quote_interval_secs),
             palette_query,
@@ -1368,10 +1410,13 @@ impl StockApp {
     }
 
     fn dismiss_overlay(&mut self, cx: &mut Context<Self>) {
-        if self.palette_open || self.settings_open {
+        if self.palette_open {
             self.palette_open = false;
-            self.settings_open = false;
             cx.notify();
+            return;
+        }
+        if self.settings_open {
+            self.close_settings(cx);
             return;
         }
         if self.drawing_mode {
@@ -1552,6 +1597,10 @@ impl StockApp {
     /// Install the native status item once and start polling menu actions.
     #[cfg(target_os = "macos")]
     fn ensure_status_bar_installed(&mut self, cx: &mut Context<Self>) {
+        // AppKit NSStatusItem is unsafe in headless / gpui unit tests.
+        if cfg!(test) {
+            return;
+        }
         use crate::mac_status_bar;
         if mac_status_bar::is_installed() {
             self.sync_status_bar();
@@ -1659,26 +1708,11 @@ impl StockApp {
                 return;
             }
 
-            let active = if self.status_bar_active.is_empty() {
-                self.selected.as_ref()
-            } else {
-                self.status_bar_active.as_str()
-            };
-
-            let title = self
-                .symbols
-                .iter()
-                .find(|s| s.code == active)
-                .map(|s| self.status_bar_title_for(s))
-                .unwrap_or_else(|| {
-                    if self.work_mode {
-                        "ZStock".into()
-                    } else {
-                        "ZStock · 无行情".into()
-                    }
-                });
+            // All pinned symbols appear together in the menu-bar title.
+            let title = self.status_bar_multi_title();
             mac_status_bar::set_title(&title);
 
+            let selected = self.selected.as_ref();
             let entries: Vec<MenuEntry> = self
                 .status_bar_codes
                 .iter()
@@ -1687,12 +1721,38 @@ impl StockApp {
                     Some(MenuEntry {
                         code: code.clone(),
                         label: self.status_bar_menu_label_for(sym),
-                        active: *code == active,
+                        // Checkmark = currently selected in the main window.
+                        active: *code == selected,
                     })
                 })
                 .collect();
             mac_status_bar::rebuild_menu(&entries, self.work_mode);
         }
+    }
+
+    /// Menu-bar title: one symbol full, many symbols compact side-by-side.
+    fn status_bar_multi_title(&self) -> String {
+        let syms: Vec<&Symbol> = self
+            .status_bar_codes
+            .iter()
+            .filter_map(|code| self.symbols.iter().find(|s| s.code == *code))
+            .collect();
+        if syms.is_empty() {
+            return if self.work_mode {
+                "ZStock".into()
+            } else {
+                "ZStock · 未固定".into()
+            };
+        }
+        if syms.len() == 1 {
+            return self.status_bar_title_for(syms[0]);
+        }
+        // Multi: keep each segment short so 3–5 names still fit the menu bar.
+        let parts: Vec<String> = syms
+            .iter()
+            .map(|s| self.status_bar_compact_for(s))
+            .collect();
+        parts.join(" · ")
     }
 
     fn status_bar_title_for(&self, sym: &Symbol) -> String {
@@ -1713,6 +1773,25 @@ impl StockApp {
                 )
             } else {
                 format!("{name} …")
+            }
+        }
+    }
+
+    /// Compact segment for multi-symbol titles: `名+涨跌%` (no price).
+    fn status_bar_compact_for(&self, sym: &Symbol) -> String {
+        if self.work_mode {
+            let alias = disguise_label(&sym.code, sym.name.as_ref());
+            if sym.last > 0.0 {
+                format!("{alias}{:+.2}%", sym.change_pct)
+            } else {
+                alias
+            }
+        } else {
+            let name = short_status_name(sym.name.as_ref(), &sym.code);
+            if sym.last > 0.0 {
+                format!("{name}{}", format_pct(sym.change_pct))
+            } else {
+                format!("{name}…")
             }
         }
     }
@@ -1749,19 +1828,31 @@ impl StockApp {
         use crate::mac_status_bar::StatusBarAction;
         match action {
             StatusBarAction::SelectCode(code) => {
-                self.set_status_bar_active(&code, cx);
+                // Focus that symbol in the main window (title still shows all pins).
+                self.status_bar_active = code.clone();
+                self.settings_open = false;
+                self.persist();
+                self.select_symbol(shared(code), cx);
+                self.activate_main_window(cx);
             }
             StatusBarAction::ShowWindow => {
-                cx.activate(true);
-                for handle in cx.windows() {
-                    let _ = handle.update(cx, |_root, window, _cx| {
-                        window.activate_window();
-                    });
-                }
+                self.settings_open = false;
+                cx.notify();
+                self.activate_main_window(cx);
             }
             StatusBarAction::Quit => {
                 cx.quit();
             }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn activate_main_window(&self, cx: &mut Context<Self>) {
+        cx.activate(true);
+        for handle in cx.windows() {
+            let _ = handle.update(cx, |_root, window, _cx| {
+                window.activate_window();
+            });
         }
     }
 
@@ -1921,7 +2012,25 @@ impl StockApp {
         self.settings_open = !self.settings_open;
         if self.settings_open {
             self.palette_open = false;
+            // Re-enter on General so the page feels fresh each open.
+            self.settings_section = SettingsSection::General;
         }
+        cx.notify();
+    }
+
+    fn set_settings_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        if self.settings_section == section {
+            return;
+        }
+        self.settings_section = section;
+        cx.notify();
+    }
+
+    fn close_settings(&mut self, cx: &mut Context<Self>) {
+        if !self.settings_open {
+            return;
+        }
+        self.settings_open = false;
         cx.notify();
     }
 
@@ -3688,7 +3797,18 @@ impl StockApp {
                             Button::new("settings-btn")
                                 .ghost()
                                 .xsmall()
-                                .label(if work { "Prefs" } else { "设置" })
+                                .when(self.settings_open, |b| b.primary())
+                                .label(if self.settings_open {
+                                    if work {
+                                        "Back"
+                                    } else {
+                                        "返回"
+                                    }
+                                } else if work {
+                                    "Prefs"
+                                } else {
+                                    "设置"
+                                })
                                 .tooltip(if work {
                                     "Preferences · ⌘,"
                                 } else {
@@ -3709,21 +3829,16 @@ impl StockApp {
     ) -> impl IntoElement {
         let enabled = self.status_bar_enabled;
         let pinned = self.status_bar_codes.clone();
-        let active = self.status_bar_active.clone();
         let pin_count = pinned.len();
 
         v_flex()
-            .gap_2()
+            .gap_3()
             .child(
                 div()
-                    .text_xs()
+                    .text_sm()
                     .font_semibold()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(if work {
-                        "Menu bar"
-                    } else {
-                        "菜单栏行情"
-                    }),
+                    .text_color(cx.theme().foreground)
+                    .child(if work { "Menu bar quotes" } else { "菜单栏行情" }),
             )
             .child(
                 div()
@@ -3731,11 +3846,11 @@ impl StockApp {
                     .text_color(cx.theme().muted_foreground.opacity(0.9))
                     .child(if work {
                         format!(
-                            "Pin up to {STATUS_BAR_MAX_CODES} watchlist symbols to the macOS menu bar. Click the title to switch."
+                            "Pin up to {STATUS_BAR_MAX_CODES} watchlist symbols. All pinned quotes show together in the macOS menu bar (e.g. A · B · C). Click a row in the dropdown to open that symbol."
                         )
                     } else {
                         format!(
-                            "从自选固定最多 {STATUS_BAR_MAX_CODES} 只到 macOS 菜单栏；点击菜单栏标题可切换展示。Windows/Linux 暂不支持。"
+                            "从自选固定最多 {STATUS_BAR_MAX_CODES} 只；菜单栏会同时显示全部固定标的（例：比亚迪-0.1% · 楚天+0.5%）。点下拉项可打开对应股票。Windows/Linux 暂不支持。"
                         )
                     }),
             )
@@ -3769,541 +3884,517 @@ impl StockApp {
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(if work {
-                            format!("Pinned {pin_count}/{STATUS_BAR_MAX_CODES} · click to pin/unpin")
+                            format!("Pinned {pin_count}/{STATUS_BAR_MAX_CODES} · click to pin/unpin · all show in menu bar")
                         } else {
-                            format!("已固定 {pin_count}/{STATUS_BAR_MAX_CODES} · 点击自选切换固定")
+                            format!("已固定 {pin_count}/{STATUS_BAR_MAX_CODES} · 点击切换固定 · 全部同时显示在菜单栏")
                         }),
                 )
                 .child(
-                    h_flex().gap_1().flex_wrap().children(
-                        self.symbols.iter().map(|sym| {
-                            let code = sym.code.clone();
-                            let is_pinned = pinned.iter().any(|c| c == &code);
-                            let is_active = active == code && is_pinned;
-                            let label = if work {
-                                disguise_label(&sym.code, sym.name.as_ref())
-                            } else if is_real_name(sym.name.as_ref(), &sym.code) {
-                                format!(
-                                    "{} {}",
-                                    short_status_name(sym.name.as_ref(), &sym.code),
-                                    sym.code
-                                )
-                            } else {
-                                sym.code.clone()
-                            };
-                            let btn_id = format!("sb-pin-{}", sym.code);
-                            Button::new(SharedString::from(btn_id))
-                                .xsmall()
-                                .when(is_active, |b| b.primary())
-                                .when(is_pinned && !is_active, |b| b.outline())
-                                .when(!is_pinned, |b| b.ghost())
-                                .label(label)
-                                .on_click(cx.listener(move |this, _, _w, cx| {
-                                    // Already pinned & active → unpin; pinned but not active → make active;
-                                    // not pinned → pin (and keep current active if any).
-                                    if this.status_bar_codes.iter().any(|c| c == &code) {
-                                        if this.status_bar_active == code {
-                                            this.toggle_status_bar_code(&code, cx);
-                                        } else {
-                                            this.set_status_bar_active(&code, cx);
-                                        }
-                                    } else {
-                                        this.toggle_status_bar_code(&code, cx);
-                                    }
-                                }))
-                        }),
-                    ),
+                    h_flex().gap_1().flex_wrap().children(self.symbols.iter().map(|sym| {
+                        let code = sym.code.clone();
+                        let is_pinned = pinned.iter().any(|c| c == &code);
+                        let label = if work {
+                            disguise_label(&sym.code, sym.name.as_ref())
+                        } else if is_real_name(sym.name.as_ref(), &sym.code) {
+                            format!(
+                                "{} {}",
+                                short_status_name(sym.name.as_ref(), &sym.code),
+                                sym.code
+                            )
+                        } else {
+                            sym.code.clone()
+                        };
+                        let btn_id = format!("sb-pin-{}", sym.code);
+                        Button::new(SharedString::from(btn_id))
+                            .xsmall()
+                            .when(is_pinned, |b| b.primary())
+                            .when(!is_pinned, |b| b.ghost())
+                            .label(label)
+                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                this.toggle_status_bar_code(&code, cx);
+                            }))
+                    })),
                 )
                 .child(
                     div()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground.opacity(0.75))
                         .child(if work {
-                            "Primary = shown in menu bar · Outline = pinned · Ghost = not pinned. Click primary again to unpin."
+                            "Primary = pinned (shown) · Ghost = not pinned."
                         } else {
-                            "主色 = 菜单栏当前展示 · 描边 = 已固定 · 幽灵 = 未固定。再点主色可取消固定。"
+                            "主色 = 已固定并显示 · 幽灵 = 未固定。可多选。"
                         }),
                 )
             })
     }
 
+    /// Full-page settings (replaces the old centered modal).
     fn render_settings(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let work = self.work_mode;
-        let interval = self.quote_interval_secs;
-        let scheme = self.color_scheme;
+        let section = self.settings_section;
+        let _ = window; // height comes from flex layout
 
-        // Responsive panel: fit inside the current window with comfortable
-        // margins on both axes (narrow/tall windows included) instead of a
-        // fixed 440x520 that overflows small windows and wastes tall ones.
-        let viewport = window.bounds().size;
-        let panel_w = (viewport.width - px(48.)).clamp(px(240.), px(440.));
-        let panel_max_h = (viewport.height - px(96.)).clamp(px(320.), px(680.));
-
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_start()
-            .justify_center()
-            .pt(px(48.))
-            .bg(gpui::hsla(0., 0., 0., 0.55))
-            // Block wheel/scroll and hover from leaking into the app behind
-            // the modal; the panel itself stays fully interactive.
-            .occlude()
+        v_flex()
+            .id("settings-panel")
+            .debug_selector(|| "settings-panel-root".into())
+            .size_full()
+            .bg(cx.theme().background)
             .child(
-                v_flex()
-                    .id("settings-panel")
-                    // Used by the layout regression test; no-op outside test builds.
-                    .debug_selector(|| "settings-panel-root".into())
-                    .w(panel_w)
-                    .max_h(panel_max_h)
-                    .rounded(cx.theme().radius_lg)
-                    .border_1()
+                h_flex()
+                    .h(px(44.))
+                    .px_3()
+                    .items_center()
+                    .gap_2()
+                    .border_b_1()
                     .border_color(cx.theme().border)
-                    .bg(cx.theme().popover)
-                    .overflow_hidden()
-                    .on_mouse_down_out(cx.listener(|this, _, _w, cx| {
-                        this.settings_open = false;
-                        cx.notify();
-                    }))
+                    .bg(cx.theme().sidebar)
                     .child(
-                        h_flex()
-                            .h(px(44.))
-                            .px_4()
-                            .items_center()
-                            .justify_between()
-                            .border_b_1()
-                            .border_color(cx.theme().border)
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .text_color(cx.theme().foreground)
-                                    .child(if work { "Preferences" } else { "设置" }),
-                            )
-                            .child(
-                                Button::new("settings-close")
-                                    .ghost()
-                                    .xsmall()
-                                    .label(if work { "Close" } else { "关闭" })
-                                    .on_click(cx.listener(|this, _, _w, cx| {
-                                        this.settings_open = false;
-                                        cx.notify();
-                                    })),
-                            ),
+                        Button::new("settings-back")
+                            .ghost()
+                            .xsmall()
+                            .label(if work { "← Back" } else { "← 返回行情" })
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.close_settings(cx);
+                            })),
                     )
                     .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .text_color(cx.theme().foreground)
+                            .child(if work { "Preferences" } else { "设置" }),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if work {
+                                "Saved locally · Esc to leave"
+                            } else {
+                                "本地保存 · Esc 返回"
+                            }),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(
                         v_flex()
+                            .w(px(200.))
+                            .h_full()
+                            .flex_shrink_0()
+                            .border_r_1()
+                            .border_color(cx.theme().border)
+                            .bg(cx.theme().sidebar)
+                            .p_2()
+                            .gap_1()
+                            .children(SettingsSection::all().map(|sec| {
+                                let on = section == sec;
+                                Button::new(("settings-nav", sec as u32))
+                                    .ghost()
+                                    .when(on, |b| b.primary())
+                                    .label(sec.label(work))
+                                    .on_click(cx.listener(move |this, _, _w, cx| {
+                                        this.set_settings_section(sec, cx);
+                                    }))
+                            })),
+                    )
+                    .child(
+                        div()
                             .id("settings-body")
                             .flex_1()
                             .min_h_0()
+                            .h_full()
                             .overflow_y_scroll()
-                            .p_4()
-                            .gap_4()
-                            // —— Quote interval ——
+                            .p_5()
+                            .child(match section {
+                                SettingsSection::General => {
+                                    self.render_settings_general(work, cx).into_any_element()
+                                }
+                                SettingsSection::StatusBar => {
+                                    self.render_settings_status_bar(work, cx).into_any_element()
+                                }
+                                SettingsSection::Ai => {
+                                    self.render_settings_ai(work, cx).into_any_element()
+                                }
+                                SettingsSection::Update => {
+                                    self.render_settings_update(work, cx).into_any_element()
+                                }
+                                SettingsSection::About => {
+                                    self.render_settings_about(work, cx).into_any_element()
+                                }
+                            }),
+                    ),
+            )
+    }
+
+    fn render_settings_general(&self, work: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let interval = self.quote_interval_secs;
+        let scheme = self.color_scheme;
+
+        v_flex()
+            .gap_5()
+            .max_w(px(640.))
+            .child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .text_color(cx.theme().foreground)
+                    .child(if work { "General" } else { "常规" }),
+            )
+            // Quote interval
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if work { "Poll interval" } else { "行情刷新间隔" }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground.opacity(0.9))
+                            .child(if work {
+                                "How often quotes refresh. Faster may hit rate limits."
+                            } else {
+                                "自选报价自动刷新频率。过快可能被数据源限流。"
+                            }),
+                    )
+                    .child(
+                        h_flex().gap_1().flex_wrap().children(
+                            QUOTE_INTERVAL_PRESETS.iter().map(|&secs| {
+                                let active = interval == secs;
+                                Button::new(("qi", secs as u32))
+                                    .xsmall()
+                                    .when(active, |b| b.primary())
+                                    .when(!active, |b| b.ghost())
+                                    .label(format!("{secs}s"))
+                                    .on_click(cx.listener(move |this, _, _w, cx| {
+                                        this.set_quote_interval_secs(secs, cx);
+                                    }))
+                            }),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!(
+                                "{}: {interval}s",
+                                if work { "Current" } else { "当前" }
+                            )),
+                    ),
+            )
+            // Color scheme
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if work { "Color scheme" } else { "涨跌配色" }),
+                    )
+                    .child(
+                        h_flex().gap_1().children([ColorScheme::Cn, ColorScheme::Us].map(|s| {
+                            let active = scheme == s;
+                            let id = match s {
+                                ColorScheme::Cn => "set-scheme-cn",
+                                ColorScheme::Us => "set-scheme-us",
+                            };
+                            Button::new(id)
+                                .xsmall()
+                                .when(active, |b| b.primary())
+                                .when(!active, |b| b.ghost())
+                                .label(s.label())
+                                .on_click(cx.listener(move |this, _, _w, cx| {
+                                    this.set_color_scheme(s, cx);
+                                }))
+                        })),
+                    ),
+            )
+            // Work mode
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if work { "Focus layout" } else { "工作模式" }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground.opacity(0.9))
+                            .child(if work {
+                                "Metrics dashboard + neutral chrome. Toggle with ⌘⇧W."
+                            } else {
+                                "服务指标台 + 中性文案。快捷键 ⌘⇧W。"
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
                             .child(
-                                v_flex()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_semibold()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(if work {
-                                                "Poll interval"
-                                            } else {
-                                                "行情刷新间隔"
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground.opacity(0.9))
-                                            .child(if work {
-                                                "How often quotes refresh. Faster may hit rate limits."
-                                            } else {
-                                                "自选报价自动刷新频率。过快可能被数据源限流。"
-                                            }),
-                                    )
-                                    .child(
-                                        h_flex().gap_1().flex_wrap().children(
-                                            QUOTE_INTERVAL_PRESETS.iter().map(|&secs| {
-                                                let active = interval == secs;
-                                                Button::new(("qi", secs as u32))
-                                                    .xsmall()
-                                                    .when(active, |b| b.primary())
-                                                    .when(!active, |b| b.ghost())
-                                                    .label(format!("{secs}s"))
-                                                    .on_click(cx.listener(move |this, _, _w, cx| {
-                                                        this.set_quote_interval_secs(secs, cx);
-                                                    }))
-                                            }),
-                                        ),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(format!(
-                                                "{}: {interval}s",
-                                                if work { "Current" } else { "当前" }
-                                            )),
-                                    ),
-                            )
-                            // —— Color scheme ——
-                            .child(
-                                v_flex()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_semibold()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(if work {
-                                                "Color scheme"
-                                            } else {
-                                                "涨跌配色"
-                                            }),
-                                    )
-                                    .child(
-                                        h_flex().gap_1().children(
-                                            [ColorScheme::Cn, ColorScheme::Us].map(|s| {
-                                                let active = scheme == s;
-                                                let id = match s {
-                                                    ColorScheme::Cn => "set-scheme-cn",
-                                                    ColorScheme::Us => "set-scheme-us",
-                                                };
-                                                Button::new(id)
-                                                    .xsmall()
-                                                    .when(active, |b| b.primary())
-                                                    .when(!active, |b| b.ghost())
-                                                    .label(s.label())
-                                                    .on_click(cx.listener(move |this, _, _w, cx| {
-                                                        this.set_color_scheme(s, cx);
-                                                    }))
-                                            }),
-                                        ),
-                                    ),
-                            )
-                            // —— Work mode ——
-                            .child(
-                                v_flex()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_semibold()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(if work {
-                                                "Focus layout"
-                                            } else {
-                                                "工作模式"
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground.opacity(0.9))
-                                            .child(if work {
-                                                "Metrics dashboard + neutral chrome. Toggle with ⌘⇧W."
-                                            } else {
-                                                "服务指标台 + 中性文案。快捷键 ⌘⇧W。"
-                                            }),
-                                    )
-                                    .child(
-                                        h_flex()
-                                            .gap_1()
-                                            .child(
-                                                Button::new("set-work-off")
-                                                    .xsmall()
-                                                    .when(!work, |b| b.primary())
-                                                    .when(work, |b| b.ghost())
-                                                    .label(if work { "Off" } else { "关闭" })
-                                                    .on_click(cx.listener(|this, _, window, cx| {
-                                                        this.set_work_mode(false, window, cx);
-                                                    })),
-                                            )
-                                            .child(
-                                                Button::new("set-work-on")
-                                                    .xsmall()
-                                                    .when(work, |b| b.primary())
-                                                    .when(!work, |b| b.ghost())
-                                                    .label(if work { "On" } else { "开启" })
-                                                    .on_click(cx.listener(|this, _, window, cx| {
-                                                        this.set_work_mode(true, window, cx);
-                                                    })),
-                                            ),
-                                    ),
-                            )
-                            // —— Status bar (macOS menu bar) ——
-                            .child(self.render_settings_status_bar(work, cx))
-                            // —— Update ——
-                            .child(
-                                v_flex()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_semibold()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(if work { "Update" } else { "更新" }),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground.opacity(0.9))
-                                            .child(self.update_status_line(work)),
-                                    )
-                                    .child(
-                                        h_flex()
-                                            .gap_1()
-                                            .child(
-                                                Button::new("check-update-btn")
-                                                    .xsmall()
-                                                    .ghost()
-                                                    .label(if work {
-                                                        "Check"
-                                                    } else {
-                                                        "检查更新"
-                                                    })
-                                                    .disabled(matches!(
-                                                        self.update_state,
-                                                        UpdateState::Checking
-                                                            | UpdateState::Downloading(_)
-                                                    ))
-                                                    .on_click(cx.listener(|this, _, _w, cx| {
-                                                        this.check_for_updates(true, cx);
-                                                    })),
-                                            )
-                                            .children(match &self.update_state {
-                                                UpdateState::Available(_) => Some(
-                                                    Button::new("settings-update-now")
-                                                        .xsmall()
-                                                        .primary()
-                                                        .label(if work {
-                                                            "Update now"
-                                                        } else {
-                                                            "立即更新"
-                                                        })
-                                                        .on_click(cx.listener(
-                                                            |this, _, _w, cx| {
-                                                                this.start_update(cx);
-                                                            },
-                                                        )),
-                                                ),
-                                                _ => None,
-                                            }),
-                                    ),
-                            )
-                            // —— AI 分析 ——
-                            .child(
-                                v_flex()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_semibold()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(if work {
-                                                "AI analysis"
-                                            } else {
-                                                "AI 分析"
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground.opacity(0.9))
-                                            .child(if work {
-                                                "Optional LLM brief for the selected stock. Falls back to local rules when disabled or offline."
-                                            } else {
-                                                "为当前标的生成 AI 点评；未开启或请求失败时自动使用本地规则点评。"
-                                            }),
-                                    )
-                                    .child(
-                                        h_flex()
-                                            .gap_1()
-                                            .child(
-                                                Button::new("ai-on")
-                                                    .xsmall()
-                                                    .when(self.ai_config.enabled, |b| b.primary())
-                                                    .when(!self.ai_config.enabled, |b| b.ghost())
-                                                    .label(if work { "On" } else { "开启" })
-                                                    .on_click(cx.listener(|this, _, _w, cx| {
-                                                        this.set_ai_enabled(true, cx);
-                                                    })),
-                                            )
-                                            .child(
-                                                Button::new("ai-off")
-                                                    .xsmall()
-                                                    .when(!self.ai_config.enabled, |b| b.primary())
-                                                    .when(self.ai_config.enabled, |b| b.ghost())
-                                                    .label(if work { "Off" } else { "关闭" })
-                                                    .on_click(cx.listener(|this, _, _w, cx| {
-                                                        this.set_ai_enabled(false, cx);
-                                                    })),
-                                            ),
-                                    )
-                                    .child(
-                                        h_flex()
-                                            .gap_1()
-                                            .children(AiKind::all().map(|kind| {
-                                                let active = self.ai_config.kind == kind;
-                                                let id = match kind {
-                                                    AiKind::Responses => "ai-kind-responses",
-                                                    AiKind::Chat => "ai-kind-chat",
-                                                };
-                                                Button::new(id)
-                                                    .xsmall()
-                                                    .when(active, |b| b.primary())
-                                                    .when(!active, |b| b.ghost())
-                                                    .label(kind.label())
-                                                    .on_click(cx.listener(
-                                                        move |this, _, _w, cx| {
-                                                            this.set_ai_kind(kind, cx);
-                                                        },
-                                                    ))
-                                            })),
-                                    )
-                                    .child(
-                                        v_flex()
-                                            .gap_1()
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child(if work {
-                                                        "Base URL"
-                                                    } else {
-                                                        "API 地址"
-                                                    }),
-                                            )
-                                            .child(
-                                                Input::new(&self.ai_base_url_input).small(),
-                                            ),
-                                    )
-                                    .child(
-                                        v_flex()
-                                            .gap_1()
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child(if work {
-                                                        "Model"
-                                                    } else {
-                                                        "模型"
-                                                    }),
-                                            )
-                                            .child(Input::new(&self.ai_model_input).small()),
-                                    )
-                                    .child(
-                                        v_flex()
-                                            .gap_1()
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child(if work {
-                                                        "API key"
-                                                    } else {
-                                                        "API Key"
-                                                    }),
-                                            )
-                                            .child(
-                                                Input::new(&self.ai_api_key_input)
-                                                    .small()
-                                                    .mask_toggle(),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground.opacity(0.75))
-                                            .child(if work {
-                                                "Key stays in local config.json. Only the computed metric snapshot is sent to the endpoint."
-                                            } else {
-                                                "Key 仅保存在本机 config.json；只上传本地算好的指标快照，不上传原始行情。"
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(if self.ai_config.enabled {
-                                                if self.ai_config.is_configured() {
-                                                    if work {
-                                                        "Enabled · configured."
-                                                    } else {
-                                                        "已开启 · 配置完整。"
-                                                    }
-                                                } else {
-                                                    if work {
-                                                        "Enabled · missing base URL / model / key."
-                                                    } else {
-                                                        "已开启 · 尚未填全 API 地址 / 模型 / Key。"
-                                                    }
-                                                }
-                                            } else if work {
-                                                "Disabled · local rules only."
-                                            } else {
-                                                "未开启 · 仅使用本地点评。"
-                                            }),
-                                    ),
-                            )
-                            // —— About / compliance ——
-                            .child(
-                                v_flex()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_semibold()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(if work { "About" } else { "关于" }),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground.opacity(0.9))
-                                            .child(format!(
-                                                "{} v{}",
-                                                if work { "Version" } else { "版本" },
-                                                env!("CARGO_PKG_VERSION")
-                                            )),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground.opacity(0.9))
-                                            .child(if work {
-                                                "Data: Eastmoney & Tencent public endpoints, personal study only."
-                                            } else {
-                                                "数据来源：东方财富 / 腾讯财经公开接口，仅供个人学习研究。"
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground.opacity(0.75))
-                                            .child(if work {
-                                                "For reference only. Quotes may be delayed or erroneous; no investment advice."
-                                            } else {
-                                                "行情可能有延迟或误差，所有指标与评分仅供参考，不构成任何投资建议。"
-                                            }),
-                                    ),
+                                Button::new("set-work-off")
+                                    .xsmall()
+                                    .when(!work, |b| b.primary())
+                                    .when(work, |b| b.ghost())
+                                    .label(if work { "Off" } else { "关闭" })
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.set_work_mode(false, window, cx);
+                                    })),
                             )
                             .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground.opacity(0.75))
-                                    .child(if work {
-                                        "Prefs are saved locally and apply immediately."
-                                    } else {
-                                        "设置会写入本地配置，立即生效。"
-                                    }),
+                                Button::new("set-work-on")
+                                    .xsmall()
+                                    .when(work, |b| b.primary())
+                                    .when(!work, |b| b.ghost())
+                                    .label(if work { "On" } else { "开启" })
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.set_work_mode(true, window, cx);
+                                    })),
                             ),
                     ),
+            )
+    }
+
+    fn render_settings_update(&self, work: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_3()
+            .max_w(px(640.))
+            .child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .text_color(cx.theme().foreground)
+                    .child(if work { "Update" } else { "更新" }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground.opacity(0.9))
+                    .child(self.update_status_line(work)),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new("check-update-btn")
+                            .xsmall()
+                            .ghost()
+                            .label(if work { "Check" } else { "检查更新" })
+                            .disabled(matches!(
+                                self.update_state,
+                                UpdateState::Checking | UpdateState::Downloading(_)
+                            ))
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.check_for_updates(true, cx);
+                            })),
+                    )
+                    .children(match &self.update_state {
+                        UpdateState::Available(_) => Some(
+                            Button::new("settings-update-now")
+                                .xsmall()
+                                .primary()
+                                .label(if work { "Update now" } else { "立即更新" })
+                                .on_click(cx.listener(|this, _, _w, cx| {
+                                    this.start_update(cx);
+                                })),
+                        ),
+                        _ => None,
+                    }),
+            )
+    }
+
+    fn render_settings_ai(&self, work: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_3()
+            .max_w(px(640.))
+            .child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .text_color(cx.theme().foreground)
+                    .child(if work { "AI analysis" } else { "AI 分析" }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground.opacity(0.9))
+                    .child(if work {
+                        "Optional LLM brief for the selected stock. Falls back to local rules when disabled or offline."
+                    } else {
+                        "为当前标的生成 AI 点评；未开启或请求失败时自动使用本地规则点评。"
+                    }),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new("ai-on")
+                            .xsmall()
+                            .when(self.ai_config.enabled, |b| b.primary())
+                            .when(!self.ai_config.enabled, |b| b.ghost())
+                            .label(if work { "On" } else { "开启" })
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.set_ai_enabled(true, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("ai-off")
+                            .xsmall()
+                            .when(!self.ai_config.enabled, |b| b.primary())
+                            .when(self.ai_config.enabled, |b| b.ghost())
+                            .label(if work { "Off" } else { "关闭" })
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.set_ai_enabled(false, cx);
+                            })),
+                    ),
+            )
+            .child(
+                h_flex().gap_1().children(AiKind::all().map(|kind| {
+                    let active = self.ai_config.kind == kind;
+                    let id = match kind {
+                        AiKind::Responses => "ai-kind-responses",
+                        AiKind::Chat => "ai-kind-chat",
+                    };
+                    Button::new(id)
+                        .xsmall()
+                        .when(active, |b| b.primary())
+                        .when(!active, |b| b.ghost())
+                        .label(kind.label())
+                        .on_click(cx.listener(move |this, _, _w, cx| {
+                            this.set_ai_kind(kind, cx);
+                        }))
+                })),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if work { "Base URL" } else { "API 地址" }),
+                    )
+                    .child(Input::new(&self.ai_base_url_input).small()),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if work { "Model" } else { "模型" }),
+                    )
+                    .child(Input::new(&self.ai_model_input).small()),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if work { "API key" } else { "API Key" }),
+                    )
+                    .child(Input::new(&self.ai_api_key_input).small().mask_toggle()),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground.opacity(0.75))
+                    .child(if work {
+                        "Key stays in local config.json. Only the computed metric snapshot is sent to the endpoint."
+                    } else {
+                        "Key 仅保存在本机 config.json；只上传本地算好的指标快照，不上传原始行情。"
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if self.ai_config.enabled {
+                        if self.ai_config.is_configured() {
+                            if work {
+                                "Enabled · configured."
+                            } else {
+                                "已开启 · 配置完整。"
+                            }
+                        } else if work {
+                            "Enabled · missing base URL / model / key."
+                        } else {
+                            "已开启 · 尚未填全 API 地址 / 模型 / Key。"
+                        }
+                    } else if work {
+                        "Disabled · local rules only."
+                    } else {
+                        "未开启 · 仅使用本地点评。"
+                    }),
+            )
+    }
+
+    fn render_settings_about(&self, work: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_3()
+            .max_w(px(640.))
+            .child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .text_color(cx.theme().foreground)
+                    .child(if work { "About" } else { "关于" }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground.opacity(0.9))
+                    .child(format!(
+                        "{} v{}",
+                        if work { "Version" } else { "版本" },
+                        env!("CARGO_PKG_VERSION")
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground.opacity(0.9))
+                    .child(if work {
+                        "Data: Eastmoney & Tencent public endpoints, personal study only."
+                    } else {
+                        "数据来源：东方财富 / 腾讯财经公开接口，仅供个人学习研究。"
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground.opacity(0.75))
+                    .child(if work {
+                        "For reference only. Quotes may be delayed or erroneous; no investment advice."
+                    } else {
+                        "行情可能有延迟或误差，所有指标与评分仅供参考，不构成任何投资建议。"
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground.opacity(0.75))
+                    .child(if work {
+                        "Prefs are saved locally and apply immediately."
+                    } else {
+                        "设置会写入本地配置，立即生效。"
+                    }),
             )
     }
 
@@ -5715,7 +5806,7 @@ impl StockApp {
             )
     }
 
-    /// 概览：评分徽章 + 关键因子芯片 + 依据标签。一眼看懂，不堆列。
+    /// 概览：紧凑两行——评分/因子 + OHLC/量能/快捷，填满底栏而不是漂在大片空底上。
     fn render_detail_overview(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let work = self.work_mode;
         let signal = self.current_signal();
@@ -5734,6 +5825,11 @@ impl StockApp {
         } else {
             None
         };
+        let last_candle = if candles_match {
+            self.candles.last()
+        } else {
+            None
+        };
         let code = self.selected.as_ref();
         let name_raw = sym.map(|s| s.name.as_ref()).unwrap_or("");
         let title = if work {
@@ -5749,181 +5845,253 @@ impl StockApp {
             format!("{} · {} 根", self.chart_label(), self.candles.len())
         };
         let prev = self.format_value(snap.as_ref().map(|s| s.prev_close).unwrap_or(0.0));
+        let last_price = sym.map(|s| s.last).unwrap_or(0.0);
+        let change_pct = sym.map(|s| s.change_pct).unwrap_or(0.0);
+        let volume = sym.map(|s| s.volume).unwrap_or(0);
 
-        h_flex()
+        v_flex()
             .w_full()
-            .gap_4()
-            .items_start()
-            // 左：评分徽章
-            .child(self.render_score_badge(signal.as_ref(), cx))
-            // 中：关键因子网格
+            .gap_2()
+            // Row 1: score + title/chips + quick links
             .child(
-                v_flex()
-                    .flex_1()
-                    .min_w(px(220.))
-                    .gap_2()
+                h_flex()
+                    .w_full()
+                    .gap_3()
+                    .items_start()
+                    .child(self.render_score_badge(signal.as_ref(), cx))
                     .child(
-                        h_flex()
-                            .gap_2()
-                            .items_baseline()
+                        v_flex()
+                            .flex_1()
+                            .min_w(px(200.))
+                            .gap_1p5()
                             .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .text_color(cx.theme().foreground)
-                                    .child(title),
+                                h_flex()
+                                    .gap_2()
+                                    .items_baseline()
+                                    .flex_wrap()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_semibold()
+                                            .text_color(cx.theme().foreground)
+                                            .child(title),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .px_1p5()
+                                            .py_0p5()
+                                            .rounded_full()
+                                            .bg(cx.theme().muted)
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(if work {
+                                                "svc".to_string()
+                                            } else {
+                                                sym.map(|s| s.board.as_ref().to_string())
+                                                    .unwrap_or_else(|| "--".into())
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(period),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_semibold()
+                                            .text_color(self.chg_color(change_pct >= 0.0, cx))
+                                            .child(if last_price > 0.0 {
+                                                format!(
+                                                    "{}  {}",
+                                                    self.format_value(last_price),
+                                                    format_pct(change_pct)
+                                                )
+                                            } else {
+                                                "—".into()
+                                            }),
+                                    ),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .px_1p5()
-                                    .py_0p5()
-                                    .rounded_full()
-                                    .bg(cx.theme().muted)
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(if work {
-                                        "svc".to_string()
-                                    } else {
-                                        sym.map(|s| s.board.as_ref().to_string())
-                                            .unwrap_or_else(|| "--".into())
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(period),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(if work {
-                                        format!("base {prev}")
-                                    } else {
-                                        format!("昨收 {prev}")
-                                    }),
-                            ),
-                    )
-                    .child(if let Some(s) = signal.as_ref() {
-                        h_flex()
-                            .gap_2()
-                            .flex_wrap()
-                            .child(metric_chip(
-                                if work { "RSI" } else { "RSI14" },
-                                &s.rsi14
-                                    .map(|v| format!("{v:.1}"))
-                                    .unwrap_or_else(|| "—".into()),
-                                cx,
-                            ))
-                            .child(metric_chip(
-                                if work { "Mom20" } else { "20日动量" },
-                                &s.momentum_20_pct
-                                    .map(|v| format!("{v:+.1}%"))
-                                    .unwrap_or_else(|| "—".into()),
-                                cx,
-                            ))
-                            .child(metric_chip(
-                                if work { "Vol×" } else { "量能比" },
-                                &s.volume_ratio_20
-                                    .map(|v| format!("{v:.1}x"))
-                                    .unwrap_or_else(|| "—".into()),
-                                cx,
-                            ))
-                            .child(metric_chip(
-                                if work { "DD1Y" } else { "1Y回撤" },
-                                &s.max_drawdown_1y_pct
-                                    .map(|v| format!("{v:.1}%"))
-                                    .unwrap_or_else(|| "—".into()),
-                                cx,
-                            ))
-                            .child(metric_chip(
-                                if work { "σ20" } else { "波动" },
-                                &s.volatility_20_ann_pct
-                                    .map(|v| format!("{v:.1}%"))
-                                    .unwrap_or_else(|| "—".into()),
-                                cx,
-                            ))
-                            .child(metric_chip(
-                                if work { "Conf" } else { "置信" },
-                                &format!("{:.0}%", s.confidence),
-                                cx,
-                            ))
-                            .into_any_element()
-                    } else {
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(if work {
-                                "Need ≥20 daily bars for signal."
+                            .child(if let Some(s) = signal.as_ref() {
+                                h_flex()
+                                    .gap_1p5()
+                                    .flex_wrap()
+                                    .child(metric_chip(
+                                        if work { "RSI" } else { "RSI14" },
+                                        &s.rsi14
+                                            .map(|v| format!("{v:.1}"))
+                                            .unwrap_or_else(|| "—".into()),
+                                        cx,
+                                    ))
+                                    .child(metric_chip(
+                                        if work { "Mom20" } else { "20日动量" },
+                                        &s.momentum_20_pct
+                                            .map(|v| format!("{v:+.1}%"))
+                                            .unwrap_or_else(|| "—".into()),
+                                        cx,
+                                    ))
+                                    .child(metric_chip(
+                                        if work { "Vol×" } else { "量能比" },
+                                        &s.volume_ratio_20
+                                            .map(|v| format!("{v:.1}x"))
+                                            .unwrap_or_else(|| "—".into()),
+                                        cx,
+                                    ))
+                                    .child(metric_chip(
+                                        if work { "DD1Y" } else { "1Y回撤" },
+                                        &s.max_drawdown_1y_pct
+                                            .map(|v| format!("{v:.1}%"))
+                                            .unwrap_or_else(|| "—".into()),
+                                        cx,
+                                    ))
+                                    .child(metric_chip(
+                                        if work { "σ20" } else { "波动" },
+                                        &s.volatility_20_ann_pct
+                                            .map(|v| format!("{v:.1}%"))
+                                            .unwrap_or_else(|| "—".into()),
+                                        cx,
+                                    ))
+                                    .child(metric_chip(
+                                        if work { "Conf" } else { "置信" },
+                                        &format!("{:.0}%", s.confidence),
+                                        cx,
+                                    ))
+                                    .into_any_element()
                             } else {
-                                "至少需要 20 根有效日 K 才能生成策略评分。"
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if work {
+                                        "Need ≥20 daily bars for signal."
+                                    } else {
+                                        "至少需要 20 根有效日 K 才能生成策略评分。"
+                                    })
+                                    .into_any_element()
                             })
-                            .into_any_element()
-                    })
-                    .when_some(signal.as_ref(), |col, s| {
-                        col.child(
-                            h_flex()
-                                .gap_1()
-                                .flex_wrap()
-                                .children(s.reasons.iter().take(5).map(|r| {
-                                    div()
-                                        .px_1p5()
-                                        .py_0p5()
-                                        .rounded(cx.theme().radius)
-                                        .bg(cx.theme().muted.opacity(0.55))
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child((*r).to_string())
-                                })),
-                        )
-                    }),
+                            .when_some(signal.as_ref(), |col, s| {
+                                col.child(
+                                    h_flex().gap_1().flex_wrap().children(
+                                        s.reasons.iter().take(5).map(|r| {
+                                            div()
+                                                .px_1p5()
+                                                .py_0p5()
+                                                .rounded(cx.theme().radius)
+                                                .bg(cx.theme().muted.opacity(0.55))
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child((*r).to_string())
+                                        }),
+                                    ),
+                                )
+                            }),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .min_w(px(120.))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_semibold()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if work { "Quick" } else { "快捷" }),
+                            )
+                            .child(
+                                Button::new("goto-strategy")
+                                    .xsmall()
+                                    .ghost()
+                                    .label(if work { "Signal →" } else { "策略 →" })
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.set_detail_tab(DetailTab::Strategy, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("goto-ai")
+                                    .xsmall()
+                                    .ghost()
+                                    .label(if work { "AI →" } else { "AI →" })
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.set_detail_tab(DetailTab::Ai, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("goto-treasure")
+                                    .xsmall()
+                                    .ghost()
+                                    .label(if work { "Scan →" } else { "寻宝 →" })
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.set_detail_tab(DetailTab::Treasure, cx);
+                                    })),
+                            ),
+                    ),
             )
-            // 右：快捷跳转 + 免责
+            // Row 2: OHLC / volume / source — fills residual dock height with real info
             .child(
-                v_flex()
-                    .gap_1p5()
-                    .min_w(px(140.))
-                    .max_w(px(180.))
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .flex_wrap()
+                    .items_center()
+                    .px_1()
+                    .py_1p5()
+                    .rounded(cx.theme().radius)
+                    .bg(cx.theme().muted.opacity(0.35))
+                    .child(metric_chip(
+                        if work { "Base" } else { "昨收" },
+                        &prev,
+                        cx,
+                    ))
+                    .child(metric_chip(
+                        if work { "O" } else { "开" },
+                        &last_candle
+                            .map(|c| self.format_value(c.open))
+                            .unwrap_or_else(|| "—".into()),
+                        cx,
+                    ))
+                    .child(metric_chip(
+                        if work { "H" } else { "高" },
+                        &last_candle
+                            .map(|c| self.format_value(c.high))
+                            .unwrap_or_else(|| "—".into()),
+                        cx,
+                    ))
+                    .child(metric_chip(
+                        if work { "L" } else { "低" },
+                        &last_candle
+                            .map(|c| self.format_value(c.low))
+                            .unwrap_or_else(|| "—".into()),
+                        cx,
+                    ))
+                    .child(metric_chip(
+                        if work { "C" } else { "收" },
+                        &last_candle
+                            .map(|c| self.format_value(c.close))
+                            .unwrap_or_else(|| "—".into()),
+                        cx,
+                    ))
+                    .child(metric_chip(
+                        if work { "Vol" } else { "量" },
+                        &if volume > 0 {
+                            format_volume(volume)
+                        } else {
+                            last_candle
+                                .map(|c| format_volume(c.volume))
+                                .unwrap_or_else(|| "—".into())
+                        },
+                        cx,
+                    ))
+                    .child(div().flex_1())
                     .child(
                         div()
                             .text_xs()
-                            .font_semibold()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(if work { "Quick" } else { "快捷" }),
-                    )
-                    .child(
-                        Button::new("goto-strategy")
-                            .xsmall()
-                            .ghost()
-                            .label(if work { "Full signal →" } else { "完整策略 →" })
-                            .on_click(cx.listener(|this, _, _w, cx| {
-                                this.set_detail_tab(DetailTab::Strategy, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("goto-ai")
-                            .xsmall()
-                            .ghost()
-                            .label(if work { "AI brief →" } else { "AI 点评 →" })
-                            .on_click(cx.listener(|this, _, _w, cx| {
-                                this.set_detail_tab(DetailTab::Ai, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("goto-treasure")
-                            .xsmall()
-                            .ghost()
-                            .label(if work { "Scan detail →" } else { "寻宝详情 →" })
-                            .on_click(cx.listener(|this, _, _w, cx| {
-                                this.set_detail_tab(DetailTab::Treasure, cx);
-                            })),
+                            .text_color(cx.theme().muted_foreground.opacity(0.85))
+                            .child(self.status.clone()),
                     )
                     .child(
                         div()
-                            .mt_1()
                             .text_xs()
-                            .text_color(cx.theme().muted_foreground.opacity(0.8))
+                            .text_color(cx.theme().muted_foreground.opacity(0.7))
                             .child(if work {
                                 "For reference only."
                             } else {
@@ -7102,7 +7270,16 @@ impl Render for StockApp {
                     .overflow_hidden()
                     .child(self.render_title_bar(cx)),
             )
-            .child(if work {
+            .child(if self.settings_open {
+                // Full-page settings: no modal overlay.
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_hidden()
+                    .child(self.render_settings(window, cx))
+                    .into_any_element()
+            } else if work {
                 div()
                     .flex_1()
                     .min_h_0()
@@ -7147,8 +7324,9 @@ impl Render for StockApp {
                                             )
                                             .child(
                                                 resizable_panel()
-                                                    .size(px(bottom_h.max(160.0)))
-                                                    .size_range(px(140.)..px(420.))
+                                                    // Slightly shorter default so overview isn't floating in empty space.
+                                                    .size(px(bottom_h.max(148.0)))
+                                                    .size_range(px(128.)..px(420.))
                                                     .child(self.render_detail_panel(cx)),
                                             ),
                                     ),
@@ -7156,9 +7334,8 @@ impl Render for StockApp {
                     )
                     .into_any_element()
             })
-            .when(self.palette_open, |this| this.child(self.render_palette(cx)))
-            .when(self.settings_open, |this| {
-                this.child(self.render_settings(window, cx))
+            .when(self.palette_open && !self.settings_open, |this| {
+                this.child(self.render_palette(cx))
             })
             .children(Root::render_dialog_layer(window, cx))
     }
@@ -7377,12 +7554,9 @@ mod layout_regression_tests {
         );
     }
 
-    /// Regression test: the settings modal must size itself to the current
-    /// window (capped at 440x680 on large windows, squeezed on small ones) and
-    /// stay horizontally centered with a top margin, instead of overflowing
-    /// narrow windows or leaving the body too short on tall ones.
+    /// Regression test: settings is a full page under the title bar (not a modal).
     #[gpui::test]
-    fn settings_panel_is_responsive_and_centered(cx: &mut TestAppContext) {
+    fn settings_page_fills_content_area(cx: &mut TestAppContext) {
         let mut window = test_window(cx, 1320.0, 860.0);
         window.run_until_parked();
         let handle = window.window_handle();
@@ -7399,34 +7573,39 @@ mod layout_regression_tests {
         let panel = window
             .debug_bounds("settings-panel-root")
             .expect("settings-panel-root bounds");
-        eprintln!("settings panel bounds (1320x860): {panel:?}");
+        eprintln!("settings page bounds (1320x860): {panel:?}");
+        // Below 34px title bar, full remaining height.
         assert!(
-            (panel.origin.x.as_f32() - 440.0).abs() < 1.0
-                && (panel.size.width.as_f32() - 440.0).abs() < 1.0,
-            "panel should be 440 wide and centered in a 1320 window, got {panel:?}"
+            (panel.origin.y.as_f32() - 34.0).abs() < 1.0,
+            "settings page should start below title bar, got y={}",
+            panel.origin.y.as_f32()
         );
         assert!(
-            (panel.origin.y.as_f32() - 48.0).abs() < 1.0
-                && (panel.size.height.as_f32() - 680.0).abs() < 1.0,
-            "panel should cap at 680 tall starting at y=48, got {panel:?}"
+            (panel.size.height.as_f32() - 826.0).abs() < 1.0,
+            "settings page should fill content height 826, got {}",
+            panel.size.height.as_f32()
+        );
+        assert!(
+            (panel.size.width.as_f32() - 1320.0).abs() < 1.0,
+            "settings page should be full window width, got {}",
+            panel.size.width.as_f32()
         );
 
-        // Narrow/short window: panel must stay inside the window bounds.
         window.simulate_resize(size(px(640.), px(600.)));
         window.run_until_parked();
         let panel = window
             .debug_bounds("settings-panel-root")
             .expect("settings-panel-root bounds");
-        eprintln!("settings panel bounds (640x600): {panel:?}");
+        eprintln!("settings page bounds (640x600): {panel:?}");
         assert!(
-            (panel.origin.x.as_f32() - 100.0).abs() < 1.0
-                && (panel.size.width.as_f32() - 440.0).abs() < 1.0,
-            "panel should stay 440 wide and centered in a 640 window, got {panel:?}"
+            (panel.size.width.as_f32() - 640.0).abs() < 1.0,
+            "settings page should match window width 640, got {}",
+            panel.size.width.as_f32()
         );
         assert!(
-            (panel.origin.y.as_f32() - 48.0).abs() < 1.0
-                && (panel.size.height.as_f32() - 504.0).abs() < 1.0,
-            "panel should shrink to 504 tall (600-96) on a short window, got {panel:?}"
+            (panel.size.height.as_f32() - 566.0).abs() < 1.0,
+            "settings page should fill 600-34 height, got {}",
+            panel.size.height.as_f32()
         );
     }
 }

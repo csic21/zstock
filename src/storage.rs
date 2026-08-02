@@ -154,10 +154,10 @@ pub struct AppConfig {
     /// Show live quotes in the macOS menu bar (no-op on other platforms).
     #[serde(default)]
     pub status_bar_enabled: bool,
-    /// Watchlist codes pinned to the status bar menu (max 5). Title shows `status_bar_active`.
+    /// Watchlist codes pinned to the status bar (max 5). All pinned codes are shown together.
     #[serde(default)]
     pub status_bar_codes: Vec<String>,
-    /// Code currently shown in the status bar title.
+    /// Preferred pin when focusing a symbol from the menu (still all codes are displayed).
     #[serde(default)]
     pub status_bar_active: String,
 }
@@ -205,7 +205,8 @@ impl Default for AppConfig {
             show_boll: false,
             dock: DockLayout::default(),
             left_width: 280.0,
-            bottom_height: 200.0,
+            // Compact by default so the overview strip doesn't sit in a tall empty dock.
+            bottom_height: 168.0,
             color_scheme: ColorScheme::Cn,
             work_mode: false,
             quote_interval_secs: default_quote_interval_secs(),
