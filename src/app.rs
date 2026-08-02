@@ -167,6 +167,50 @@ enum LeftTab {
     Treasure,
 }
 
+/// 底部分析台分区：一次只聚焦一个任务，避免横向信息堆叠。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u32)]
+enum DetailTab {
+    /// 一屏概览：评分徽章 + 关键因子 + 状态
+    #[default]
+    Overview = 0,
+    /// 策略雷达完整因子
+    Strategy = 1,
+    /// AI 点评
+    Ai = 2,
+    /// 寻宝多窗口位置
+    Treasure = 3,
+    /// MA / MACD / BOLL 指标读数
+    Indicators = 4,
+}
+
+impl DetailTab {
+    fn all() -> [Self; 5] {
+        [
+            Self::Overview,
+            Self::Strategy,
+            Self::Ai,
+            Self::Treasure,
+            Self::Indicators,
+        ]
+    }
+
+    fn label(self, work: bool) -> &'static str {
+        match (self, work) {
+            (Self::Overview, true) => "Overview",
+            (Self::Overview, false) => "概览",
+            (Self::Strategy, true) => "Signal",
+            (Self::Strategy, false) => "策略",
+            (Self::Ai, true) => "AI",
+            (Self::Ai, false) => "AI",
+            (Self::Treasure, true) => "Scan",
+            (Self::Treasure, false) => "寻宝",
+            (Self::Indicators, true) => "Tech",
+            (Self::Indicators, false) => "指标",
+        }
+    }
+}
+
 /// 底部「AI 点评」列的展示状态。
 #[derive(Debug, Clone)]
 enum AiPanelState {
@@ -290,6 +334,8 @@ pub struct StockApp {
     quote_fail_streak: u32,
     /// 左侧：自选 / 寻宝鼠
     left_tab: LeftTab,
+    /// 底部分析台当前分区（会话内；不写入 config）。
+    detail_tab: DetailTab,
     /// 寻宝扫描结果（按 score 降序）。
     treasure_hits: Vec<TreasureHit>,
     /// 候选池来源。
@@ -495,6 +541,7 @@ impl StockApp {
             watchlist_sort: cfg.watchlist_sort,
             quote_fail_streak: 0,
             left_tab: LeftTab::Watchlist,
+            detail_tab: DetailTab::Overview,
             treasure_hits,
             treasure_pool: TreasurePool::from_id(&cfg.treasure_pool),
             treasure_fin: FinFilter::from_id(&cfg.treasure_fin),
@@ -4435,25 +4482,76 @@ impl StockApp {
         let close_disp = self.format_value(close);
         let chg_disp = self.format_change(chg);
 
+        // OHLC strip (merged into quote header to free chart vertical space)
+        let ohlc_el = if candles_match {
+            let o = snap.as_ref().map(|s| s.open).unwrap_or(0.0);
+            let hi = snap.as_ref().map(|s| s.high).unwrap_or(0.0);
+            let lo = snap.as_ref().map(|s| s.low).unwrap_or(0.0);
+            let v = snap.as_ref().map(|s| s.volume).unwrap_or(0);
+            if work {
+                h_flex()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("min {}", self.format_value(lo)))
+                    .child(format!("max {}", self.format_value(hi)))
+                    .child(format!("pts {}", format_volume(v)))
+                    .into_any_element()
+            } else {
+                h_flex()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("开 {}", format_price(o)))
+                    .child(format!("高 {}", format_price(hi)))
+                    .child(format!("低 {}", format_price(lo)))
+                    .child(format!("量 {}", format_volume(v)))
+                    .into_any_element()
+            }
+        } else {
+            h_flex()
+                .gap_2()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(if self.loading {
+                    if work {
+                        "Loading series…"
+                    } else if matches!(self.chart_kind, ChartKind::Intraday) {
+                        "分时加载中…"
+                    } else {
+                        "K线加载中…"
+                    }
+                } else if work {
+                    "No series data"
+                } else if matches!(self.chart_kind, ChartKind::Intraday) {
+                    "暂无分时数据"
+                } else {
+                    "暂无匹配的 K 线"
+                })
+                .into_any_element()
+        };
+
         v_flex()
             .size_full()
             .bg(cx.theme().background)
-            // header
+            // Quote identity + price + OHLC（原两行合并为一行）
             .child(
                 h_flex()
-                    .h(px(52.))
+                    .h(px(48.))
                     .px_4()
                     .items_center()
                     .justify_between()
+                    .gap_3()
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(
                         h_flex()
-                            .gap_3()
+                            .gap_2()
                             .items_baseline()
+                            .min_w_0()
                             .child(
                                 div()
-                                    .text_xl()
+                                    .text_lg()
                                     .font_semibold()
                                     .text_color(cx.theme().foreground)
                                     .child(code_show),
@@ -4475,12 +4573,15 @@ impl StockApp {
                                     .bg(cx.theme().muted)
                                     .text_color(cx.theme().muted_foreground)
                                     .child(board),
-                            ),
+                            )
+                            .child(div().w(px(8.)))
+                            .child(ohlc_el),
                     )
                     .child(
                         h_flex()
-                            .gap_3()
+                            .gap_2()
                             .items_baseline()
+                            .flex_shrink_0()
                             .child(
                                 div()
                                     .text_2xl()
@@ -4497,126 +4598,36 @@ impl StockApp {
                             ),
                     ),
             )
-            // toolbar: OHLC + range + MA toggles
+            // Toolbar：周期 / 指标 / 画线（操作与行情分离）
             .child(
                 h_flex()
-                    .h(px(36.))
+                    .h(px(34.))
                     .px_3()
                     .items_center()
                     .justify_between()
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child({
-                        if candles_match {
-                            let o = snap.as_ref().map(|s| s.open).unwrap_or(0.0);
-                            let h = snap.as_ref().map(|s| s.high).unwrap_or(0.0);
-                            let l = snap.as_ref().map(|s| s.low).unwrap_or(0.0);
-                            let v = snap.as_ref().map(|s| s.volume).unwrap_or(0);
-                            if work {
-                                h_flex()
-                                    .gap_3()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!("min {}", self.format_value(l)))
-                                    .child(format!("max {}", self.format_value(h)))
-                                    .child(format!("pts {}", format_volume(v)))
-                            } else {
-                                h_flex()
-                                    .gap_3()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!("开 {}", format_price(o)))
-                                    .child(format!("高 {}", format_price(h)))
-                                    .child(format!("低 {}", format_price(l)))
-                                    .child(format!("量 {}", format_volume(v)))
-                            }
-                        } else {
-                            h_flex()
-                                .gap_3()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(if self.loading {
-                                    if work {
-                                        "Loading series…"
-                                    } else if matches!(self.chart_kind, ChartKind::Intraday) {
-                                        "分时加载中…"
-                                    } else {
-                                        "K线加载中…"
-                                    }
-                                } else if work {
-                                    "No series data"
-                                } else if matches!(self.chart_kind, ChartKind::Intraday) {
-                                    "暂无分时数据"
-                                } else {
-                                    "暂无匹配的 K 线"
-                                })
-                        }
-                    })
                     .child(
                         h_flex()
                             .gap_1()
                             .items_center()
-                            .when(
-                                !matches!(self.chart_kind, ChartKind::Intraday),
-                                |row| {
-                                    row.child(self.ma_toggle(
-                                        "ma5",
-                                        if work { "L1" } else { "MA5" },
-                                        self.show_ma5,
-                                        cx,
-                                    ))
-                                    .child(self.ma_toggle(
-                                        "ma10",
-                                        if work { "L2" } else { "MA10" },
-                                        self.show_ma10,
-                                        cx,
-                                    ))
-                                    .child(self.ma_toggle(
-                                        "ma20",
-                                        if work { "L3" } else { "MA20" },
-                                        self.show_ma20,
-                                        cx,
-                                    ))
-                                    .child(self.ma_toggle(
-                                        "ma60",
-                                        if work { "L4" } else { "MA60" },
-                                        self.show_ma60,
-                                        cx,
-                                    ))
-                                    .when(!work, |row| {
-                                        row.child(self.ma_toggle(
-                                            "vol",
-                                            "VOL",
-                                            self.show_volume,
-                                            cx,
-                                        ))
-                                        .child(self.ma_toggle(
-                                            "macd",
-                                            "MACD",
-                                            self.show_macd,
-                                            cx,
-                                        ))
-                                        .child(self.ma_toggle(
-                                            "boll",
-                                            "BOLL",
-                                            self.show_boll,
-                                            cx,
-                                        ))
-                                    })
-                                },
-                            )
-                            .child(div().w(px(8.)))
-                            .child(self.kind_button("分时", ChartKind::Intraday, cx))
-                            .child(self.kind_button("日K", ChartKind::DayK, cx))
-                            .child(
-                                self.kind_button(
-                                    "分钟",
-                                    ChartKind::MinuteK(self.current_minute_period()),
-                                    cx,
-                                ),
-                            )
+                            .child(self.kind_button(
+                                if work { "Intraday" } else { "分时" },
+                                ChartKind::Intraday,
+                                cx,
+                            ))
+                            .child(self.kind_button(
+                                if work { "Daily" } else { "日K" },
+                                ChartKind::DayK,
+                                cx,
+                            ))
+                            .child(self.kind_button(
+                                if work { "Minute" } else { "分钟" },
+                                ChartKind::MinuteK(self.current_minute_period()),
+                                cx,
+                            ))
                             .when(matches!(self.chart_kind, ChartKind::DayK), |row| {
-                                row.child(div().w(px(8.)))
+                                row.child(div().w(px(6.)))
                                     .children(ChartRange::all().map(|range| {
                                         let active = self.range == range;
                                         Button::new(("range", range as u32))
@@ -4629,31 +4640,73 @@ impl StockApp {
                                             }))
                                     }))
                             })
-                            .when(
-                                matches!(self.chart_kind, ChartKind::MinuteK(_)),
-                                |row| {
-                                    row.child(div().w(px(8.)))
-                                        .children(MinutePeriod::all().map(|p| {
-                                            let active =
-                                                self.chart_kind == ChartKind::MinuteK(p);
-                                            Button::new(("mperiod", p as u32))
-                                                .xsmall()
-                                                .when(active, |b| b.primary())
-                                                .when(!active, |b| b.ghost())
-                                                .label(p.label())
-                                                .on_click(cx.listener(
-                                                    move |this, _, _w, cx| {
-                                                        this.set_chart_kind(
-                                                            ChartKind::MinuteK(p),
-                                                            cx,
-                                                        );
-                                                    },
-                                                ))
-                                        }))
-                                },
-                            )
+                            .when(matches!(self.chart_kind, ChartKind::MinuteK(_)), |row| {
+                                row.child(div().w(px(6.)))
+                                    .children(MinutePeriod::all().map(|p| {
+                                        let active = self.chart_kind == ChartKind::MinuteK(p);
+                                        Button::new(("mperiod", p as u32))
+                                            .xsmall()
+                                            .when(active, |b| b.primary())
+                                            .when(!active, |b| b.ghost())
+                                            .label(p.label())
+                                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                                this.set_chart_kind(ChartKind::MinuteK(p), cx);
+                                            }))
+                                    }))
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .when(!matches!(self.chart_kind, ChartKind::Intraday), |row| {
+                                row.child(self.ma_toggle(
+                                    "ma5",
+                                    if work { "L1" } else { "MA5" },
+                                    self.show_ma5,
+                                    cx,
+                                ))
+                                .child(self.ma_toggle(
+                                    "ma10",
+                                    if work { "L2" } else { "MA10" },
+                                    self.show_ma10,
+                                    cx,
+                                ))
+                                .child(self.ma_toggle(
+                                    "ma20",
+                                    if work { "L3" } else { "MA20" },
+                                    self.show_ma20,
+                                    cx,
+                                ))
+                                .child(self.ma_toggle(
+                                    "ma60",
+                                    if work { "L4" } else { "MA60" },
+                                    self.show_ma60,
+                                    cx,
+                                ))
+                                .when(!work, |row| {
+                                    row.child(self.ma_toggle(
+                                        "vol",
+                                        "VOL",
+                                        self.show_volume,
+                                        cx,
+                                    ))
+                                    .child(self.ma_toggle(
+                                        "macd",
+                                        "MACD",
+                                        self.show_macd,
+                                        cx,
+                                    ))
+                                    .child(self.ma_toggle(
+                                        "boll",
+                                        "BOLL",
+                                        self.show_boll,
+                                        cx,
+                                    ))
+                                })
+                            })
                             .when(!work, |row| {
-                                row.child(div().w(px(8.)))
+                                row.child(div().w(px(6.)))
                                     .child(
                                         Button::new("draw-toggle")
                                             .xsmall()
@@ -5184,7 +5237,78 @@ impl StockApp {
             .into_any_element()
     }
 
+    fn set_detail_tab(&mut self, tab: DetailTab, cx: &mut Context<Self>) {
+        if self.detail_tab == tab {
+            return;
+        }
+        self.detail_tab = tab;
+        cx.notify();
+    }
+
     fn render_detail_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let work = self.work_mode;
+        let active = self.detail_tab;
+
+        v_flex()
+            .size_full()
+            .bg(cx.theme().sidebar)
+            // Tab strip：功能分区，一次只看一类信息
+            .child(
+                h_flex()
+                    .h(px(34.))
+                    .px_2()
+                    .items_center()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .children(DetailTab::all().map(|tab| {
+                        let is_on = active == tab;
+                        Button::new(("detail-tab", tab as u32))
+                            .xsmall()
+                            .when(is_on, |b| b.primary())
+                            .when(!is_on, |b| b.ghost())
+                            .label(tab.label(work))
+                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                this.set_detail_tab(tab, cx);
+                            }))
+                    }))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .max_w(px(360.))
+                            .overflow_hidden()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(self.status.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .id("detail-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_x_hidden()
+                    .overflow_y_scroll()
+                    .p_3()
+                    .child(match self.detail_tab {
+                        DetailTab::Overview => self.render_detail_overview(cx).into_any_element(),
+                        DetailTab::Strategy => self.render_signal_detail_col(cx).into_any_element(),
+                        DetailTab::Ai => self.render_ai_detail_col(cx).into_any_element(),
+                        DetailTab::Treasure => {
+                            self.render_treasure_detail_col(cx).into_any_element()
+                        }
+                        DetailTab::Indicators => {
+                            self.render_indicators_detail(cx).into_any_element()
+                        }
+                    }),
+            )
+    }
+
+    /// 概览：评分徽章 + 关键因子芯片 + 依据标签。一眼看懂，不堆列。
+    fn render_detail_overview(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let work = self.work_mode;
+        let signal = self.current_signal();
         let sym = self.current_symbol();
         let candles_match = self
             .candles_code
@@ -5202,185 +5326,399 @@ impl StockApp {
         };
         let code = self.selected.as_ref();
         let name_raw = sym.map(|s| s.name.as_ref()).unwrap_or("");
-        let title = if self.work_mode {
+        let title = if work {
             self.display_code(code)
         } else if is_real_name(name_raw, code) {
-            format!("{code} {name_raw}")
+            format!("{code}  {name_raw}")
         } else {
             code.to_string()
         };
+        let period = if work {
+            format!("{} · {} pts", self.chart_label(), self.candles.len())
+        } else {
+            format!("{} · {} 根", self.chart_label(), self.candles.len())
+        };
+        let prev = self.format_value(snap.as_ref().map(|s| s.prev_close).unwrap_or(0.0));
 
-        v_flex()
-            .size_full()
-            .bg(cx.theme().sidebar)
+        h_flex()
+            .w_full()
+            .gap_4()
+            .items_start()
+            // 左：评分徽章
+            .child(self.render_score_badge(signal.as_ref(), cx))
+            // 中：关键因子网格
             .child(
-                h_flex()
-                    .h(px(32.))
-                    .px_3()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
+                v_flex()
+                    .flex_1()
+                    .min_w(px(220.))
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_baseline()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .text_color(cx.theme().foreground)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_full()
+                                    .bg(cx.theme().muted)
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if work {
+                                        "svc".to_string()
+                                    } else {
+                                        sym.map(|s| s.board.as_ref().to_string())
+                                            .unwrap_or_else(|| "--".into())
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(period),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if work {
+                                        format!("base {prev}")
+                                    } else {
+                                        format!("昨收 {prev}")
+                                    }),
+                            ),
+                    )
+                    .child(if let Some(s) = signal.as_ref() {
+                        h_flex()
+                            .gap_2()
+                            .flex_wrap()
+                            .child(metric_chip(
+                                if work { "RSI" } else { "RSI14" },
+                                &s.rsi14
+                                    .map(|v| format!("{v:.1}"))
+                                    .unwrap_or_else(|| "—".into()),
+                                cx,
+                            ))
+                            .child(metric_chip(
+                                if work { "Mom20" } else { "20日动量" },
+                                &s.momentum_20_pct
+                                    .map(|v| format!("{v:+.1}%"))
+                                    .unwrap_or_else(|| "—".into()),
+                                cx,
+                            ))
+                            .child(metric_chip(
+                                if work { "Vol×" } else { "量能比" },
+                                &s.volume_ratio_20
+                                    .map(|v| format!("{v:.1}x"))
+                                    .unwrap_or_else(|| "—".into()),
+                                cx,
+                            ))
+                            .child(metric_chip(
+                                if work { "DD1Y" } else { "1Y回撤" },
+                                &s.max_drawdown_1y_pct
+                                    .map(|v| format!("{v:.1}%"))
+                                    .unwrap_or_else(|| "—".into()),
+                                cx,
+                            ))
+                            .child(metric_chip(
+                                if work { "σ20" } else { "波动" },
+                                &s.volatility_20_ann_pct
+                                    .map(|v| format!("{v:.1}%"))
+                                    .unwrap_or_else(|| "—".into()),
+                                cx,
+                            ))
+                            .child(metric_chip(
+                                if work { "Conf" } else { "置信" },
+                                &format!("{:.0}%", s.confidence),
+                                cx,
+                            ))
+                            .into_any_element()
+                    } else {
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if work {
+                                "Need ≥20 daily bars for signal."
+                            } else {
+                                "至少需要 20 根有效日 K 才能生成策略评分。"
+                            })
+                            .into_any_element()
+                    })
+                    .when_some(signal.as_ref(), |col, s| {
+                        col.child(
+                            h_flex()
+                                .gap_1()
+                                .flex_wrap()
+                                .children(s.reasons.iter().take(5).map(|r| {
+                                    div()
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded(cx.theme().radius)
+                                        .bg(cx.theme().muted.opacity(0.55))
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child((*r).to_string())
+                                })),
+                        )
+                    }),
+            )
+            // 右：快捷跳转 + 免责
+            .child(
+                v_flex()
+                    .gap_1p5()
+                    .min_w(px(140.))
+                    .max_w(px(180.))
                     .child(
                         div()
                             .text_xs()
                             .font_semibold()
                             .text_color(cx.theme().muted_foreground)
-                            .child(if self.work_mode {
-                                "Inspector"
+                            .child(if work { "Quick" } else { "快捷" }),
+                    )
+                    .child(
+                        Button::new("goto-strategy")
+                            .xsmall()
+                            .ghost()
+                            .label(if work { "Full signal →" } else { "完整策略 →" })
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.set_detail_tab(DetailTab::Strategy, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("goto-ai")
+                            .xsmall()
+                            .ghost()
+                            .label(if work { "AI brief →" } else { "AI 点评 →" })
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.set_detail_tab(DetailTab::Ai, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("goto-treasure")
+                            .xsmall()
+                            .ghost()
+                            .label(if work { "Scan detail →" } else { "寻宝详情 →" })
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.set_detail_tab(DetailTab::Treasure, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground.opacity(0.8))
+                            .child(if work {
+                                "For reference only."
                             } else {
-                                "详情 / 状态"
+                                "仅供学习研究，不构成投资建议。"
                             }),
                     ),
             )
+    }
+
+    fn render_score_badge(
+        &self,
+        signal: Option<&signals::SignalSnapshot>,
+        cx: &App,
+    ) -> impl IntoElement {
+        let work = self.work_mode;
+        let (score_txt, regime_txt, conf_txt, color) = if let Some(s) = signal {
+            (
+                format!("{:.0}", s.score),
+                if work {
+                    s.regime.service_state().to_string()
+                } else {
+                    s.regime.label().to_string()
+                },
+                format!("{:.0}%", s.confidence),
+                self.regime_color(s.regime, cx),
+            )
+        } else {
+            (
+                "—".into(),
+                if work { "n/a".into() } else { "无数据".into() },
+                "—".into(),
+                cx.theme().muted_foreground,
+            )
+        };
+
+        v_flex()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .min_w(px(96.))
+            .px_3()
+            .py_2()
+            .rounded(cx.theme().radius)
+            .bg(color.opacity(0.12))
+            .border_1()
+            .border_color(color.opacity(0.35))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if work { "Score" } else { "综合" }),
+            )
             .child(
                 h_flex()
-                    .id("detail-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_x_scroll()
-                    .overflow_y_scroll()
-                    .p_3()
-                    .gap_5()
-                    .items_start()
+                    .items_baseline()
+                    .gap_0p5()
                     .child(
-                        v_flex()
-                            .gap_1()
-                            .min_w(px(180.))
-                            .child(detail_row(
-                                if self.work_mode { "Item" } else { "标的" },
-                                &title,
-                                cx,
-                            ))
-                            .child(detail_row(
-                                if self.work_mode { "Group" } else { "板块" },
-                                if self.work_mode {
-                                    "svc"
-                                } else {
-                                    sym.map(|s| s.board.as_ref()).unwrap_or("--")
-                                },
-                                cx,
-                            ))
-                            .child(detail_row(
-                                if self.work_mode { "Range" } else { "周期" },
-                                &if self.work_mode {
-                                    format!("{} · {} pts", self.chart_label(), self.candles.len())
-                                } else {
-                                    format!("{} · {} 根", self.chart_label(), self.candles.len())
-                                },
-                                cx,
-                            ))
-                            .child(detail_row(
-                                if self.work_mode { "Base" } else { "昨收" },
-                                &self.format_value(
-                                    snap.as_ref().map(|s| s.prev_close).unwrap_or(0.0),
-                                ),
-                                cx,
-                            ))
-                            .child(detail_row(
-                                if self.work_mode { "Theme" } else { "配色" },
-                                if self.work_mode {
-                                    "neutral"
-                                } else {
-                                    self.color_scheme.label()
-                                },
-                                cx,
-                            )),
+                        div()
+                            .text_3xl()
+                            .font_semibold()
+                            .text_color(color)
+                            .child(score_txt),
                     )
                     .child(
-                        v_flex()
-                            .gap_1()
-                            .min_w(px(120.))
-                            .child(detail_row(
-                                if self.work_mode { "L1" } else { "MA5" },
-                                &if candles_match {
-                                    self.ma
-                                        .ma5
-                                        .last()
-                                        .and_then(|x| *x)
-                                        .map(|v| self.format_value(v))
-                                        .unwrap_or_else(|| "--".into())
-                                } else {
-                                    "--".into()
-                                },
-                                cx,
-                            ))
-                            .child(detail_row(
-                                if self.work_mode { "L2" } else { "MA10" },
-                                &if candles_match {
-                                    self.ma
-                                        .ma10
-                                        .last()
-                                        .and_then(|x| *x)
-                                        .map(|v| self.format_value(v))
-                                        .unwrap_or_else(|| "--".into())
-                                } else {
-                                    "--".into()
-                                },
-                                cx,
-                            ))
-                            .child(detail_row(
-                                if self.work_mode { "L3" } else { "MA20" },
-                                &if candles_match {
-                                    self.ma
-                                        .ma20
-                                        .last()
-                                        .and_then(|x| *x)
-                                        .map(|v| self.format_value(v))
-                                        .unwrap_or_else(|| "--".into())
-                                } else {
-                                    "--".into()
-                                },
-                                cx,
-                            ))
-                            .child(detail_row(
-                                if self.work_mode { "L4" } else { "MA60" },
-                                &if candles_match {
-                                    self.ma
-                                        .ma60
-                                        .last()
-                                        .and_then(|x| *x)
-                                        .map(|v| self.format_value(v))
-                                        .unwrap_or_else(|| "--".into())
-                                } else {
-                                    "--".into()
-                                },
-                                cx,
-                            )),
-                    )
-                    .child(self.render_signal_detail_col(cx))
-                    .child(self.render_ai_detail_col(cx))
-                    .child(self.render_treasure_detail_col(cx))
-                    .child(self.render_macd_detail_col(cx))
-                    .child(self.render_boll_detail_col(cx))
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w(px(160.))
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(if self.work_mode { "Status" } else { "状态" }),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().foreground)
-                                    .child(self.status.clone()),
-                            )
-                            .when(!self.work_mode, |col| {
-                                col.child(
-                                    div()
-                                        .mt_1()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(
-                                            "1Y/3Y/全样本评分；「上行中继回撤」= 一年低但多年仍高。仅供学习，非投资建议。",
-                                        ),
-                                )
-                            }),
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("/100"),
                     ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .font_semibold()
+                    .text_color(color)
+                    .child(regime_txt),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if work {
+                        format!("conf {conf_txt}")
+                    } else {
+                        format!("置信 {conf_txt}")
+                    }),
+            )
+    }
+
+    fn regime_color(&self, regime: signals::SignalRegime, cx: &App) -> gpui::Hsla {
+        if self.work_mode {
+            return cx.theme().muted_foreground;
+        }
+        use signals::SignalRegime::*;
+        match regime {
+            Strong => cx.theme().chart_1,
+            Constructive => cx.theme().chart_2,
+            Neutral => cx.theme().muted_foreground,
+            Weak => cx.theme().chart_4,
+            Defensive => cx.theme().danger,
+        }
+    }
+
+    /// 指标 Tab：MA / MACD / BOLL 三卡并排，上下文相关（分时隐藏无意义读数）。
+    fn render_indicators_detail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let work = self.work_mode;
+        let candles_match = self
+            .candles_code
+            .as_ref()
+            .is_some_and(|c| c == self.selected.as_ref());
+        let kline_ok = candles_match && !matches!(self.chart_kind, ChartKind::Intraday);
+
+        h_flex()
+            .w_full()
+            .gap_4()
+            .items_start()
+            .child(
+                v_flex()
+                    .gap_1()
+                    .min_w(px(140.))
+                    .flex_1()
+                    .child(section_title(if work { "Moving avg" } else { "均线" }, cx))
+                    .child(detail_row(
+                        if work { "L1" } else { "MA5" },
+                        &if kline_ok {
+                            self.ma
+                                .ma5
+                                .last()
+                                .and_then(|x| *x)
+                                .map(|v| self.format_value(v))
+                                .unwrap_or_else(|| "--".into())
+                        } else {
+                            "--".into()
+                        },
+                        cx,
+                    ))
+                    .child(detail_row(
+                        if work { "L2" } else { "MA10" },
+                        &if kline_ok {
+                            self.ma
+                                .ma10
+                                .last()
+                                .and_then(|x| *x)
+                                .map(|v| self.format_value(v))
+                                .unwrap_or_else(|| "--".into())
+                        } else {
+                            "--".into()
+                        },
+                        cx,
+                    ))
+                    .child(detail_row(
+                        if work { "L3" } else { "MA20" },
+                        &if kline_ok {
+                            self.ma
+                                .ma20
+                                .last()
+                                .and_then(|x| *x)
+                                .map(|v| self.format_value(v))
+                                .unwrap_or_else(|| "--".into())
+                        } else {
+                            "--".into()
+                        },
+                        cx,
+                    ))
+                    .child(detail_row(
+                        if work { "L4" } else { "MA60" },
+                        &if kline_ok {
+                            self.ma
+                                .ma60
+                                .last()
+                                .and_then(|x| *x)
+                                .map(|v| self.format_value(v))
+                                .unwrap_or_else(|| "--".into())
+                        } else {
+                            "--".into()
+                        },
+                        cx,
+                    ))
+                    .when(!kline_ok, |col| {
+                        col.child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if work {
+                                    "Switch to daily/minute K for MA."
+                                } else {
+                                    "切换到日 K / 分钟 K 查看均线。"
+                                }),
+                        )
+                    }),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .min_w(px(140.))
+                    .flex_1()
+                    .child(self.render_macd_detail_col(cx)),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .min_w(px(140.))
+                    .flex_1()
+                    .child(self.render_boll_detail_col(cx)),
             )
     }
 
@@ -5471,51 +5809,109 @@ impl StockApp {
     }
 
     fn render_signal_detail_col(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let work = self.work_mode;
         let signal = self.current_signal();
-        let mut col = v_flex().gap_1().min_w(px(240.)).child(
-            div()
-                .text_xs()
-                .font_semibold()
-                .text_color(cx.theme().muted_foreground)
-                .child("策略雷达 · 多因子"),
-        );
+
+        let mut root = h_flex().w_full().gap_4().items_start();
 
         if let Some(s) = signal {
             let fmt = |v: Option<f64>, suffix: &str| {
                 v.map(|n| format!("{n:.1}{suffix}"))
                     .unwrap_or_else(|| "—".into())
             };
-            let reasons = s.reasons.iter().take(4).copied().collect::<Vec<_>>().join(" · ");
-            col = col
-                .child(detail_row(
-                    "综合",
-                    &format!("{:.0}/100 · {}", s.score, s.regime.label()),
-                    cx,
-                ))
-                .child(detail_row("RSI14", &fmt(s.rsi14, ""), cx))
-                .child(detail_row("20日动量", &fmt(s.momentum_20_pct, "%"), cx))
-                .child(detail_row(
-                    "20日年化波动",
-                    &fmt(s.volatility_20_ann_pct, "%"),
-                    cx,
-                ))
-                .child(detail_row(
-                    "1Y最大回撤",
-                    &fmt(s.max_drawdown_1y_pct, "%"),
-                    cx,
-                ))
-                .child(detail_row("量能比", &fmt(s.volume_ratio_20, "x"), cx))
-                .child(detail_row("数据置信", &format!("{:.0}%", s.confidence), cx))
-                .child(detail_row("依据", &reasons, cx));
+            let regime = if work {
+                s.regime.service_state()
+            } else {
+                s.regime.label()
+            };
+            root = root
+                .child(self.render_score_badge(Some(&s), cx))
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .min_w(px(220.))
+                        .flex_1()
+                        .child(section_title(
+                            if work {
+                                "Factors"
+                            } else {
+                                "策略雷达 · 多因子"
+                            },
+                            cx,
+                        ))
+                        .child(detail_kv(
+                            if work { "Composite" } else { "综合" },
+                            &format!("{:.0}/100 · {regime}", s.score),
+                            cx,
+                        ))
+                        .child(detail_kv("RSI14", &fmt(s.rsi14, ""), cx))
+                        .child(detail_kv(
+                            if work { "Mom 20d" } else { "20日动量" },
+                            &fmt(s.momentum_20_pct, "%"),
+                            cx,
+                        ))
+                        .child(detail_kv(
+                            if work { "Vol 20d ann" } else { "20日年化波动" },
+                            &fmt(s.volatility_20_ann_pct, "%"),
+                            cx,
+                        ))
+                        .child(detail_kv(
+                            if work { "Max DD 1Y" } else { "1Y最大回撤" },
+                            &fmt(s.max_drawdown_1y_pct, "%"),
+                            cx,
+                        ))
+                        .child(detail_kv(
+                            if work { "Vol ratio" } else { "量能比" },
+                            &fmt(s.volume_ratio_20, "x"),
+                            cx,
+                        ))
+                        .child(detail_kv(
+                            if work { "Confidence" } else { "数据置信" },
+                            &format!("{:.0}%", s.confidence),
+                            cx,
+                        )),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .min_w(px(200.))
+                        .flex_1()
+                        .child(section_title(if work { "Rationale" } else { "依据" }, cx))
+                        .children(s.reasons.iter().map(|r| {
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded(cx.theme().radius)
+                                .bg(cx.theme().muted.opacity(0.45))
+                                .text_xs()
+                                .text_color(cx.theme().foreground)
+                                .child((*r).to_string())
+                        }))
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground.opacity(0.8))
+                                .child(if work {
+                                    "Explainable snapshot, not a trade instruction."
+                                } else {
+                                    "可解释技术快照，仅供学习研究，不构成投资建议。"
+                                }),
+                        ),
+                );
         } else {
-            col = col.child(
+            root = root.child(
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("至少需要 20 根有效日K数据。"),
+                    .child(if work {
+                        "Need ≥20 valid daily bars."
+                    } else {
+                        "至少需要 20 根有效日 K 数据。"
+                    }),
             );
         }
-        col
+        root
     }
 
     fn render_ai_detail_col(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5528,24 +5924,19 @@ impl StockApp {
         let has_signal = self.current_signal().is_some();
 
         let mut col = v_flex()
-            .gap_1()
-            .min_w(px(250.))
-            .max_w(px(380.))
+            .gap_2()
+            .w_full()
+            .max_w(px(720.))
             .child(
                 h_flex()
                     .items_center()
                     .justify_between()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_semibold()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(if work { "AI Brief" } else { "AI 点评" }),
-                    )
+                    .child(section_title(if work { "AI Brief" } else { "AI 点评" }, cx))
                     .child(
                         Button::new("ai-request-btn")
                             .xsmall()
-                            .ghost()
+                            .when(!busy && has_signal, |b| b.primary())
+                            .when(busy || !has_signal, |b| b.ghost())
                             .label(if busy {
                                 if work { "Working…" } else { "分析中…" }
                             } else if work {
@@ -5662,23 +6053,21 @@ impl StockApp {
     }
 
     fn render_treasure_detail_col(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let work = self.work_mode;
         let hit = self
             .treasure_hits
             .iter()
             .find(|h| h.code == self.selected.as_ref())
             .cloned();
 
-        let mut col = v_flex().gap_1().min_w(px(220.)).child(
-            div()
-                .text_xs()
-                .font_semibold()
-                .text_color(cx.theme().muted_foreground)
-                .child(if self.work_mode {
-                    "Scan · multi-window"
-                } else {
-                    "寻宝鼠 · 多窗口"
-                }),
-        );
+        let mut col = v_flex().gap_2().w_full().max_w(px(640.)).child(section_title(
+            if work {
+                "Scan · multi-window"
+            } else {
+                "寻宝鼠 · 多窗口"
+            },
+            cx,
+        ));
 
         if let Some(h) = hit {
             let tags = h
@@ -5693,9 +6082,28 @@ impl StockApp {
                 tags
             };
             col = col
-                .child(detail_row("分数", &format!("{:.1}", h.score), cx))
-                .child(detail_row(
-                    "位置",
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .flex_wrap()
+                        .child(metric_chip(
+                            if work { "Score" } else { "分数" },
+                            &format!("{:.1}", h.score),
+                            cx,
+                        ))
+                        .child(metric_chip(
+                            if work { "Bars" } else { "样本" },
+                            &format!("{}", h.bars),
+                            cx,
+                        ))
+                        .child(metric_chip(
+                            if work { "Src" } else { "来源" },
+                            &h.source,
+                            cx,
+                        )),
+                )
+                .child(detail_kv(
+                    if work { "Position" } else { "位置" },
                     &format!(
                         "1Y {} · 3Y {} · 全 {}",
                         fmt_pos(h.pos_1y),
@@ -5704,8 +6112,8 @@ impl StockApp {
                     ),
                     cx,
                 ))
-                .child(detail_row(
-                    "分位",
+                .child(detail_kv(
+                    if work { "Percentile" } else { "分位" },
                     &format!(
                         "1Y {} · 3Y {} · 全 {}",
                         fmt_pos(h.pctile_1y),
@@ -5714,24 +6122,44 @@ impl StockApp {
                     ),
                     cx,
                 ))
-                .child(detail_row(
-                    "回撤",
+                .child(detail_kv(
+                    if work { "Drawdown" } else { "回撤" },
                     &format!("1Y {} · 全 {}", fmt_dd(h.dd_1y), fmt_dd(h.dd_all)),
                     cx,
                 ))
-                .child(detail_row("标签", &tags_disp, cx))
-                .child(detail_row(
-                    "样本",
-                    &format!("{} 根 · {}", h.bars, h.source),
-                    cx,
-                ));
+                .child(detail_kv(if work { "Tags" } else { "标签" }, &tags_disp, cx))
+                .when(!work, |c| {
+                    c.child(
+                        div()
+                            .mt_1()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(
+                                "1Y/3Y/全样本评分；「上行中继回撤」= 一年低但多年仍高。仅供学习，非投资建议。",
+                            ),
+                    )
+                });
         } else {
-            col = col.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("当前标的不在最近寻宝结果中。可打开左侧「寻宝」扫描。"),
-            );
+            col = col
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if work {
+                            "Not in latest scan. Open the left Scan tab."
+                        } else {
+                            "当前标的不在最近寻宝结果中。可打开左侧「寻宝」扫描。"
+                        }),
+                )
+                .child(
+                    Button::new("open-treasure-tab")
+                        .xsmall()
+                        .ghost()
+                        .label(if work { "Open Scan" } else { "打开寻宝" })
+                        .on_click(cx.listener(|this, _, _w, cx| {
+                            this.set_left_tab(LeftTab::Treasure, cx);
+                        })),
+                );
         }
         col
     }
@@ -6089,12 +6517,17 @@ fn sys_gauge(
 }
 
 fn detail_row(label: &str, value: &str, cx: &App) -> impl IntoElement {
+    detail_kv(label, value, cx)
+}
+
+/// Label/value row with room for Chinese multi-char keys.
+fn detail_kv(label: &str, value: &str, cx: &App) -> impl IntoElement {
     h_flex()
         .gap_2()
         .items_start()
         .child(
             div()
-                .w(px(36.))
+                .w(px(88.))
                 .flex_shrink_0()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
@@ -6105,6 +6538,40 @@ fn detail_row(label: &str, value: &str, cx: &App) -> impl IntoElement {
                 .flex_1()
                 .min_w_0()
                 .text_xs()
+                .text_color(cx.theme().foreground)
+                .child(value.to_string()),
+        )
+}
+
+fn section_title(text: &str, cx: &App) -> impl IntoElement {
+    div()
+        .text_xs()
+        .font_semibold()
+        .text_color(cx.theme().muted_foreground)
+        .child(text.to_string())
+}
+
+/// Compact metric pill used on the overview / treasure dashboards.
+fn metric_chip(label: &str, value: &str, cx: &App) -> impl IntoElement {
+    v_flex()
+        .gap_0p5()
+        .px_2()
+        .py_1()
+        .min_w(px(72.))
+        .rounded(cx.theme().radius)
+        .bg(cx.theme().background)
+        .border_1()
+        .border_color(cx.theme().border)
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .text_sm()
+                .font_semibold()
                 .text_color(cx.theme().foreground)
                 .child(value.to_string()),
         )
