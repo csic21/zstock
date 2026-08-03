@@ -161,6 +161,12 @@ pub struct AppConfig {
     /// Preferred pin when focusing a symbol from the menu (still all codes are displayed).
     #[serde(default)]
     pub status_bar_active: String,
+    /// Bottom analysis dock tab: `overview` | `strategy` | `ai` | `portfolio` | `treasure` | `indicators`.
+    #[serde(default = "default_detail_tab")]
+    pub detail_tab: String,
+    /// Left sidebar tab: `watchlist` | `portfolio` | `treasure`.
+    #[serde(default = "default_left_tab")]
+    pub left_tab: String,
 }
 
 fn default_true() -> bool {
@@ -181,6 +187,14 @@ fn default_treasure_pool() -> String {
 
 fn default_treasure_fin() -> String {
     "off".into()
+}
+
+fn default_detail_tab() -> String {
+    "overview".into()
+}
+
+fn default_left_tab() -> String {
+    "watchlist".into()
 }
 
 /// Clamp user-facing quote interval.
@@ -219,6 +233,8 @@ impl Default for AppConfig {
             status_bar_enabled: false,
             status_bar_codes: Vec::new(),
             status_bar_active: String::new(),
+            detail_tab: default_detail_tab(),
+            left_tab: default_left_tab(),
         }
     }
 }

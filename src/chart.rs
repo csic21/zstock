@@ -30,6 +30,9 @@ pub struct ChartPaintData {
     pub lines: Vec<TrendLine>,
     /// Line palette indexed by `TrendLine::color_ix`.
     pub line_colors: Vec<Hsla>,
+    /// Open position average cost (horizontal dashed line on the price pane).
+    pub cost_line: Option<f64>,
+    pub cost_line_color: Hsla,
     /// Intraday (分时) overlay; when present the chart paints a time-share layout
     /// (price line + average line + prev-close baseline + per-minute volume).
     pub minute: Option<MinutePaintData>,
@@ -193,6 +196,12 @@ pub fn chart_layout(data: &ChartPaintData, bounds: Bounds<Pixels>) -> ChartLayou
             y_max = y_max.max(*v);
         }
     }
+    if let Some(cost) = data.cost_line {
+        if cost.is_finite() && cost > 0.0 {
+            y_min = y_min.min(cost);
+            y_max = y_max.max(cost);
+        }
+    }
     if (y_max - y_min).abs() < 1e-6 {
         y_max += 1.0;
         y_min -= 1.0;
@@ -341,6 +350,29 @@ pub fn paint_chart(bounds: Bounds<Pixels>, data: &ChartPaintData, window: &mut W
 
     // User-drawn trend / price lines
     paint_trend_lines(data, origin, &x_center, &y_of, window);
+
+    // Portfolio average cost (dashed horizontal)
+    if let Some(cost) = data.cost_line {
+        if cost.is_finite() && cost > 0.0 {
+            let y = y_of(cost);
+            paint_dashed_hline(
+                origin,
+                PAD_L,
+                PAD_L + plot_w,
+                y,
+                data.cost_line_color,
+                window,
+            );
+            // Right gutter marker
+            window.paint_quad(fill(
+                Bounds {
+                    origin: point(origin.x + px(PAD_L + plot_w + 5.0), origin.y + px(y - 2.0)),
+                    size: size(px(5.), px(5.)),
+                },
+                data.cost_line_color,
+            ));
+        }
+    }
 
     // Volume pane
     if show_vol {
