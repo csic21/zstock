@@ -431,6 +431,325 @@ pub fn local_commentary(snap: &AiSnapshot) -> String {
     lines.join("\n")
 }
 
+// ---- 持仓买卖建议 ----------------------------------------------------------
+
+/// 本地/LLM 给出的持仓动作倾向（非交易指令）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PositionAction {
+    /// 尚无持仓，技术面可观察建仓。
+    OpenWatch,
+    /// 可考虑分批加仓。
+    Add,
+    /// 继续持有，观望为主。
+    Hold,
+    /// 可考虑分批减仓。
+    Reduce,
+    /// 风险偏高，观察减仓/清仓。
+    ExitWatch,
+}
+
+impl PositionAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenWatch => "可观察建仓",
+            Self::Add => "可考虑加仓",
+            Self::Hold => "持有观望",
+            Self::Reduce => "可考虑减仓",
+            Self::ExitWatch => "观察减仓/清仓",
+        }
+    }
+}
+
+/// 持仓感知的分析快照（技术面 + 成本/盈亏）。
+#[derive(Debug, Clone, Serialize)]
+pub struct PositionAdviceSnap {
+    pub tech: AiSnapshot,
+    /// 当前持股（0 = 无持仓）。
+    pub shares: f64,
+    pub avg_cost: f64,
+    pub last: f64,
+    pub market_value: f64,
+    pub unrealized_pnl: f64,
+    pub unrealized_pnl_pct: f64,
+    pub realized_pnl: f64,
+    /// 现价相对成本的偏离（%）。
+    pub price_vs_cost_pct: f64,
+    /// 本地规则给出的动作倾向。
+    pub action: PositionAction,
+    /// 规则依据短句。
+    pub action_reasons: Vec<String>,
+}
+
+/// 结合技术快照与持仓成本，生成买卖观察建议。
+///
+/// `shares == 0` 时按「空仓观察」处理。
+pub fn build_position_advice(
+    candles: &[Candle],
+    code: &str,
+    name: &str,
+    shares: f64,
+    avg_cost: f64,
+    last: f64,
+    realized_pnl: f64,
+) -> Option<PositionAdviceSnap> {
+    let tech = build_snapshot(candles, code, name)?;
+    let last = if last.is_finite() && last > 0.0 {
+        last
+    } else {
+        tech.close
+    };
+    let shares = if shares.is_finite() && shares > 0.0 {
+        shares
+    } else {
+        0.0
+    };
+    let avg_cost = if avg_cost.is_finite() && avg_cost > 0.0 {
+        avg_cost
+    } else {
+        0.0
+    };
+    let market_value = shares * last;
+    let total_cost = shares * avg_cost;
+    let unrealized_pnl = market_value - total_cost;
+    let unrealized_pnl_pct = if total_cost > 1e-9 {
+        unrealized_pnl / total_cost * 100.0
+    } else {
+        0.0
+    };
+    let price_vs_cost_pct = if avg_cost > 1e-9 {
+        (last / avg_cost - 1.0) * 100.0
+    } else {
+        0.0
+    };
+
+    let (action, action_reasons) = decide_position_action(
+        shares > 1e-9,
+        &tech,
+        unrealized_pnl_pct,
+        price_vs_cost_pct,
+        last,
+        avg_cost,
+    );
+
+    Some(PositionAdviceSnap {
+        tech,
+        shares,
+        avg_cost,
+        last,
+        market_value,
+        unrealized_pnl,
+        unrealized_pnl_pct,
+        realized_pnl,
+        price_vs_cost_pct,
+        action,
+        action_reasons,
+    })
+}
+
+fn decide_position_action(
+    has_pos: bool,
+    tech: &AiSnapshot,
+    unrealized_pct: f64,
+    price_vs_cost_pct: f64,
+    last: f64,
+    avg_cost: f64,
+) -> (PositionAction, Vec<String>) {
+    let mut reasons = Vec::new();
+    let regime = tech.regime.as_str();
+    let score = tech.score;
+    let rsi = tech.rsi14;
+    let range_pos = tech.range_position_60_pct;
+
+    // 相对参考价位
+    let near_buy_band = tech.levels.as_ref().is_some_and(|lv| {
+        last <= lv.buy_high * 1.01 && last >= lv.buy_low * 0.98
+    });
+    let near_sell_band = tech.levels.as_ref().is_some_and(|lv| last >= lv.sell_low * 0.99);
+    let below_cost = has_pos && avg_cost > 0.0 && last < avg_cost;
+
+    if !has_pos {
+        if score >= 62.0 && matches!(regime, "强势" | "偏强") && near_buy_band {
+            reasons.push("技术面偏强且现价靠近参考建仓带".into());
+            return (PositionAction::OpenWatch, reasons);
+        }
+        if score >= 55.0 && near_buy_band && rsi.is_none_or(|r| r < 70.0) {
+            reasons.push("现价在参考建仓带附近，可观察分批".into());
+            return (PositionAction::OpenWatch, reasons);
+        }
+        if score < 40.0 || matches!(regime, "防守" | "偏弱") {
+            reasons.push("技术面偏弱，空仓宜继续观察".into());
+            return (PositionAction::Hold, reasons);
+        }
+        reasons.push("无持仓且信号不鲜明，继续观察".into());
+        return (PositionAction::Hold, reasons);
+    }
+
+    // —— 有持仓 ——
+    if unrealized_pct <= -12.0 && (score < 45.0 || matches!(regime, "防守" | "偏弱")) {
+        reasons.push(format!("浮亏 {unrealized_pct:.1}% 且技术面偏弱"));
+        return (PositionAction::ExitWatch, reasons);
+    }
+    if near_sell_band && (unrealized_pct >= 8.0 || range_pos.is_some_and(|p| p >= 85.0)) {
+        reasons.push("现价靠近参考减仓带，且已有浮盈/处于区间高位".into());
+        return (PositionAction::Reduce, reasons);
+    }
+    if unrealized_pct >= 15.0 && (rsi.is_some_and(|r| r >= 70.0) || tech.near_20d_high) {
+        reasons.push(format!("浮盈 {unrealized_pct:.1}% 且短线偏热"));
+        return (PositionAction::Reduce, reasons);
+    }
+    if below_cost
+        && near_buy_band
+        && score >= 55.0
+        && !matches!(regime, "防守")
+        && unrealized_pct > -15.0
+    {
+        reasons.push(format!(
+            "现价低于成本 {price_vs_cost_pct:.1}% 且靠近建仓带，可观察补仓"
+        ));
+        return (PositionAction::Add, reasons);
+    }
+    if score >= 65.0
+        && matches!(regime, "强势" | "偏强")
+        && near_buy_band
+        && unrealized_pct > -5.0
+        && unrealized_pct < 12.0
+    {
+        reasons.push("趋势偏强且仍在建仓带附近，可观察加仓".into());
+        return (PositionAction::Add, reasons);
+    }
+    if score < 38.0 || matches!(regime, "防守") {
+        reasons.push("技术面转弱，持仓宜以防守/减仓观察".into());
+        return (PositionAction::ExitWatch, reasons);
+    }
+    if unrealized_pct <= -8.0 {
+        reasons.push(format!("浮亏 {unrealized_pct:.1}%，优先观察而非盲目加仓"));
+        return (PositionAction::Hold, reasons);
+    }
+    reasons.push("盈亏与技术面中性，以持有观望为主".into());
+    (PositionAction::Hold, reasons)
+}
+
+/// 本地规则生成的持仓买卖建议文案。
+pub fn local_position_advice(snap: &PositionAdviceSnap) -> String {
+    let mut lines: Vec<String> = Vec::with_capacity(12);
+    let held = snap.shares > 1e-9;
+
+    lines.push(format!(
+        "【建议倾向】{} · 策略雷达 {:.0} 分（{}）",
+        snap.action.label(),
+        snap.tech.score,
+        snap.tech.regime
+    ));
+
+    if held {
+        lines.push(format!(
+            "【持仓】{} 股 · 成本 {} 元 · 现价 {} 元 · 浮盈亏 {} ({:+.2}%)",
+            crate::data::portfolio::format_shares(snap.shares),
+            crate::model::format_price(snap.avg_cost),
+            crate::model::format_price(snap.last),
+            crate::data::portfolio::format_money(snap.unrealized_pnl),
+            snap.unrealized_pnl_pct
+        ));
+        if snap.realized_pnl.abs() > 1e-6 {
+            lines.push(format!(
+                "【已实现盈亏】{} 元",
+                crate::data::portfolio::format_money(snap.realized_pnl)
+            ));
+        }
+    } else {
+        lines.push(format!(
+            "【仓位】当前无持仓 · 现价 {} 元",
+            crate::model::format_price(snap.last)
+        ));
+    }
+
+    if !snap.action_reasons.is_empty() {
+        lines.push(format!("【依据】{}。", snap.action_reasons.join("；")));
+    }
+
+    // 复用部分技术点评
+    lines.push(format!(
+        "【趋势】{}。{}",
+        snap.tech.ma_alignment.label(),
+        match snap.tech.ma20_slope_5 {
+            Some(s) if s >= 0.3 => "MA20 近 5 日上行。",
+            Some(s) if s <= -0.3 => "MA20 近 5 日下行。",
+            Some(_) => "MA20 近 5 日走平。",
+            None => "中期均线数据不足。",
+        }
+    ));
+
+    if let Some(rsi) = snap.tech.rsi14 {
+        lines.push(format!(
+            "【动量】RSI14={rsi:.1}{}",
+            snap.tech
+                .momentum_20_pct
+                .map(|m| format!("，20日动量 {m:+.1}%"))
+                .unwrap_or_default()
+        ));
+    }
+
+    if let Some(lv) = &snap.tech.levels {
+        lines.push(format!(
+            "【参考建仓带】{} 元 · 【参考减仓带】{} 元",
+            lv.buy_band_text(),
+            lv.sell_band_text()
+        ));
+        if held && snap.avg_cost > 0.0 {
+            let vs_buy = if snap.avg_cost <= lv.buy_high {
+                "成本落在/低于建仓带上沿附近"
+            } else if snap.avg_cost >= lv.sell_low {
+                "成本偏高、靠近减仓带"
+            } else {
+                "成本介于建仓与减仓带之间"
+            };
+            lines.push(format!("【成本位置】{vs_buy}。"));
+        }
+    }
+
+    match snap.action {
+        PositionAction::OpenWatch => {
+            lines.push("【操作观察】若计划建仓，可优先参考建仓带分批，不宜追高一次性重仓。".into());
+        }
+        PositionAction::Add => {
+            lines.push("【操作观察】加仓宜小步分批，并设定个人可接受的最大回撤。".into());
+        }
+        PositionAction::Hold => {
+            lines.push("【操作观察】维持现有仓位，等待更清晰的价位或信号。".into());
+        }
+        PositionAction::Reduce => {
+            lines.push("【操作观察】可考虑分批兑现部分利润，保留底仓跟踪趋势。".into());
+        }
+        PositionAction::ExitWatch => {
+            lines.push("【操作观察】风险偏好偏低时可逐步降低仓位，避免情绪化清仓。".into());
+        }
+    }
+
+    lines.push("以上为本地规则生成 · 仅供学习研究，不构成任何投资建议。".into());
+    lines.join("\n")
+}
+
+/// LLM 持仓买卖建议（仅上传压缩快照）。
+pub fn llm_position_advice(cfg: &AiConfig, snap: &PositionAdviceSnap) -> Result<String> {
+    let body = serde_json::to_string(snap).context("序列化持仓建议快照失败")?;
+    let user_prompt = format!(
+        "请基于以下「持仓 + 技术面」量化快照给出买卖观察建议：\n```json\n{body}\n```\n\
+         要求：1) 明确回应当前建议倾向（可观察建仓/加仓/持有/减仓/观察清仓）及理由；\
+         2) 结合成本价、浮盈亏%、现价与 levels 参考带，用「约 X–Y 元」写出观察价；\
+         3) 区分「有持仓」与「空仓」场景；4) 不超过 480 字；\
+         5) 不得编造快照外数据；结尾必须含“不构成投资建议”。"
+    );
+    llm_complete(cfg, POSITION_SYSTEM_PROMPT, &user_prompt)
+}
+
+const POSITION_SYSTEM_PROMPT: &str = "你是一名严谨的 A 股持仓助手。\
+你只会获得本地计算的技术快照 + 用户持仓成本/股数/浮盈亏（无原始 K 线、无基本面新闻）。\
+请：1) 在快照 action 倾向基础上做可解释的中文建议，可微调但需说明依据；\
+2) 给出观察性的加仓/减仓价位带（优先用 levels），强调非交易指令；\
+3) 对深浮亏避免鼓吹死扛或报复性加仓；对大浮盈提醒兑现纪律；\
+4) 全文不超过 480 字；结尾必须“不构成投资建议”；不得编造数值。";
+
 fn regime_sentence(regime: &str) -> &'static str {
     match regime {
         "强势" => "当前技术面处于强势区间。",
@@ -1166,6 +1485,28 @@ mod tests {
         assert!(snap.levels.is_some(), "levels expected on long series");
         assert!(text.contains("【参考建仓带】"));
         assert!(text.contains("【参考减仓带】"));
+    }
+
+    #[test]
+    fn position_advice_includes_cost_and_action() {
+        let candles = series(10.0, 0.006, 120);
+        let last = candles.last().unwrap().close;
+        let snap = build_position_advice(
+            &candles,
+            "600519",
+            "测试",
+            100.0,
+            last * 0.9, // 成本低于现价 → 有浮盈
+            last,
+            0.0,
+        )
+        .unwrap();
+        assert!(snap.shares > 0.0);
+        assert!(snap.unrealized_pnl > 0.0);
+        let text = local_position_advice(&snap);
+        assert!(text.contains("【建议倾向】"));
+        assert!(text.contains("【持仓】"));
+        assert!(text.contains("不构成任何投资建议"));
     }
 
     #[test]

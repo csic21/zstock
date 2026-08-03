@@ -27,6 +27,9 @@ use crate::chart::{
 };
 use crate::data::ai::{self, AiCliProvider, AiConfig, AiKind, AiTransport};
 use crate::data::levels;
+use crate::data::portfolio::{
+    self, format_money, format_shares, Portfolio, PortfolioSummary, TradeSide,
+};
 use crate::data::scout::{self, ScoutPick, ScoutVerdict, SCOUT_CANDIDATE_N};
 use crate::data::treasure::{self, fmt_dd, fmt_pos, TreasureHit, TREASURE_KLINE_LIMIT};
 use crate::data::universe::{self, FinFilter, TreasurePool, TREASURE_SCAN_CAP, TREASURE_TOP_N};
@@ -162,11 +165,12 @@ impl ChartKind {
 
 }
 
-/// 左侧栏：自选 vs 寻宝鼠。
+/// 左侧栏：自选 / 持仓 / 寻宝鼠。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum LeftTab {
     #[default]
     Watchlist,
+    Portfolio,
     Treasure,
 }
 
@@ -220,18 +224,21 @@ enum DetailTab {
     Strategy = 1,
     /// AI 点评
     Ai = 2,
+    /// 持仓与买卖建议
+    Portfolio = 3,
     /// 寻宝多窗口位置
-    Treasure = 3,
+    Treasure = 4,
     /// MA / MACD / BOLL 指标读数
-    Indicators = 4,
+    Indicators = 5,
 }
 
 impl DetailTab {
-    fn all() -> [Self; 5] {
+    fn all() -> [Self; 6] {
         [
             Self::Overview,
             Self::Strategy,
             Self::Ai,
+            Self::Portfolio,
             Self::Treasure,
             Self::Indicators,
         ]
@@ -245,6 +252,8 @@ impl DetailTab {
             (Self::Strategy, false) => "策略",
             (Self::Ai, true) => "AI",
             (Self::Ai, false) => "AI",
+            (Self::Portfolio, true) => "Book",
+            (Self::Portfolio, false) => "持仓",
             (Self::Treasure, true) => "Scan",
             (Self::Treasure, false) => "寻宝",
             (Self::Indicators, true) => "Tech",
@@ -429,6 +438,21 @@ pub struct StockApp {
     ai_api_key_input: Entity<InputState>,
     /// Optional override path/name for the local AI CLI binary.
     ai_cli_bin_input: Entity<InputState>,
+    /// 本地持仓（交易流水 + 可选现金）。
+    portfolio: Portfolio,
+    /// 打开中的买卖表单方向；`None` = 关闭。
+    trade_form_side: Option<TradeSide>,
+    trade_shares_input: Entity<InputState>,
+    trade_price_input: Entity<InputState>,
+    trade_fee_input: Entity<InputState>,
+    trade_note_input: Entity<InputState>,
+    /// 现金初始化/调整输入。
+    portfolio_cash_input: Entity<InputState>,
+    /// 持仓 AI 建议面板状态。
+    portfolio_ai_panel: AiPanelState,
+    portfolio_ai_key: Option<String>,
+    portfolio_ai_cache: HashMap<String, AiCacheEntry>,
+    portfolio_ai_gen: u64,
     /// macOS menu bar: show live quotes for pinned watchlist codes.
     status_bar_enabled: bool,
     /// Codes pinned to the status bar menu (subset of watchlist, max 5).
@@ -496,6 +520,21 @@ impl StockApp {
         });
         ai_cli_bin_input.update(cx, |state, cx| {
             state.set_value(ai_cfg.cli_bin.clone(), window, cx);
+        });
+
+        let portfolio = storage::load_portfolio();
+        let trade_shares_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("股数，如 100"));
+        let trade_price_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("成交价"));
+        let trade_fee_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("手续费，可 0"));
+        let trade_note_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("备注（可选）"));
+        let portfolio_cash_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("现金余额"));
+        portfolio_cash_input.update(cx, |state, cx| {
+            state.set_value(format!("{:.2}", portfolio.cash), window, cx);
         });
 
         let _subscriptions = vec![
@@ -664,11 +703,37 @@ impl StockApp {
             ai_model_input,
             ai_api_key_input,
             ai_cli_bin_input,
+            portfolio,
+            trade_form_side: None,
+            trade_shares_input,
+            trade_price_input,
+            trade_fee_input,
+            trade_note_input,
+            portfolio_cash_input,
+            portfolio_ai_panel: AiPanelState::Idle,
+            portfolio_ai_key: None,
+            portfolio_ai_cache: HashMap::new(),
+            portfolio_ai_gen: 0,
             status_bar_enabled,
             status_bar_codes,
             status_bar_active,
             _subscriptions,
         };
+
+        // 历史持仓代码自动并入自选，便于行情轮询。
+        let before = app.symbols.len();
+        let open_codes: Vec<(String, String)> = app
+            .portfolio
+            .positions()
+            .into_iter()
+            .map(|p| (p.code, p.name))
+            .collect();
+        for (code, name) in open_codes {
+            app.ensure_in_watchlist(&code, &name, 0.0);
+        }
+        if app.symbols.len() != before {
+            app.persist();
+        }
 
         window.set_window_title(app.window_title());
         app.bootstrap(cx);
@@ -778,7 +843,14 @@ impl StockApp {
             loop {
                 Timer::after(delay).await;
                 let codes = match this.read_with(cx, |app, _| {
-                    app.symbols.iter().map(|s| s.code.clone()).collect::<Vec<_>>()
+                    let mut codes: Vec<String> =
+                        app.symbols.iter().map(|s| s.code.clone()).collect();
+                    for c in app.portfolio.open_codes() {
+                        if !codes.iter().any(|x| x == &c) {
+                            codes.push(c);
+                        }
+                    }
+                    codes
                 }) {
                     Ok(c) => c,
                     Err(_) => break,
@@ -1455,9 +1527,61 @@ impl StockApp {
         let _ = storage::save_config(&cfg);
     }
 
+    fn persist_portfolio(&self) {
+        let _ = storage::save_portfolio(&self.portfolio);
+    }
+
+    /// 组合汇总：现价优先取自选行情，否则用成本占位。
+    fn portfolio_summary(&self) -> PortfolioSummary {
+        self.portfolio.summarize_with(|code| {
+            if let Some(sym) = self.symbols.iter().find(|s| s.code == code) {
+                (
+                    sym.last,
+                    sym.change_pct,
+                    sym.name.to_string(),
+                )
+            } else {
+                (0.0, 0.0, String::new())
+            }
+        })
+    }
+
+    /// 确保代码在自选中（持仓需要行情）。
+    fn ensure_in_watchlist(&mut self, code: &str, name: &str, last: f64) {
+        if self.symbols.iter().any(|s| s.code == code) {
+            if let Some(sym) = self.symbols.iter_mut().find(|s| s.code == code) {
+                if is_real_name(name, code) && !is_real_name(sym.name.as_ref(), code) {
+                    sym.name = shared(name.to_string());
+                }
+                if last > 0.0 && sym.last <= 0.0 {
+                    sym.last = last;
+                }
+            }
+            return;
+        }
+        self.symbols.push(Symbol {
+            code: code.to_string(),
+            name: shared(if is_real_name(name, code) {
+                name.to_string()
+            } else {
+                code.to_string()
+            }),
+            last,
+            change_pct: 0.0,
+            volume: 0,
+            board: board_for_code(code),
+        });
+        self.filtered_local = (0..self.symbols.len()).collect();
+    }
+
     fn dismiss_overlay(&mut self, cx: &mut Context<Self>) {
         if self.palette_open {
             self.palette_open = false;
+            cx.notify();
+            return;
+        }
+        if self.trade_form_side.is_some() {
+            self.trade_form_side = None;
             cx.notify();
             return;
         }
@@ -1476,6 +1600,397 @@ impl StockApp {
             });
             cx.notify();
         }
+    }
+
+    /// 打开买入/卖出表单，默认填充现价与（卖出时）全部可卖股数。
+    fn open_trade_form(&mut self, side: TradeSide, window: &mut Window, cx: &mut Context<Self>) {
+        let code = self.selected.to_string();
+        let last = self
+            .symbols
+            .iter()
+            .find(|s| s.code == code)
+            .map(|s| s.last)
+            .filter(|p| *p > 0.0)
+            .or_else(|| {
+                self.candles
+                    .last()
+                    .filter(|_| {
+                        self.candles_code
+                            .as_ref()
+                            .is_some_and(|c| c == code.as_str())
+                    })
+                    .map(|c| c.close)
+            })
+            .unwrap_or(0.0);
+        let held = self
+            .portfolio
+            .position_of(&code)
+            .map(|p| p.shares)
+            .unwrap_or(0.0);
+
+        let price_s = if last > 0.0 {
+            format_price(last)
+        } else {
+            String::new()
+        };
+        let shares_s = match side {
+            TradeSide::Sell if held > 0.0 => format_shares(held),
+            _ => String::new(),
+        };
+
+        self.trade_price_input.update(cx, |s, cx| {
+            s.set_value(price_s, window, cx);
+        });
+        self.trade_shares_input.update(cx, |s, cx| {
+            s.set_value(shares_s, window, cx);
+        });
+        self.trade_fee_input.update(cx, |s, cx| {
+            s.set_value("0", window, cx);
+        });
+        self.trade_note_input.update(cx, |s, cx| {
+            s.set_value("", window, cx);
+        });
+        self.trade_form_side = Some(side);
+        self.left_tab = LeftTab::Portfolio;
+        cx.notify();
+    }
+
+    fn submit_trade(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(side) = self.trade_form_side else {
+            return;
+        };
+        let code = self.selected.to_string();
+        let name = self
+            .symbols
+            .iter()
+            .find(|s| s.code == code)
+            .map(|s| s.name.to_string())
+            .unwrap_or_else(|| code.clone());
+
+        let shares = parse_f64(&self.trade_shares_input.read(cx).value());
+        let price = parse_f64(&self.trade_price_input.read(cx).value());
+        let fee = parse_f64(&self.trade_fee_input.read(cx).value()).unwrap_or(0.0);
+        let note = self.trade_note_input.read(cx).value().to_string();
+
+        let (Some(shares), Some(price)) = (shares, price) else {
+            self.status = shared(if self.work_mode {
+                "Invalid shares/price"
+            } else {
+                "请填写有效的股数与价格"
+            });
+            cx.notify();
+            return;
+        };
+
+        match self.portfolio.record_trade(
+            &code,
+            &name,
+            side,
+            shares,
+            price,
+            fee,
+            &note,
+            None,
+        ) {
+            Ok(_) => {
+                self.ensure_in_watchlist(&code, &name, price);
+                self.persist_portfolio();
+                self.persist();
+                self.trade_form_side = None;
+                self.status = shared(if self.work_mode {
+                    format!(
+                        "{} {} × {} @ {}",
+                        side.label_work(),
+                        code,
+                        format_shares(shares),
+                        format_price(price)
+                    )
+                } else {
+                    format!(
+                        "{} {} × {} 股 @ {} 元",
+                        side.label(),
+                        code,
+                        format_shares(shares),
+                        format_price(price)
+                    )
+                });
+                self.detail_tab = DetailTab::Portfolio;
+                // 清空表单
+                self.trade_shares_input.update(cx, |s, cx| {
+                    s.set_value("", window, cx);
+                });
+                self.trade_note_input.update(cx, |s, cx| {
+                    s.set_value("", window, cx);
+                });
+            }
+            Err(e) => {
+                self.status = shared(e.to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    fn close_selected_position(&mut self, cx: &mut Context<Self>) {
+        let code = self.selected.to_string();
+        let price = self
+            .symbols
+            .iter()
+            .find(|s| s.code == code)
+            .map(|s| s.last)
+            .filter(|p| *p > 0.0)
+            .or_else(|| {
+                self.candles.last().map(|c| c.close).filter(|p| *p > 0.0)
+            })
+            .unwrap_or(0.0);
+        if price <= 0.0 {
+            self.status = shared(if self.work_mode {
+                "No price for close"
+            } else {
+                "无法清仓：缺少现价"
+            });
+            cx.notify();
+            return;
+        }
+        match self.portfolio.close_position(&code, price, 0.0, "清仓") {
+            Ok(Some(_)) => {
+                self.persist_portfolio();
+                self.status = shared(if self.work_mode {
+                    format!("Closed {code} @ {}", format_price(price))
+                } else {
+                    format!("已清仓 {code} @ {} 元", format_price(price))
+                });
+            }
+            Ok(None) => {
+                self.status = shared(if self.work_mode {
+                    "No position"
+                } else {
+                    "当前无持仓"
+                });
+            }
+            Err(e) => {
+                self.status = shared(e.to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    fn undo_last_trade_for_selected(&mut self, cx: &mut Context<Self>) {
+        let code = self.selected.to_string();
+        let id = self
+            .portfolio
+            .trades
+            .iter()
+            .rev()
+            .find(|t| t.code == code)
+            .map(|t| t.id.clone());
+        let Some(id) = id else {
+            self.status = shared(if self.work_mode {
+                "No trade to undo"
+            } else {
+                "没有可撤销的成交"
+            });
+            cx.notify();
+            return;
+        };
+        if self.portfolio.remove_trade(&id) {
+            self.persist_portfolio();
+            self.status = shared(if self.work_mode {
+                "Trade undone"
+            } else {
+                "已撤销最近一笔成交"
+            });
+        } else {
+            self.status = shared(if self.work_mode {
+                "Cannot undo (would break history)"
+            } else {
+                "无法撤销：会破坏后续卖出流水"
+            });
+        }
+        cx.notify();
+    }
+
+    fn apply_portfolio_cash(&mut self, cx: &mut Context<Self>) {
+        let raw = self.portfolio_cash_input.read(cx).value();
+        let Some(v) = parse_f64(&raw) else {
+            self.status = shared(if self.work_mode {
+                "Invalid cash"
+            } else {
+                "现金金额无效"
+            });
+            cx.notify();
+            return;
+        };
+        if v < 0.0 {
+            self.status = shared(if self.work_mode {
+                "Cash cannot be negative"
+            } else {
+                "现金不能为负"
+            });
+            cx.notify();
+            return;
+        }
+        self.portfolio.cash = v;
+        self.persist_portfolio();
+        self.status = shared(if self.work_mode {
+            format!("Cash = {v:.2}")
+        } else {
+            format!("现金已设为 {v:.2} 元")
+        });
+        cx.notify();
+    }
+
+    fn toggle_track_cash(&mut self, cx: &mut Context<Self>) {
+        self.portfolio.track_cash = !self.portfolio.track_cash;
+        self.persist_portfolio();
+        cx.notify();
+    }
+
+    fn request_portfolio_ai(&mut self, cx: &mut Context<Self>) {
+        let code = self.selected.to_string();
+        let matched = self
+            .candles_code
+            .as_ref()
+            .is_some_and(|c| c == code.as_str());
+        if !matched || self.candles.is_empty() {
+            self.portfolio_ai_panel = AiPanelState::Ready {
+                text: shared(if self.work_mode {
+                    "Load daily chart first."
+                } else {
+                    "请先加载该标的日 K 数据。"
+                }),
+                source: AiSource::Local,
+                note: None,
+            };
+            cx.notify();
+            return;
+        }
+        let name = self
+            .symbols
+            .iter()
+            .find(|s| s.code == code)
+            .map(|s| s.name.to_string())
+            .unwrap_or_default();
+        let pos = self.portfolio.position_state_of(&code);
+        let (shares, avg_cost, realized) = pos
+            .map(|p| (p.shares, p.avg_cost, p.realized_pnl))
+            .unwrap_or((0.0, 0.0, 0.0));
+        let last = self
+            .symbols
+            .iter()
+            .find(|s| s.code == code)
+            .map(|s| s.last)
+            .filter(|p| *p > 0.0)
+            .unwrap_or_else(|| self.candles.last().map(|c| c.close).unwrap_or(0.0));
+        let date = self.candles.last().map(|c| c.date.to_string()).unwrap_or_default();
+        let cache_key = format!(
+            "pos:{}@{}:{:.4}:{:.4}",
+            code,
+            date,
+            shares,
+            avg_cost
+        );
+
+        if let Some(hit) = self.portfolio_ai_cache.get(&cache_key).cloned() {
+            self.portfolio_ai_panel = AiPanelState::Ready {
+                text: hit.text.into(),
+                source: hit.source,
+                note: None,
+            };
+            self.portfolio_ai_key = Some(cache_key);
+            cx.notify();
+            return;
+        }
+
+        let Some(snap) = ai::build_position_advice(
+            &self.candles,
+            &code,
+            &name,
+            shares,
+            avg_cost,
+            last,
+            realized,
+        ) else {
+            self.portfolio_ai_panel = AiPanelState::Ready {
+                text: shared("数据不足：需要至少 20 根有效日 K。"),
+                source: AiSource::Local,
+                note: None,
+            };
+            self.portfolio_ai_key = Some(cache_key);
+            cx.notify();
+            return;
+        };
+
+        let local = ai::local_position_advice(&snap);
+        self.portfolio_ai_cache.insert(
+            cache_key.clone(),
+            AiCacheEntry {
+                text: local.clone(),
+                source: AiSource::Local,
+            },
+        );
+        self.portfolio_ai_key = Some(cache_key.clone());
+
+        if !self.ai_config.enabled {
+            self.portfolio_ai_panel = AiPanelState::Ready {
+                text: local.into(),
+                source: AiSource::Local,
+                note: None,
+            };
+            cx.notify();
+            return;
+        }
+
+        self.portfolio_ai_panel = AiPanelState::Loading {
+            text: local.clone().into(),
+        };
+        self.portfolio_ai_gen = self.portfolio_ai_gen.wrapping_add(1);
+        let req_id = self.portfolio_ai_gen;
+        let cfg = self.ai_config.clone();
+        let source_label = cfg.source_label();
+        cx.spawn(async move |this, cx| {
+            let res = smol::unblock(move || ai::llm_position_advice(&cfg, &snap)).await;
+            let _ = this.update(cx, |app, cx| {
+                if app.portfolio_ai_gen != req_id {
+                    return;
+                }
+                match res {
+                    Ok(text) if !text.trim().is_empty() => {
+                        let source = AiSource::Llm {
+                            label: source_label.clone(),
+                        };
+                        app.portfolio_ai_cache.insert(
+                            cache_key.clone(),
+                            AiCacheEntry {
+                                text: text.clone(),
+                                source: source.clone(),
+                            },
+                        );
+                        app.portfolio_ai_panel = AiPanelState::Ready {
+                            text: text.into(),
+                            source,
+                            note: None,
+                        };
+                    }
+                    Ok(_) => {
+                        app.portfolio_ai_panel = AiPanelState::Ready {
+                            text: local.clone().into(),
+                            source: AiSource::Local,
+                            note: Some(shared("LLM 返回了空内容")),
+                        };
+                    }
+                    Err(e) => {
+                        app.portfolio_ai_panel = AiPanelState::Ready {
+                            text: local.clone().into(),
+                            source: AiSource::Local,
+                            note: Some(shared(format!("LLM 请求失败：{e}"))),
+                        };
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn select_adjacent_symbol(&mut self, delta: i32, cx: &mut Context<Self>) {
@@ -2375,8 +2890,8 @@ impl StockApp {
 
     fn toggle_treasure_tab(&mut self, cx: &mut Context<Self>) {
         self.left_tab = match self.left_tab {
-            LeftTab::Watchlist => LeftTab::Treasure,
             LeftTab::Treasure => LeftTab::Watchlist,
+            _ => LeftTab::Treasure,
         };
         cx.notify();
     }
@@ -5040,6 +5555,21 @@ impl StockApp {
                             })),
                     )
                     .child(
+                        Button::new("tab-portfolio")
+                            .xsmall()
+                            .when(self.left_tab == LeftTab::Portfolio, |b| b.primary())
+                            .when(self.left_tab != LeftTab::Portfolio, |b| b.ghost())
+                            .label(if work { "Book" } else { "持仓" })
+                            .tooltip(if work {
+                                "Positions · buy/sell"
+                            } else {
+                                "持仓 · 买入/卖出 · AI 建议"
+                            })
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.set_left_tab(LeftTab::Portfolio, cx);
+                            })),
+                    )
+                    .child(
                         Button::new("tab-treasure")
                             .xsmall()
                             .when(self.left_tab == LeftTab::Treasure, |b| b.primary())
@@ -5061,6 +5591,9 @@ impl StockApp {
                             .text_color(cx.theme().muted_foreground)
                             .child(match self.left_tab {
                                 LeftTab::Watchlist => format!("{} 只", self.symbols.len()),
+                                LeftTab::Portfolio => {
+                                    format!("{} 只", self.portfolio_summary().open_count)
+                                }
                                 LeftTab::Treasure => {
                                     if self.treasure_scanning {
                                         format!("{}/{}", self.treasure_done, self.treasure_total)
@@ -5073,6 +5606,7 @@ impl StockApp {
             )
             .child(match self.left_tab {
                 LeftTab::Watchlist => self.render_watchlist_body(cx).into_any_element(),
+                LeftTab::Portfolio => self.render_portfolio_body(cx).into_any_element(),
                 LeftTab::Treasure => self.render_treasure_body(cx).into_any_element(),
             })
     }
@@ -5267,6 +5801,394 @@ impl StockApp {
                             .child(if work { "↑↓ navigate" } else { "↑↓ 切换" }),
                     ),
             )
+    }
+
+    fn render_portfolio_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let work = self.work_mode;
+        let selected = self.selected.clone();
+        let summary = self.portfolio_summary();
+        let form_side = self.trade_form_side;
+        let pnl_up = summary.total_unrealized_pnl >= 0.0;
+        let pnl_color = self.chg_color(pnl_up, cx);
+
+        let mut root = v_flex().flex_1().min_h_0().w_full();
+
+        // 组合汇总
+        root = root.child(
+            v_flex()
+                .gap_1()
+                .px_2()
+                .py_2()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if work { "Book value" } else { "持仓市值" }),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_semibold()
+                                .text_color(cx.theme().foreground)
+                                .child(format!("{:.0}", summary.total_market_value)),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if work { "Unrealized" } else { "浮动盈亏" }),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_semibold()
+                                .text_color(pnl_color)
+                                .child(format!(
+                                    "{} ({})",
+                                    format_money(summary.total_unrealized_pnl),
+                                    format_pct(summary.total_unrealized_pnl_pct)
+                                )),
+                        ),
+                )
+                .when(summary.track_cash, |this| {
+                    this.child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if work { "Cash" } else { "现金" }),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().foreground)
+                                    .child(format!("{:.0}", summary.cash)),
+                            ),
+                    )
+                }),
+        );
+
+        // 买卖表单
+        if let Some(side) = form_side {
+            let side_label = if work {
+                side.label_work()
+            } else {
+                side.label()
+            };
+            root = root.child(
+                v_flex()
+                    .gap_1()
+                    .px_2()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_semibold()
+                                    .text_color(cx.theme().foreground)
+                                    .child(format!(
+                                        "{} · {}",
+                                        side_label,
+                                        self.selected.as_ref()
+                                    )),
+                            )
+                            .child(
+                                Button::new("trade-form-close")
+                                    .ghost()
+                                    .xsmall()
+                                    .label(if work { "Close" } else { "取消" })
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.trade_form_side = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                div()
+                                    .w(px(36.))
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if work { "Qty" } else { "股数" }),
+                            )
+                            .child(div().flex_1().child(Input::new(&self.trade_shares_input).small())),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                div()
+                                    .w(px(36.))
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if work { "Px" } else { "价格" }),
+                            )
+                            .child(div().flex_1().child(Input::new(&self.trade_price_input).small())),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                div()
+                                    .w(px(36.))
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if work { "Fee" } else { "费用" }),
+                            )
+                            .child(div().flex_1().child(Input::new(&self.trade_fee_input).small())),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                div()
+                                    .w(px(36.))
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if work { "Note" } else { "备注" }),
+                            )
+                            .child(div().flex_1().child(Input::new(&self.trade_note_input).small())),
+                    )
+                    .child(
+                        Button::new("trade-submit")
+                            .xsmall()
+                            .primary()
+                            .label(if work {
+                                "Submit"
+                            } else {
+                                "确认成交"
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.submit_trade(window, cx);
+                            })),
+                    ),
+            );
+        }
+
+        // 持仓列表头
+        root = root.child(
+            h_flex()
+                .h(px(26.))
+                .px_2()
+                .items_center()
+                .gap_1()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if work { "ID" } else { "代码" }),
+                )
+                .child(
+                    div()
+                        .w(px(52.))
+                        .text_right()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if work { "Qty" } else { "股数" }),
+                )
+                .child(
+                    div()
+                        .w(px(64.))
+                        .text_right()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if work { "P&L" } else { "盈亏" }),
+                ),
+        );
+
+        // 持仓行
+        let rows: Vec<_> = summary.positions.iter().cloned().collect();
+        root = root.child(
+            div()
+                .id("portfolio-scroll")
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .overflow_y_scroll()
+                .children(rows.into_iter().enumerate().map(|(ix, mark)| {
+                    let code = mark.position.code.clone();
+                    let code_s = shared(code.clone());
+                    let is_selected = selected.as_ref() == code.as_str();
+                    let code_show = if work {
+                        disguise_label(&code, &mark.position.name)
+                    } else {
+                        code.clone()
+                    };
+                    let name_show = if work {
+                        String::new()
+                    } else if is_real_name(&mark.position.name, &code) {
+                        mark.position.name.clone()
+                    } else {
+                        String::new()
+                    };
+                    let up = mark.unrealized_pnl >= 0.0;
+                    let pnl_c = self.chg_color(up, cx);
+                    let shares_s = format_shares(mark.position.shares);
+                    let pnl_s = format!(
+                        "{} {}",
+                        format_money(mark.unrealized_pnl),
+                        format_pct(mark.unrealized_pnl_pct)
+                    );
+
+                    div()
+                        .id(("port-row", ix))
+                        .px_2()
+                        .py_1p5()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .cursor_pointer()
+                        .border_b_1()
+                        .border_color(cx.theme().border.opacity(0.35))
+                        .when(is_selected, |this| this.bg(cx.theme().accent.opacity(0.18)))
+                        .hover(|this| this.bg(cx.theme().accent.opacity(0.10)))
+                        .on_click(cx.listener(move |this, _, _w, cx| {
+                            this.select_symbol(code_s.clone(), cx);
+                            this.detail_tab = DetailTab::Portfolio;
+                        }))
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_semibold()
+                                        .text_color(cx.theme().foreground)
+                                        .child(code_show),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .truncate()
+                                        .child(if name_show.is_empty() {
+                                            format!(
+                                                "成本 {} · 现 {}",
+                                                format_price(mark.position.avg_cost),
+                                                format_price(mark.last)
+                                            )
+                                        } else {
+                                            format!(
+                                                "{name_show} · 成本 {}",
+                                                format_price(mark.position.avg_cost)
+                                            )
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w(px(52.))
+                                .text_right()
+                                .text_xs()
+                                .text_color(cx.theme().foreground)
+                                .child(shares_s),
+                        )
+                        .child(
+                            div()
+                                .w(px(72.))
+                                .text_right()
+                                .text_xs()
+                                .font_semibold()
+                                .text_color(pnl_c)
+                                .child(pnl_s),
+                        )
+                })),
+        );
+
+        if summary.open_count == 0 && form_side.is_none() {
+            root = root.child(
+                div()
+                    .px_3()
+                    .py_4()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if work {
+                        "No positions. Buy to open."
+                    } else {
+                        "暂无持仓。选中标的后点「买入」开仓，或从底部「持仓」页管理。"
+                    }),
+            );
+        }
+
+        // 底部操作
+        root.child(
+            h_flex()
+                .h(px(32.))
+                .px_1()
+                .items_center()
+                .gap_0p5()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .child(
+                    Button::new("port-buy")
+                        .xsmall()
+                        .primary()
+                        .label(if work { "Buy" } else { "买入" })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_trade_form(TradeSide::Buy, window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("port-sell")
+                        .xsmall()
+                        .ghost()
+                        .label(if work { "Sell" } else { "卖出" })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_trade_form(TradeSide::Sell, window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("port-close")
+                        .xsmall()
+                        .ghost()
+                        .label(if work { "Flat" } else { "清仓" })
+                        .on_click(cx.listener(|this, _, _w, cx| {
+                            this.close_selected_position(cx);
+                        })),
+                )
+                .child(div().flex_1())
+                .child(
+                    Button::new("port-detail")
+                        .xsmall()
+                        .ghost()
+                        .label(if work { "AI" } else { "建议" })
+                        .on_click(cx.listener(|this, _, _w, cx| {
+                            this.detail_tab = DetailTab::Portfolio;
+                            this.request_portfolio_ai(cx);
+                        })),
+                ),
+        )
     }
 
     fn render_treasure_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -6853,6 +7775,9 @@ impl StockApp {
                         DetailTab::Overview => self.render_detail_overview(cx).into_any_element(),
                         DetailTab::Strategy => self.render_signal_detail_col(cx).into_any_element(),
                         DetailTab::Ai => self.render_ai_detail_col(cx).into_any_element(),
+                        DetailTab::Portfolio => {
+                            self.render_portfolio_detail_col(cx).into_any_element()
+                        }
                         DetailTab::Treasure => {
                             self.render_treasure_detail_col(cx).into_any_element()
                         }
@@ -7070,6 +7995,15 @@ impl StockApp {
                                     .label(if work { "AI →" } else { "AI →" })
                                     .on_click(cx.listener(|this, _, _w, cx| {
                                         this.set_detail_tab(DetailTab::Ai, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("goto-portfolio")
+                                    .xsmall()
+                                    .ghost()
+                                    .label(if work { "Book →" } else { "持仓 →" })
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.set_detail_tab(DetailTab::Portfolio, cx);
                                     })),
                             )
                             .child(
@@ -7547,6 +8481,473 @@ impl StockApp {
             );
         }
         root
+    }
+
+    fn render_portfolio_detail_col(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let work = self.work_mode;
+        let code = self.selected.to_string();
+        let pos = self.portfolio.position_state_of(&code);
+        let last = self
+            .symbols
+            .iter()
+            .find(|s| s.code == code)
+            .map(|s| s.last)
+            .filter(|p| *p > 0.0)
+            .or_else(|| self.candles.last().map(|c| c.close))
+            .unwrap_or(0.0);
+        let mark = pos.as_ref().filter(|p| p.shares > 1e-9).map(|p| {
+            portfolio::PositionMark::from_position(p.clone(), last, 0.0)
+        });
+        let trades: Vec<_> = self
+            .portfolio
+            .trades_for(&code)
+            .into_iter()
+            .rev()
+            .take(12)
+            .cloned()
+            .collect();
+
+        let current_key = self.candles.last().map(|c| {
+            let shares = pos.as_ref().map(|p| p.shares).unwrap_or(0.0);
+            let avg = pos.as_ref().map(|p| p.avg_cost).unwrap_or(0.0);
+            format!("pos:{}@{}:{:.4}:{:.4}", code, c.date, shares, avg)
+        });
+        let shown = current_key
+            .as_ref()
+            .is_some_and(|k| self.portfolio_ai_key.as_ref() == Some(k));
+        let loading = matches!(&self.portfolio_ai_panel, AiPanelState::Loading { .. });
+        let busy = shown && loading;
+        let has_signal = self.current_signal().is_some();
+
+        let mut col = v_flex()
+            .gap_2()
+            .w_full()
+            .max_w(px(780.))
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(section_title(
+                        if work {
+                            "Position"
+                        } else {
+                            "持仓与买卖建议"
+                        },
+                        cx,
+                    ))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new("pd-buy")
+                                    .xsmall()
+                                    .primary()
+                                    .label(if work { "Buy" } else { "买入" })
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_trade_form(TradeSide::Buy, window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("pd-sell")
+                                    .xsmall()
+                                    .ghost()
+                                    .label(if work { "Sell" } else { "卖出" })
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_trade_form(TradeSide::Sell, window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("pd-ai")
+                                    .xsmall()
+                                    .when(!busy && has_signal, |b| b.primary())
+                                    .when(busy || !has_signal, |b| b.ghost())
+                                    .label(if busy {
+                                        if work {
+                                            "Working…"
+                                        } else {
+                                            "分析中…"
+                                        }
+                                    } else if work {
+                                        "Advice"
+                                    } else {
+                                        "AI 建议"
+                                    })
+                                    .disabled(busy || !has_signal)
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.request_portfolio_ai(cx);
+                                    })),
+                            ),
+                    ),
+            );
+
+        // 持仓数字
+        if let Some(m) = &mark {
+            let pnl_c = self.chg_color(m.unrealized_pnl >= 0.0, cx);
+            col = col.child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .child(metric_chip(
+                        if work { "Qty" } else { "持股" },
+                        &format_shares(m.position.shares),
+                        cx,
+                    ))
+                    .child(metric_chip(
+                        if work { "Cost" } else { "成本" },
+                        &format_price(m.position.avg_cost),
+                        cx,
+                    ))
+                    .child(metric_chip(
+                        if work { "Last" } else { "现价" },
+                        &format_price(m.last),
+                        cx,
+                    ))
+                    .child(metric_chip(
+                        if work { "Value" } else { "市值" },
+                        &format!("{:.0}", m.market_value),
+                        cx,
+                    ))
+                    .child(
+                        v_flex()
+                            .gap_0p5()
+                            .px_2()
+                            .py_1()
+                            .min_w(px(88.))
+                            .rounded(cx.theme().radius)
+                            .bg(cx.theme().background)
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if work { "P&L" } else { "浮盈亏" }),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .text_color(pnl_c)
+                                    .child(format!(
+                                        "{} ({})",
+                                        format_money(m.unrealized_pnl),
+                                        format_pct(m.unrealized_pnl_pct)
+                                    )),
+                            ),
+                    ),
+            );
+            if m.position.realized_pnl.abs() > 1e-6 {
+                col = col.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "{} {}",
+                            if work { "Realized" } else { "已实现盈亏" },
+                            format_money(m.position.realized_pnl)
+                        )),
+                );
+            }
+        } else if let Some(p) = &pos {
+            col = col.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!(
+                        "{} · {} {}",
+                        if work {
+                            "Flat (history)"
+                        } else {
+                            "已清仓（保留流水）"
+                        },
+                        if work { "realized" } else { "已实现" },
+                        format_money(p.realized_pnl)
+                    )),
+            );
+        } else {
+            col = col.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if work {
+                        "No position on this symbol. Use Buy to open."
+                    } else {
+                        "当前标的无持仓。可用「买入」开仓，或先生成 AI 建仓观察建议。"
+                    }),
+            );
+        }
+
+        // AI 建议
+        col = col.child(section_title(
+            if work {
+                "AI position advice"
+            } else {
+                "AI 买卖建议"
+            },
+            cx,
+        ));
+        if shown {
+            match &self.portfolio_ai_panel {
+                AiPanelState::Loading { text } => {
+                    col = col.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().foreground)
+                            .child(text.clone()),
+                    );
+                    col = col.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if work {
+                                "LLM advice in progress…"
+                            } else {
+                                "正在请求 LLM 持仓建议…"
+                            }),
+                    );
+                }
+                AiPanelState::Ready { text, source, note } => {
+                    let source_color = if source.is_llm() {
+                        cx.theme().accent
+                    } else {
+                        cx.theme().muted_foreground
+                    };
+                    col = col.child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_semibold()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if work { "Source" } else { "来源" }),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_semibold()
+                                    .text_color(source_color)
+                                    .child(source.label(work)),
+                            ),
+                    );
+                    col = col.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().foreground)
+                            .child(text.clone()),
+                    );
+                    if let Some(note) = note {
+                        col = col.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground.opacity(0.9))
+                                .child(note.clone()),
+                        );
+                    }
+                }
+                AiPanelState::Idle => {
+                    col = col.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if work {
+                                "Not generated."
+                            } else {
+                                "尚未生成建议。"
+                            }),
+                    );
+                }
+            }
+        } else if !has_signal {
+            col = col.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("至少需要 20 根有效日K数据。"),
+            );
+        } else {
+            col = col.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if work {
+                        "Click Advice for cost-aware buy/sell guidance."
+                    } else {
+                        "点击「AI 建议」：结合成本、现价与技术面给出买卖观察倾向。"
+                    }),
+            );
+        }
+
+        // 成交流水
+        col = col.child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .child(section_title(
+                    if work { "Trades" } else { "成交记录" },
+                    cx,
+                ))
+                .child(
+                    Button::new("pd-undo")
+                        .xsmall()
+                        .ghost()
+                        .label(if work { "Undo last" } else { "撤销最近" })
+                        .on_click(cx.listener(|this, _, _w, cx| {
+                            this.undo_last_trade_for_selected(cx);
+                        })),
+                ),
+        );
+
+        if trades.is_empty() {
+            col = col.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if work {
+                        "No trades yet."
+                    } else {
+                        "暂无成交。"
+                    }),
+            );
+        } else {
+            for (ix, t) in trades.iter().enumerate() {
+                let side_c = match t.side {
+                    TradeSide::Buy => self.chg_color(true, cx),
+                    TradeSide::Sell => self.chg_color(false, cx),
+                };
+                let line = if work {
+                    format!(
+                        "{} {} × {} @ {}  {}",
+                        t.side.label_work(),
+                        format_shares(t.shares),
+                        format_price(t.price),
+                        if t.fee > 0.0 {
+                            format!("fee {:.2}", t.fee)
+                        } else {
+                            String::new()
+                        },
+                        t.time
+                    )
+                } else {
+                    format!(
+                        "{} {} 股 @ {} 元{}  · {}",
+                        t.side.label(),
+                        format_shares(t.shares),
+                        format_price(t.price),
+                        if t.fee > 0.0 {
+                            format!(" · 费 {:.2}", t.fee)
+                        } else {
+                            String::new()
+                        },
+                        t.time
+                    )
+                };
+                col = col.child(
+                    h_flex()
+                        .id(("trade-row", ix))
+                        .gap_2()
+                        .items_center()
+                        .px_1()
+                        .py_0p5()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_semibold()
+                                .text_color(side_c)
+                                .child(if work {
+                                    t.side.label_work()
+                                } else {
+                                    t.side.label()
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_xs()
+                                .text_color(cx.theme().foreground)
+                                .child(line),
+                        ),
+                );
+                if !t.note.is_empty() && !work {
+                    col = col.child(
+                        div()
+                            .pl_4()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(t.note.clone()),
+                    );
+                }
+            }
+        }
+
+        // 现金设置
+        col = col
+            .child(section_title(
+                if work {
+                    "Cash tracking"
+                } else {
+                    "现金（可选）"
+                },
+                cx,
+            ))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        Button::new("pd-track-cash")
+                            .xsmall()
+                            .when(self.portfolio.track_cash, |b| b.primary())
+                            .when(!self.portfolio.track_cash, |b| b.ghost())
+                            .label(if self.portfolio.track_cash {
+                                if work {
+                                    "On"
+                                } else {
+                                    "约束开"
+                                }
+                            } else if work {
+                                "Off"
+                            } else {
+                                "约束关"
+                            })
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.toggle_track_cash(cx);
+                            })),
+                    )
+                    .child(div().flex_1().child(Input::new(&self.portfolio_cash_input).small()))
+                    .child(
+                        Button::new("pd-set-cash")
+                            .xsmall()
+                            .ghost()
+                            .label(if work { "Set" } else { "设定" })
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.apply_portfolio_cash(cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground.opacity(0.75))
+                    .child(if work {
+                        "Optional cash balance. When On, buys require enough cash."
+                    } else {
+                        "可选记录现金。开启约束后，买入会检查余额；卖出回补现金。"
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground.opacity(0.75))
+                    .child(if work {
+                        "For reference only, not investment advice."
+                    } else {
+                        "仅供学习研究，不构成投资建议。持仓数据仅存本地。"
+                    }),
+            );
+
+        col
     }
 
     fn render_ai_detail_col(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -8249,6 +9650,20 @@ fn section_title(text: &str, cx: &App) -> impl IntoElement {
         .font_semibold()
         .text_color(cx.theme().muted_foreground)
         .child(text.to_string())
+}
+
+/// 解析用户输入的金额/股数（允许千分位逗号、空白）。
+fn parse_f64(raw: &str) -> Option<f64> {
+    let s = raw.trim().replace(',', "").replace('，', "");
+    if s.is_empty() {
+        return None;
+    }
+    let v: f64 = s.parse().ok()?;
+    if v.is_finite() {
+        Some(v)
+    } else {
+        None
+    }
 }
 
 /// Compact metric pill used on the overview / treasure dashboards.

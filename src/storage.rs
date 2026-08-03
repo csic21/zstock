@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::data::ai::AiConfig;
+use crate::data::portfolio::Portfolio;
 use crate::data::treasure::TreasureCache;
 use crate::model::{TrendLine, default_watchlist_codes};
 
@@ -293,6 +294,10 @@ pub fn treasure_cache_path() -> PathBuf {
     app_data_dir().join("treasure_cache.json")
 }
 
+pub fn portfolio_path() -> PathBuf {
+    app_data_dir().join("portfolio.json")
+}
+
 pub fn load_config() -> AppConfig {
     let path = config_path();
     match fs::read_to_string(&path) {
@@ -327,6 +332,25 @@ pub fn save_treasure_cache(cache: &TreasureCache) -> Result<()> {
             .with_context(|| format!("create {}", parent.display()))?;
     }
     let s = serde_json::to_string_pretty(cache)?;
+    fs::write(&path, s).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+pub fn load_portfolio() -> Portfolio {
+    let path = portfolio_path();
+    match fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => Portfolio::default(),
+    }
+}
+
+pub fn save_portfolio(portfolio: &Portfolio) -> Result<()> {
+    let path = portfolio_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create {}", parent.display()))?;
+    }
+    let s = serde_json::to_string_pretty(portfolio)?;
     fs::write(&path, s).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
