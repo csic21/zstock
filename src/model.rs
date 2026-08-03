@@ -73,13 +73,13 @@ pub fn format_index(value: f64) -> String {
 /// One row in the watchlist.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Symbol {
-    /// Pure code, e.g. `600519`, `000001`.
+    /// Pure code: A 股 6 位（`600519`），港股 5 位（`00700`）。
     pub code: String,
     pub name: SharedString,
     pub last: f64,
     pub change_pct: f64,
     pub volume: u64,
-    /// Market board label: 沪市 / 深市 / 创业板 / 科创板
+    /// Market board label: 沪市 / 深市 / 创业板 / 科创板 / 港股
     pub board: SharedString,
 }
 
@@ -92,7 +92,7 @@ impl Symbol {
         SharedString::from(self.code.clone())
     }
 
-    /// Eastmoney `secid`: `1.600519` (SH) or `0.000001` (SZ).
+    /// Eastmoney `secid`: A 股 `1.600519` / `0.000001`，港股 `116.00700`。
     pub fn secid(&self) -> String {
         secid_for_code(&self.code)
     }
@@ -305,25 +305,98 @@ impl QuoteSnapshot {
     }
 }
 
-/// Map 6-digit A-share / ETF code → Eastmoney `secid` (`1.xxxxxx` SH, `0.xxxxxx` SZ).
+/// Canonical pure code: A 股 6 位数字，港股 5 位数字（左侧补 0）。
 ///
-/// Rules (simplified, covers common equities + ETFs):
-/// - SH: 6xxxxx stocks, 688 科创, 5xxxxx funds/ETFs (e.g. 510300), 9xxxxx B
-/// - SZ: 0xxxxx / 3xxxxx stocks, 1xxxxx funds/ETFs
+/// Accepts common aliases: `hk00700` / `00700.HK` / `HK.00700` / `sh600519` / `sz000001`.
+pub fn normalize_code(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let lower = s.to_ascii_lowercase();
+
+    // Explicit HK prefixes / suffixes.
+    if let Some(rest) = lower.strip_prefix("hk") {
+        let digits: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
+        return pad_hk_digits(&digits);
+    }
+    if let Some(rest) = lower.strip_suffix(".hk") {
+        let digits: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
+        return pad_hk_digits(&digits);
+    }
+    if let Some(rest) = lower.strip_prefix("hk.") {
+        let digits: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
+        return pad_hk_digits(&digits);
+    }
+
+    // A-share exchange prefixes.
+    for p in ["sh", "sz", "bj"] {
+        if let Some(rest) = lower.strip_prefix(p) {
+            let digits: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
+            if digits.len() == 6 {
+                return Some(digits);
+            }
+            return None;
+        }
+    }
+
+    // Bare digits: 6 → A 股, 5 → 港股。1–4 位易与 A 股半成品码混淆，需 `hk`/` .HK` 前缀。
+    if s.chars().all(|c| c.is_ascii_digit()) {
+        if s.len() == 6 {
+            return Some(s.to_string());
+        }
+        if s.len() == 5 {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+fn pad_hk_digits(digits: &str) -> Option<String> {
+    if digits.is_empty() || digits.len() > 5 || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("{digits:0>5}"))
+}
+
+/// 港股：规范为 5 位数字代码（如 `00700`）。
+pub fn is_hk_code(code: &str) -> bool {
+    let c = code.trim();
+    c.len() == 5 && c.chars().all(|ch| ch.is_ascii_digit())
+}
+
+/// A 股 / 场内基金：6 位数字。
+pub fn is_a_share_code(code: &str) -> bool {
+    let c = code.trim();
+    c.len() == 6 && c.chars().all(|ch| ch.is_ascii_digit())
+}
+
+/// Map pure code → Eastmoney `secid`.
+///
+/// - A 股 SH `1.xxxxxx` / SZ·BJ `0.xxxxxx`
+/// - 港股 `116.00700`
 pub fn secid_for_code(code: &str) -> String {
     let code = code.trim();
+    if is_hk_code(code) {
+        return format!("116.{code}");
+    }
     let market = if is_sh_market(code) { 1 } else { 0 };
     format!("{market}.{code}")
 }
 
 fn is_sh_market(code: &str) -> bool {
+    if is_hk_code(code) {
+        return false;
+    }
     code.starts_with('6')
         || code.starts_with('5') // 上交所基金/ETF（510/511/512/513/515/516/518/588…）
         || code.starts_with('9')
 }
 
 pub fn board_for_code(code: &str) -> SharedString {
-    let label = if code.starts_with("688") || code.starts_with("689") {
+    let label = if is_hk_code(code) {
+        "港股"
+    } else if code.starts_with("688") || code.starts_with("689") {
         "科创板"
     } else if code.starts_with("300") || code.starts_with("301") {
         "创业板"
@@ -331,6 +404,8 @@ pub fn board_for_code(code: &str) -> SharedString {
         "ETF"
     } else if is_sh_market(code) {
         "沪市"
+    } else if code.starts_with('4') || code.starts_with('8') {
+        "北交所"
     } else {
         "深市"
     };
@@ -391,4 +466,33 @@ pub fn format_volume(v: u64) -> String {
 
 pub fn shared(s: impl Into<String>) -> SharedString {
     SharedString::from(s.into())
+}
+
+#[cfg(test)]
+mod code_tests {
+    use super::*;
+
+    #[test]
+    fn normalize_a_and_hk() {
+        assert_eq!(normalize_code("600519").as_deref(), Some("600519"));
+        assert_eq!(normalize_code("sh600519").as_deref(), Some("600519"));
+        assert_eq!(normalize_code("00700").as_deref(), Some("00700"));
+        assert_eq!(normalize_code("hk00700").as_deref(), Some("00700"));
+        assert_eq!(normalize_code("HK700").as_deref(), Some("00700"));
+        assert_eq!(normalize_code("700.HK").as_deref(), Some("00700"));
+        assert_eq!(normalize_code("hk700").as_deref(), Some("00700"));
+        // Bare short digits are ambiguous (could be partial A-share).
+        assert!(normalize_code("700").is_none());
+        assert!(normalize_code("").is_none());
+    }
+
+    #[test]
+    fn secid_and_board_hk() {
+        assert_eq!(secid_for_code("00700"), "116.00700");
+        assert_eq!(secid_for_code("600519"), "1.600519");
+        assert_eq!(board_for_code("00700").as_ref(), "港股");
+        assert!(is_hk_code("00700"));
+        assert!(is_a_share_code("600519"));
+        assert!(!is_hk_code("600519"));
+    }
 }

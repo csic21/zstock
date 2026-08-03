@@ -1,4 +1,4 @@
-//! Root application: A-share watchlist, chart (MA + crosshair), resizable layout, persistence.
+//! Root application: A 股 / 港股 watchlist, chart (MA + crosshair), resizable layout, persistence.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -35,13 +35,14 @@ use crate::data::treasure::{self, fmt_dd, fmt_pos, TreasureHit, TREASURE_KLINE_L
 use crate::data::universe::{self, FinFilter, TreasurePool, TREASURE_SCAN_CAP, TREASURE_TOP_N};
 use crate::data::{
     indicators::{BollSeries, MaSeries, MacdSeries},
-    market, signals,
+    market, session, signals,
 };
 use crate::data::market::Sourced;
+use crate::data::session::{filter_codes_in_session, idle_delay_secs, open_markets_now, MarketSet};
 use crate::model::{
     board_for_code, disguise_index, disguise_label, format_index, format_pct, format_price,
-    format_volume, shared, Candle, IndexSnap, MinutePeriod, MinuteSeries, QuoteSnapshot, Symbol,
-    TrendLine,
+    format_volume, normalize_code, shared, Candle, IndexSnap, MinutePeriod, MinuteSeries,
+    QuoteSnapshot, Symbol, TrendLine,
 };
 use crate::storage::{
     self, clamp_quote_interval_secs, normalize_status_bar, AppConfig, ColorScheme, DockLayout,
@@ -471,18 +472,25 @@ impl StockApp {
         let symbols: Vec<Symbol> = cfg
             .watchlist
             .iter()
-            .map(|code| Symbol {
-                code: code.clone(),
-                name: shared(code.clone()),
-                last: 0.0,
-                change_pct: 0.0,
-                volume: 0,
-                board: board_for_code(code),
+            .filter_map(|code| {
+                let code = normalize_code(code).unwrap_or_else(|| code.trim().to_string());
+                if code.is_empty() {
+                    return None;
+                }
+                Some(Symbol {
+                    code: code.clone(),
+                    name: shared(code.clone()),
+                    last: 0.0,
+                    change_pct: 0.0,
+                    volume: 0,
+                    board: board_for_code(&code),
+                })
             })
             .collect();
 
-        let selected = if symbols.iter().any(|s| s.code == cfg.selected) {
-            shared(cfg.selected.clone())
+        let selected_norm = normalize_code(&cfg.selected).unwrap_or_else(|| cfg.selected.clone());
+        let selected = if symbols.iter().any(|s| s.code == selected_norm) {
+            shared(selected_norm)
         } else {
             symbols
                 .first()
@@ -837,7 +845,8 @@ impl StockApp {
             }
         }
 
-        // Quote polling loop with backoff on failure (interval from settings).
+        // Quote polling: only during relevant market sessions (A / 港股).
+        // Off-hours: no network; startup snapshot is `refresh_all` once.
         cx.spawn(async move |this, cx| {
             let mut delay = Duration::from_secs(1);
             loop {
@@ -856,16 +865,26 @@ impl StockApp {
                     Err(_) => break,
                 };
                 if codes.is_empty() {
-                    // Still respect configured interval while empty.
                     if let Ok(secs) = this.read_with(cx, |app, _| app.quote_interval_secs) {
                         delay = Duration::from_secs(secs);
                     }
                     continue;
                 }
+
+                let present = MarketSet::from_codes(&codes);
+                let open = open_markets_now(present);
+                let active = filter_codes_in_session(&codes, open);
+                if active.is_empty() {
+                    // Closed for all markets in the list — idle without fetching.
+                    delay = Duration::from_secs(idle_delay_secs(present, 60));
+                    continue;
+                }
+
                 let need_idx = this
                     .read_with(cx, |app, _| app.work_mode)
-                    .unwrap_or(false);
-                let result = smol::unblock(move || market::fetch_quotes(&codes)).await;
+                    .unwrap_or(false)
+                    && open.a; // 指数只在 A 股时段刷新
+                let result = smol::unblock(move || market::fetch_quotes(&active)).await;
                 let idx_result = if need_idx {
                     Some(smol::unblock(market::fetch_major_indices).await)
                 } else {
@@ -921,8 +940,14 @@ impl StockApp {
                             }
                             // Don't clobber an in-flight kline status unless idle
                             if !app.loading {
+                                let mkt = match (open.a, open.hk) {
+                                    (true, true) => "A+港",
+                                    (true, false) => "A股",
+                                    (false, true) => "港股",
+                                    _ => "—",
+                                };
                                 app.status = shared(format!(
-                                    "行情已更新 · {} · {}",
+                                    "行情已更新 · {mkt} · {} · {}",
                                     sourced.source,
                                     chrono::Local::now().format("%H:%M:%S")
                                 ));
@@ -963,12 +988,12 @@ impl StockApp {
         })
         .detach();
 
-        // 分时自动刷新（仅 Intraday 模式）。
+        // 分时自动刷新（仅 Intraday 模式 + 该标的所属市场交易时段）。
         self.spawn_minute_refresh_loop(cx);
     }
 
     // 分时自动刷新：仅 Intraday 模式生效，约每 5 秒补一根新分钟线。
-    // 分时刷新在 quote loop 之外单独跑，避免拖慢行情轮询。
+    // 盘外不拉；所属市场开盘后再刷。
     fn spawn_minute_refresh_loop(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let mut delay = Duration::from_secs(5);
@@ -988,6 +1013,12 @@ impl StockApp {
                     Err(_) => break,
                 };
                 if selected.is_empty() {
+                    continue;
+                }
+                // Gate on the selected symbol's market session.
+                let present = MarketSet::from_codes(std::iter::once(selected.as_str()));
+                if !session::should_poll_quotes(present) {
+                    delay = Duration::from_secs(idle_delay_secs(present, 60));
                     continue;
                 }
                 let fetch_code = selected.clone();
@@ -1551,9 +1582,13 @@ impl StockApp {
 
     /// 确保代码在自选中（持仓需要行情）。
     fn ensure_in_watchlist(&mut self, code: &str, name: &str, last: f64) {
+        let code = normalize_code(code).unwrap_or_else(|| code.trim().to_string());
+        if code.is_empty() {
+            return;
+        }
         if self.symbols.iter().any(|s| s.code == code) {
             if let Some(sym) = self.symbols.iter_mut().find(|s| s.code == code) {
-                if is_real_name(name, code) && !is_real_name(sym.name.as_ref(), code) {
+                if is_real_name(name, &code) && !is_real_name(sym.name.as_ref(), &code) {
                     sym.name = shared(name.to_string());
                 }
                 if last > 0.0 && sym.last <= 0.0 {
@@ -1563,16 +1598,16 @@ impl StockApp {
             return;
         }
         self.symbols.push(Symbol {
-            code: code.to_string(),
-            name: shared(if is_real_name(name, code) {
+            code: code.clone(),
+            name: shared(if is_real_name(name, &code) {
                 name.to_string()
             } else {
-                code.to_string()
+                code.clone()
             }),
             last,
             change_pct: 0.0,
             volume: 0,
-            board: board_for_code(code),
+            board: board_for_code(&code),
         });
         self.filtered_local = (0..self.symbols.len()).collect();
     }
@@ -5023,9 +5058,9 @@ impl StockApp {
                             .text_xs()
                             .text_color(cx.theme().muted_foreground.opacity(0.9))
                             .child(if work {
-                                "How often quotes refresh. Faster may hit rate limits."
+                                "Poll only in session (CN 09:15–15:00 incl. auction; HK 09:00–16:10). Off-hours: once on open."
                             } else {
-                                "自选报价自动刷新频率。过快可能被数据源限流。"
+                                "仅交易时段轮询：A股 09:15–11:30/13:00–15:00（含竞价）；港股 09:00–12:00/13:00–16:10。盘外启动只拉一次。"
                             }),
                     )
                     .child(

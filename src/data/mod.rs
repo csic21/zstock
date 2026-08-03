@@ -7,6 +7,7 @@ pub mod levels;
 pub mod market;
 pub mod portfolio;
 pub mod scout;
+pub mod session;
 pub mod signals;
 pub mod sina;
 pub mod tencent;

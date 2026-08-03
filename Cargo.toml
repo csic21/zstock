@@ -1,8 +1,8 @@
 [package]
 name = "stock"
-version = "0.0.26"
+version = "0.0.27"
 edition = "2024"
-description = "A-share stock analysis desktop app built with GPUI"
+description = "A-share and Hong Kong stock analysis desktop app built with GPUI"
 license = "MIT"
 
 # Optional: cargo install cargo-bundle && cargo bundle --release
@@ -11,8 +11,8 @@ name = "ZStock"
 identifier = "com.karl.stock-analysis"
 icon = ["assets/logo/app-icon.png"]
 category = "Finance"
-short_description = "A-share stock analysis"
-long_description = "A-share stock analysis desktop app: watchlist, K-line, treasure scan."
+short_description = "A-share and Hong Kong stock analysis"
+long_description = "A-share and Hong Kong stock analysis desktop app: watchlist, K-line, treasure scan."
 osx_info_plist_exts = ["assets/macos/Info.plist"]
 
 [dependencies]
