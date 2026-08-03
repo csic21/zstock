@@ -1138,6 +1138,9 @@ impl StockApp {
                 }
                 app.loading = false;
                 app.persist();
+                // Hydrate fills last/change before the quote poll may succeed;
+                // push to the menu bar immediately so it is not stuck on "…".
+                app.sync_status_bar();
                 cx.notify();
             })
             .ok();
@@ -2316,10 +2319,17 @@ impl StockApp {
     }
 
     fn status_bar_title_for(&self, sym: &Symbol) -> String {
+        // Always include last price when available. Work-mode / multi compact used
+        // to show only ±% (2dp); the main window re-renders every poll with live
+        // prices, so the menu bar looked "stuck" whenever % didn't tick.
         if self.work_mode {
             let alias = disguise_label(&sym.code, sym.name.as_ref());
             if sym.last > 0.0 {
-                format!("{alias} {:+.2}%", sym.change_pct)
+                format!(
+                    "{alias} {} {:+.2}%",
+                    format_price(sym.last),
+                    sym.change_pct
+                )
             } else {
                 alias
             }
@@ -2337,19 +2347,27 @@ impl StockApp {
         }
     }
 
-    /// Compact segment for multi-symbol titles: `名+涨跌%` (no price).
+    /// Compact segment for multi-symbol titles: `名 价±%` (price keeps it live).
     fn status_bar_compact_for(&self, sym: &Symbol) -> String {
         if self.work_mode {
             let alias = disguise_label(&sym.code, sym.name.as_ref());
             if sym.last > 0.0 {
-                format!("{alias}{:+.2}%", sym.change_pct)
+                format!(
+                    "{alias} {}{:+.2}%",
+                    format_price(sym.last),
+                    sym.change_pct
+                )
             } else {
                 alias
             }
         } else {
             let name = short_status_name(sym.name.as_ref(), &sym.code);
             if sym.last > 0.0 {
-                format!("{name}{}", format_pct(sym.change_pct))
+                format!(
+                    "{name} {}{}",
+                    format_price(sym.last),
+                    format_pct(sym.change_pct)
+                )
             } else {
                 format!("{name}…")
             }
@@ -2360,7 +2378,11 @@ impl StockApp {
         if self.work_mode {
             let alias = disguise_label(&sym.code, sym.name.as_ref());
             if sym.last > 0.0 {
-                format!("{alias}  {:+.2}%", sym.change_pct)
+                format!(
+                    "{alias}  {}  {:+.2}%",
+                    format_price(sym.last),
+                    sym.change_pct
+                )
             } else {
                 alias
             }
@@ -2846,6 +2868,7 @@ impl StockApp {
                     let _ = storage::save_treasure_cache(&cache);
                 }
                 app.persist();
+                app.sync_status_bar();
                 cx.notify();
             });
         })
@@ -4726,11 +4749,11 @@ impl StockApp {
                     .text_color(cx.theme().muted_foreground.opacity(0.9))
                     .child(if work {
                         format!(
-                            "Pin up to {STATUS_BAR_MAX_CODES} watchlist symbols. All pinned quotes show together in the macOS menu bar (e.g. A · B · C). Click a row in the dropdown to open that symbol."
+                            "Pin up to {STATUS_BAR_MAX_CODES} watchlist symbols. All pinned quotes (price + change) show together in the macOS menu bar. Click a row in the dropdown to open that symbol."
                         )
                     } else {
                         format!(
-                            "从自选固定最多 {STATUS_BAR_MAX_CODES} 只；菜单栏会同时显示全部固定标的（例：比亚迪-0.1% · 楚天+0.5%）。点下拉项可打开对应股票。Windows/Linux 暂不支持。"
+                            "从自选固定最多 {STATUS_BAR_MAX_CODES} 只；菜单栏会同时显示全部固定标的的现价与涨跌（例：比亚迪 98.50 +1.2% · 楚天 …）。点下拉项可打开对应股票。Windows/Linux 暂不支持。"
                         )
                     }),
             )

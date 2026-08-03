@@ -44,6 +44,10 @@ struct StatusBarState {
     logo: usize,
     last_title: String,
     showing_logo: bool,
+    /// Last applied visibility (avoid setLength thrash every quote tick).
+    last_visible: Option<bool>,
+    /// Fingerprint of last rebuilt menu (labels + active flags + work_mode).
+    last_menu_sig: String,
 }
 
 impl StatusBarState {
@@ -99,6 +103,8 @@ pub fn install() -> Receiver<StatusBarAction> {
             logo: logo as usize,
             last_title: String::new(),
             showing_logo: true,
+            last_visible: None,
+            last_menu_sig: String::new(),
         });
     }
     INSTALLED.store(true, Ordering::SeqCst);
@@ -113,10 +119,14 @@ pub fn is_installed() -> bool {
 
 /// Show or hide the status item without destroying it.
 pub fn set_visible(visible: bool) {
-    let guard = STATE.lock().unwrap();
-    let Some(st) = guard.as_ref() else {
+    let mut guard = STATE.lock().unwrap();
+    let Some(st) = guard.as_mut() else {
         return;
     };
+    if st.last_visible == Some(visible) {
+        return;
+    }
+    st.last_visible = Some(visible);
     unsafe {
         if visible {
             st.item().setLength_(NSVariableStatusItemLength);
@@ -136,10 +146,11 @@ pub fn set_title(title: &str) {
     if !st.showing_logo && st.last_title == title {
         return;
     }
+    let clear_image = st.showing_logo;
     st.last_title = title.to_string();
     st.showing_logo = false;
     unsafe {
-        apply_title(st.item(), title);
+        apply_title(st.item(), title, clear_image);
     }
 }
 
@@ -167,12 +178,31 @@ pub struct MenuEntry {
     pub active: bool,
 }
 
+fn menu_sig(entries: &[MenuEntry], work_mode: bool) -> String {
+    let mut s = String::with_capacity(entries.len() * 48 + 8);
+    s.push(if work_mode { 'W' } else { 'N' });
+    for e in entries {
+        s.push('|');
+        s.push_str(&e.code);
+        s.push(':');
+        s.push_str(&e.label);
+        s.push(if e.active { '*' } else { '.' });
+    }
+    s
+}
+
 /// Rebuild the dropdown: pinned quotes + Show Window + Quit.
+/// Skips AppKit work when labels / selection / work_mode are unchanged.
 pub fn rebuild_menu(entries: &[MenuEntry], work_mode: bool) {
-    let guard = STATE.lock().unwrap();
-    let Some(st) = guard.as_ref() else {
+    let mut guard = STATE.lock().unwrap();
+    let Some(st) = guard.as_mut() else {
         return;
     };
+    let sig = menu_sig(entries, work_mode);
+    if st.last_menu_sig == sig {
+        return;
+    }
+    st.last_menu_sig = sig;
     let item = st.item();
     let target = st.target();
     unsafe {
@@ -290,19 +320,25 @@ unsafe fn apply_logo(item: id, logo: id) {
     }
 }
 
-unsafe fn apply_title(item: id, title: &str) {
+unsafe fn apply_title(item: id, title: &str, clear_image: bool) {
     unsafe {
         let button: id = item.button();
         if button == nil {
             set_button_title(item, title);
             return;
         }
-        // Clear image so multi-quote text is not squeezed beside a glyph.
-        let _: () = msg_send![button, setImage: nil];
-        // NSNoImage = 0
-        let _: () = msg_send![button, setImagePosition: 0isize];
+        if clear_image {
+            // Leaving a template glyph beside multi-quote text squeezes the title.
+            let _: () = msg_send![button, setImage: nil];
+            // NSNoImage = 0
+            let _: () = msg_send![button, setImagePosition: 0isize];
+        }
         let ns = NSString::alloc(nil).init_str(title);
         let _: () = msg_send![button, setTitle: ns];
+        // Re-assert variable length so the bar remeasures after title changes
+        // (esp. when switching logo ↔ multi-quote text of different widths).
+        let _: () = msg_send![item, setLength: NSVariableStatusItemLength];
+        let _: () = msg_send![button, setNeedsDisplay: YES];
     }
 }
 
