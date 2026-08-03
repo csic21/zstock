@@ -4642,10 +4642,29 @@ impl StockApp {
 
     fn render_settings_ai(&self, work: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let use_cli = self.ai_config.transport == AiTransport::Cli;
+        let status = if self.ai_config.enabled {
+            if self.ai_config.is_configured() {
+                if work {
+                    format!("Enabled · {}", self.ai_config.source_label())
+                } else {
+                    format!("已开启 · {}", self.ai_config.source_label())
+                }
+            } else if work {
+                "Enabled · missing base URL / model / key.".to_string()
+            } else {
+                "已开启 · 尚未填全 API 地址 / 模型 / Key。".to_string()
+            }
+        } else if work {
+            "Disabled · local rules only.".to_string()
+        } else {
+            "未开启 · 仅使用本地点评。".to_string()
+        };
 
         let mut col = v_flex()
-            .gap_3()
+            .gap_5()
+            .w_full()
             .max_w(px(640.))
+            // Page title
             .child(
                 div()
                     .text_sm()
@@ -4653,48 +4672,76 @@ impl StockApp {
                     .text_color(cx.theme().foreground)
                     .child(if work { "AI analysis" } else { "AI 分析" }),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground.opacity(0.9))
-                    .child(if work {
-                        "Optional LLM brief via API or local CLI (grok / chatgpt·codex / opencode / claude). Falls back to local rules when disabled or offline."
-                    } else {
-                        "为当前标的生成 AI 点评；支持 API 或本地 CLI（Grok / ChatGPT·Codex / OpenCode / Claude）；未开启或请求失败时自动使用本地规则点评。"
-                    }),
-            )
-            .child(
-                h_flex()
-                    .gap_1()
-                    .child(
-                        Button::new("ai-on")
-                            .xsmall()
-                            .when(self.ai_config.enabled, |b| b.primary())
-                            .when(!self.ai_config.enabled, |b| b.ghost())
-                            .label(if work { "On" } else { "开启" })
-                            .on_click(cx.listener(|this, _, _w, cx| {
-                                this.set_ai_enabled(true, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("ai-off")
-                            .xsmall()
-                            .when(!self.ai_config.enabled, |b| b.primary())
-                            .when(self.ai_config.enabled, |b| b.ghost())
-                            .label(if work { "Off" } else { "关闭" })
-                            .on_click(cx.listener(|this, _, _w, cx| {
-                                this.set_ai_enabled(false, cx);
-                            })),
-                    ),
-            )
+            // Enable / disable
             .child(
                 v_flex()
-                    .gap_1()
+                    .gap_2()
+                    .w_full()
                     .child(
                         div()
                             .text_xs()
+                            .font_semibold()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if work { "Enable" } else { "开关" }),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground.opacity(0.9))
+                            .child(if work {
+                                "Optional LLM brief. Falls back to local rules when off or failed."
+                            } else {
+                                "可选 LLM 点评；关闭或请求失败时自动使用本地规则。"
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new("ai-on")
+                                    .xsmall()
+                                    .when(self.ai_config.enabled, |b| b.primary())
+                                    .when(!self.ai_config.enabled, |b| b.ghost())
+                                    .label(if work { "On" } else { "开启" })
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.set_ai_enabled(true, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("ai-off")
+                                    .xsmall()
+                                    .when(!self.ai_config.enabled, |b| b.primary())
+                                    .when(self.ai_config.enabled, |b| b.ghost())
+                                    .label(if work { "Off" } else { "关闭" })
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.set_ai_enabled(false, cx);
+                                    })),
+                            ),
+                    ),
+            )
+            // Transport
+            .child(
+                v_flex()
+                    .gap_2()
+                    .w_full()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
                             .text_color(cx.theme().muted_foreground)
                             .child(if work { "Transport" } else { "调用方式" }),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground.opacity(0.9))
+                            .child(if work {
+                                "HTTP API or a local CLI already logged in on this machine."
+                            } else {
+                                "HTTP API，或本机已登录的 CLI（Grok / ChatGPT·Codex / OpenCode / Claude）。"
+                            }),
                     )
                     .child(h_flex().gap_1().children(AiTransport::all().map(|t| {
                         let active = self.ai_config.transport == t;
@@ -4717,96 +4764,144 @@ impl StockApp {
             col = col
                 .child(
                     v_flex()
-                        .gap_1()
+                        .gap_2()
+                        .w_full()
                         .child(
                             div()
                                 .text_xs()
+                                .font_semibold()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(if work { "CLI" } else { "CLI 工具" }),
+                                .child(if work { "CLI tool" } else { "CLI 工具" }),
                         )
-                        .child(h_flex().gap_1().children(AiCliProvider::all().map(|p| {
-                            let active = self.ai_config.cli_provider == p;
-                            let id = match p {
-                                AiCliProvider::Grok => "ai-cli-grok",
-                                AiCliProvider::Chatgpt => "ai-cli-chatgpt",
-                                AiCliProvider::Opencode => "ai-cli-opencode",
-                                AiCliProvider::Claude => "ai-cli-claude",
-                            };
-                            Button::new(id)
-                                .xsmall()
-                                .when(active, |b| b.primary())
-                                .when(!active, |b| b.ghost())
-                                .label(p.label())
-                                .on_click(cx.listener(move |this, _, _w, cx| {
-                                    this.set_ai_cli_provider(p, cx);
-                                }))
-                        }))),
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .flex_wrap()
+                                .children(AiCliProvider::all().map(|p| {
+                                    let active = self.ai_config.cli_provider == p;
+                                    let id = match p {
+                                        AiCliProvider::Grok => "ai-cli-grok",
+                                        AiCliProvider::Chatgpt => "ai-cli-chatgpt",
+                                        AiCliProvider::Opencode => "ai-cli-opencode",
+                                        AiCliProvider::Claude => "ai-cli-claude",
+                                    };
+                                    Button::new(id)
+                                        .xsmall()
+                                        .when(active, |b| b.primary())
+                                        .when(!active, |b| b.ghost())
+                                        .label(p.label())
+                                        .on_click(cx.listener(move |this, _, _w, cx| {
+                                            this.set_ai_cli_provider(p, cx);
+                                        }))
+                                })),
+                        ),
                 )
                 .child(
                     v_flex()
-                        .gap_1()
+                        .gap_2()
+                        .w_full()
                         .child(
                             div()
                                 .text_xs()
+                                .font_semibold()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(if work {
                                     "Model (optional)"
                                 } else {
-                                    "模型（可选，留空用 CLI 默认）"
+                                    "模型（可选）"
+                                }),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground.opacity(0.9))
+                                .child(if work {
+                                    "Leave empty to use the CLI default model."
+                                } else {
+                                    "留空则使用 CLI 默认模型。"
                                 }),
                         )
                         .child(Input::new(&self.ai_model_input).small()),
                 )
                 .child(
                     v_flex()
-                        .gap_1()
+                        .gap_2()
+                        .w_full()
                         .child(
                             div()
                                 .text_xs()
+                                .font_semibold()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(if work {
                                     "CLI path (optional)"
                                 } else {
-                                    "CLI 路径（可选，默认搜 PATH）"
+                                    "CLI 路径（可选）"
+                                }),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground.opacity(0.9))
+                                .child(if work {
+                                    "Absolute path if the binary is not on PATH."
+                                } else {
+                                    "不在 PATH 时填写绝对路径，例如 /opt/homebrew/bin/claude。"
                                 }),
                         )
                         .child(Input::new(&self.ai_cli_bin_input).small()),
                 )
                 .child(
                     div()
+                        .w_full()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground.opacity(0.75))
                         .child(if work {
-                            "Uses your already-logged-in CLI (grok / chatgpt or codex / opencode / claude). Only the metric snapshot is sent as the prompt."
+                            "Uses your logged-in CLI. Only the metric snapshot is sent as the prompt."
                         } else {
-                            "使用本机已登录的 CLI（Grok / ChatGPT 或 Codex / OpenCode / Claude）。只把指标快照作为提示词传入，不上传原始行情。"
+                            "使用本机 CLI 登录态；只把指标快照作为提示词，不上传原始行情。"
                         }),
                 );
         } else {
             col = col
                 .child(
-                    h_flex().gap_1().children(AiKind::all().map(|kind| {
-                        let active = self.ai_config.kind == kind;
-                        let id = match kind {
-                            AiKind::Responses => "ai-kind-responses",
-                            AiKind::Chat => "ai-kind-chat",
-                        };
-                        Button::new(id)
-                            .xsmall()
-                            .when(active, |b| b.primary())
-                            .when(!active, |b| b.ghost())
-                            .label(kind.label())
-                            .on_click(cx.listener(move |this, _, _w, cx| {
-                                this.set_ai_kind(kind, cx);
-                            }))
-                    })),
-                )
-                .child(
                     v_flex()
-                        .gap_1()
+                        .gap_2()
+                        .w_full()
                         .child(
                             div()
                                 .text_xs()
+                                .font_semibold()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if work { "Protocol" } else { "协议" }),
+                        )
+                        .child(
+                            h_flex().gap_1().children(AiKind::all().map(|kind| {
+                                let active = self.ai_config.kind == kind;
+                                let id = match kind {
+                                    AiKind::Responses => "ai-kind-responses",
+                                    AiKind::Chat => "ai-kind-chat",
+                                };
+                                Button::new(id)
+                                    .xsmall()
+                                    .when(active, |b| b.primary())
+                                    .when(!active, |b| b.ghost())
+                                    .label(kind.label())
+                                    .on_click(cx.listener(move |this, _, _w, cx| {
+                                        this.set_ai_kind(kind, cx);
+                                    }))
+                            })),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .w_full()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_semibold()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(if work { "Base URL" } else { "API 地址" }),
                         )
@@ -4814,10 +4909,12 @@ impl StockApp {
                 )
                 .child(
                     v_flex()
-                        .gap_1()
+                        .gap_2()
+                        .w_full()
                         .child(
                             div()
                                 .text_xs()
+                                .font_semibold()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(if work { "Model" } else { "模型" }),
                         )
@@ -4825,10 +4922,12 @@ impl StockApp {
                 )
                 .child(
                     v_flex()
-                        .gap_1()
+                        .gap_2()
+                        .w_full()
                         .child(
                             div()
                                 .text_xs()
+                                .font_semibold()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(if work { "API key" } else { "API Key" }),
                         )
@@ -4836,37 +4935,23 @@ impl StockApp {
                 )
                 .child(
                     div()
+                        .w_full()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground.opacity(0.75))
                         .child(if work {
-                            "Key stays in local config.json. Only the computed metric snapshot is sent to the endpoint."
+                            "Key stays in local config.json. Only the metric snapshot is sent."
                         } else {
-                            "Key 仅保存在本机 config.json；只上传本地算好的指标快照，不上传原始行情。"
+                            "Key 仅保存在本机 config.json；只上传指标快照，不上传原始行情。"
                         }),
                 );
         }
 
         col.child(
             div()
+                .w_full()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
-                .child(if self.ai_config.enabled {
-                    if self.ai_config.is_configured() {
-                        if work {
-                            format!("Enabled · {}", self.ai_config.source_label())
-                        } else {
-                            format!("已开启 · {}", self.ai_config.source_label())
-                        }
-                    } else if work {
-                        "Enabled · missing base URL / model / key.".to_string()
-                    } else {
-                        "已开启 · 尚未填全 API 地址 / 模型 / Key。".to_string()
-                    }
-                } else if work {
-                    "Disabled · local rules only.".to_string()
-                } else {
-                    "未开启 · 仅使用本地点评。".to_string()
-                }),
+                .child(status),
         )
     }
 
