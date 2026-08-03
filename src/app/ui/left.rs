@@ -58,6 +58,7 @@ use super::super::{
     TITLE_WORK, TREASURE_SCAN_GAP,
 };
 use super::super::helpers::*;
+use super::super::labels::L;
 
 
 
@@ -88,7 +89,7 @@ impl StockApp {
                             .xsmall()
                             .when(self.left_tab == LeftTab::Watchlist, |b| b.primary())
                             .when(self.left_tab != LeftTab::Watchlist, |b| b.ghost())
-                            .label(if work { "List" } else { "自选" })
+                            .label(L::left_watchlist(work))
                             .on_click(cx.listener(|this, _, _w, cx| {
                                 this.set_left_tab(LeftTab::Watchlist, cx);
                             })),
@@ -98,7 +99,7 @@ impl StockApp {
                             .xsmall()
                             .when(self.left_tab == LeftTab::Portfolio, |b| b.primary())
                             .when(self.left_tab != LeftTab::Portfolio, |b| b.ghost())
-                            .label(if work { "Book" } else { "持仓" })
+                            .label(L::left_portfolio(work))
                             .tooltip(if work {
                                 "Positions · buy/sell"
                             } else {
@@ -113,7 +114,7 @@ impl StockApp {
                             .xsmall()
                             .when(self.left_tab == LeftTab::Treasure, |b| b.primary())
                             .when(self.left_tab != LeftTab::Treasure, |b| b.ghost())
-                            .label(if work { "Scan" } else { "🐭 寻宝" })
+                            .label(L::left_treasure(work))
                             .tooltip(if work {
                                 "Multi-window scan · ⌘T"
                             } else {
@@ -675,7 +676,7 @@ impl StockApp {
                     .child(if work {
                         "No positions. Buy to open."
                     } else {
-                        "暂无持仓。选中标的后点「买入」开仓，或从底部「持仓」页管理。"
+                        "暂无持仓。选中标的后点「买入」开仓；点「建议」看 AI 与成交明细。"
                     }),
             );
         }

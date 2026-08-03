@@ -8,6 +8,7 @@
 
 mod chart_ctrl;
 mod helpers;
+mod labels;
 mod market;
 mod portfolio;
 mod prefs;
@@ -67,7 +68,7 @@ actions!(
 );
 
 /// Window title in normal vs work mode.
-const TITLE_NORMAL: &str = "ZStock · A股";
+const TITLE_NORMAL: &str = "ZStock · A股/港股";
 const TITLE_WORK: &str = "Notes";
 
 /// Preset quote poll intervals offered in Settings (seconds).
@@ -78,6 +79,8 @@ const CHART_MIN_VISIBLE: usize = 15;
 /// 寻宝扫描相邻请求间隔，降低限流概率。
 /// 扩大扫描时相邻请求间隔（约 400 只 × 150ms ≈ 1 分钟级）。
 const TREASURE_SCAN_GAP: Duration = Duration::from_millis(150);
+/// Debounce window for config.json writes (typing / layout thrash).
+pub(crate) const PERSIST_DEBOUNCE: Duration = Duration::from_millis(400);
 
 pub struct StockApp {
     symbols: Vec<Symbol>,
@@ -127,9 +130,14 @@ pub struct StockApp {
     /// In-memory K-line / minute series cache for instant symbol switches.
     series_cache: series_cache::SeriesCache,
     status: SharedString,
+    /// True when the selected series has no paintable data yet (cold load).
     loading: bool,
+    /// True when a background refresh is in flight (cache already painted).
+    refreshing: bool,
     data_source: SharedString,
     palette_open: bool,
+    /// Keyboard highlight index into palette rows (local first, then remote).
+    palette_index: usize,
     /// Full-page settings (not a modal).
     settings_open: bool,
     /// Active section inside the settings page.
@@ -231,6 +239,8 @@ pub struct StockApp {
     status_bar_codes: Vec<String>,
     /// Code currently shown in the status bar title.
     status_bar_active: String,
+    /// Bumps on each `schedule_persist`; only the latest gen writes disk.
+    persist_gen: u64,
     _subscriptions: Vec<gpui::Subscription>,
 }
 
@@ -320,10 +330,16 @@ impl StockApp {
 
         let _subscriptions = vec![
             cx.subscribe_in(&palette_query, window, {
-                move |this, state: &Entity<InputState>, event: &InputEvent, _window, cx| {
-                    if matches!(event, InputEvent::Change) {
-                        let q = state.read(cx).value().to_string();
-                        this.on_palette_query_changed(&q, cx);
+                move |this, state: &Entity<InputState>, event: &InputEvent, window, cx| {
+                    match event {
+                        InputEvent::Change => {
+                            let q = state.read(cx).value().to_string();
+                            this.on_palette_query_changed(&q, cx);
+                        }
+                        InputEvent::PressEnter { .. } => {
+                            this.palette_confirm(window, cx);
+                        }
+                        _ => {}
                     }
                 }
             }),
@@ -331,7 +347,7 @@ impl StockApp {
                 move |this, state: &Entity<InputState>, event: &InputEvent, _window, cx| {
                     if matches!(event, InputEvent::Change) {
                         this.ai_config.base_url = state.read(cx).value().to_string();
-                        this.persist();
+                        this.schedule_persist(cx);
                         cx.notify();
                     }
                 }
@@ -340,7 +356,7 @@ impl StockApp {
                 move |this, state: &Entity<InputState>, event: &InputEvent, _window, cx| {
                     if matches!(event, InputEvent::Change) {
                         this.ai_config.model = state.read(cx).value().to_string();
-                        this.persist();
+                        this.schedule_persist(cx);
                         cx.notify();
                     }
                 }
@@ -349,7 +365,7 @@ impl StockApp {
                 move |this, state: &Entity<InputState>, event: &InputEvent, _window, cx| {
                     if matches!(event, InputEvent::Change) {
                         this.ai_config.api_key = state.read(cx).unmask_value().to_string();
-                        this.persist();
+                        this.schedule_persist(cx);
                         cx.notify();
                     }
                 }
@@ -358,7 +374,7 @@ impl StockApp {
                 move |this, state: &Entity<InputState>, event: &InputEvent, _window, cx| {
                     if matches!(event, InputEvent::Change) {
                         this.ai_config.cli_bin = state.read(cx).value().to_string();
-                        this.persist();
+                        this.schedule_persist(cx);
                         cx.notify();
                     }
                 }
@@ -434,8 +450,10 @@ impl StockApp {
             series_cache: series_cache::SeriesCache::new(),
             status: shared("正在连接行情源…"),
             loading: true,
+            refreshing: false,
             data_source: shared(market_data::SRC_LABEL),
             palette_open: false,
+            palette_index: 0,
             settings_open: false,
             settings_section: SettingsSection::General,
             update_state: UpdateState::Idle,
@@ -499,6 +517,7 @@ impl StockApp {
             status_bar_enabled,
             status_bar_codes,
             status_bar_active,
+            persist_gen: 0,
             _subscriptions,
         };
 
@@ -536,7 +555,7 @@ impl Render for StockApp {
             );
             if self.window_bounds != Some(cur) {
                 self.window_bounds = Some(cur);
-                self.persist();
+                self.schedule_persist(cx);
             }
         }
 
@@ -575,12 +594,22 @@ impl Render for StockApp {
                 this.dismiss_overlay(cx);
             }))
             .on_action(cx.listener(|this, _: &SelectPrevSymbol, _w, cx| {
-                if !this.palette_open && !this.settings_open {
+                if this.settings_open {
+                    return;
+                }
+                if this.palette_open {
+                    this.palette_move(-1, cx);
+                } else {
                     this.select_adjacent_symbol(-1, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &SelectNextSymbol, _w, cx| {
-                if !this.palette_open && !this.settings_open {
+                if this.settings_open {
+                    return;
+                }
+                if this.palette_open {
+                    this.palette_move(1, cx);
+                } else {
                     this.select_adjacent_symbol(1, cx);
                 }
             }))

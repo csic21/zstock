@@ -423,6 +423,7 @@ impl StockApp {
         // Keep previous candles painted until the new series arrives (no blank flash).
         self.hover_ix = None;
         self.loading = !from_cache;
+        self.refreshing = from_cache;
         self.status = shared(if from_cache {
             if is_intraday {
                 format!("缓存 · {selected} 分时 · 刷新中…")
@@ -553,7 +554,8 @@ impl StockApp {
                     }
                 }
                 app.loading = false;
-                app.persist();
+                app.refreshing = false;
+                app.schedule_persist(cx);
                 // Hydrate fills last/change before the quote poll may succeed;
                 // push to the menu bar immediately so it is not stuck on "…".
                 app.sync_status_bar();
@@ -841,6 +843,7 @@ impl StockApp {
         // Keep last series visible while loading (header uses live quote + loading flag).
         self.hover_ix = None;
         self.loading = !from_cache;
+        self.refreshing = from_cache;
         self.status = shared(if from_cache {
             format!("缓存 · {selected} {} · 刷新中…", self.chart_label())
         } else {
@@ -898,7 +901,8 @@ impl StockApp {
                     }
                 }
                 app.loading = false;
-                app.persist();
+                app.refreshing = false;
+                app.schedule_persist(cx);
                 cx.notify();
             })
             .ok();
@@ -913,6 +917,7 @@ impl StockApp {
         let from_cache = self.try_restore_series_cache();
         self.hover_ix = None;
         self.loading = !from_cache;
+        self.refreshing = from_cache;
         self.status = shared(if from_cache {
             format!("缓存 · {selected} 分时 · 刷新中…")
         } else {
@@ -951,7 +956,8 @@ impl StockApp {
                     }
                 }
                 app.loading = false;
-                app.persist();
+                app.refreshing = false;
+                app.schedule_persist(cx);
                 cx.notify();
             })
             .ok();
@@ -971,7 +977,7 @@ impl StockApp {
             return;
         }
         self.chart_kind = kind;
-        self.persist();
+        self.schedule_persist(cx);
         self.reload_chart(cx);
     }
 

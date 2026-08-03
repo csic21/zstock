@@ -58,6 +58,8 @@ use super::super::{
     TITLE_WORK, TREASURE_SCAN_GAP,
 };
 use super::super::helpers::*;
+use super::super::labels::L;
+use gpui_component::skeleton::Skeleton;
 
 
 
@@ -165,19 +167,17 @@ impl StockApp {
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
                 .child(if self.loading {
-                    if work {
-                        "Loading series…"
-                    } else if matches!(self.chart_kind, ChartKind::Intraday) {
+                    if matches!(self.chart_kind, ChartKind::Intraday) && !work {
                         "分时加载中…"
                     } else {
-                        "K线加载中…"
+                        L::chart_loading(work)
                     }
-                } else if work {
-                    "No series data"
-                } else if matches!(self.chart_kind, ChartKind::Intraday) {
+                } else if self.refreshing {
+                    L::chart_refreshing(work)
+                } else if matches!(self.chart_kind, ChartKind::Intraday) && !work {
                     "暂无分时数据"
                 } else {
-                    "暂无匹配的 K 线"
+                    L::chart_no_data(work)
                 })
                 .into_any_element()
         };
@@ -273,6 +273,30 @@ impl StockApp {
                                             .text_color(pnl_color)
                                             .child(format!("{:+.2}%", pnl_pct)),
                                     )
+                            })
+                            .when(self.refreshing, |row| {
+                                row.child(div().w(px(6.))).child(
+                                    div()
+                                        .text_xs()
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_full()
+                                        .bg(cx.theme().accent.opacity(0.18))
+                                        .text_color(cx.theme().accent)
+                                        .child(L::chart_refreshing(work)),
+                                )
+                            })
+                            .when(self.loading && !self.refreshing, |row| {
+                                row.child(div().w(px(6.))).child(
+                                    div()
+                                        .text_xs()
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_full()
+                                        .bg(cx.theme().muted)
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(L::loading_short(work)),
+                                )
                             }),
                     ),
             )
@@ -431,6 +455,7 @@ impl StockApp {
             .child({
                 let entity = cx.entity().clone();
                 let paint = paint.clone();
+                let show_skeleton = self.loading && paint.candles.is_empty() && paint.minute.is_none();
                 div()
                     .id("chart-body")
                     .flex_1()
@@ -460,6 +485,28 @@ impl StockApp {
                                 )
                                 .size_full(),
                             )
+                            .when(show_skeleton, |surface| {
+                                surface.child(
+                                    v_flex()
+                                        .absolute()
+                                        .inset_0()
+                                        .p_6()
+                                        .gap_3()
+                                        .justify_center()
+                                        .bg(cx.theme().background.opacity(0.55))
+                                        .child(Skeleton::new().h_3().w_full())
+                                        .child(Skeleton::new().secondary().h_3().w(px(280.)))
+                                        .child(Skeleton::new().h_3().w(px(320.)))
+                                        .child(Skeleton::new().secondary().h_3().w_full())
+                                        .child(
+                                            div()
+                                                .mt_2()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(L::chart_loading(work)),
+                                        ),
+                                )
+                            })
                             .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _w, cx| {
                                 let local_x =
                                     ev.position.x.as_f32() - this.chart_origin.x.as_f32();
@@ -570,7 +617,7 @@ impl StockApp {
                                                 } else {
                                                     "已添加画线"
                                                 });
-                                                this.persist();
+                                                this.schedule_persist(cx);
                                             }
                                         }
                                         this.drawing_anchor = None;
@@ -609,7 +656,7 @@ impl StockApp {
                     "boll" => this.show_boll = !this.show_boll,
                     _ => {}
                 }
-                this.persist();
+                this.schedule_persist(cx);
                 cx.notify();
             }))
     }
@@ -649,7 +696,7 @@ impl StockApp {
                 format!("已清除 {removed} 条画线")
             }
         ));
-        self.persist();
+        self.schedule_persist(cx);
         cx.notify();
     }
 
@@ -919,11 +966,9 @@ impl StockApp {
             .text_xs()
             .text_color(cx.theme().muted_foreground)
             .child(if self.loading {
-                if work {
-                    "Loading…".to_string()
-                } else {
-                    "加载中…".to_string()
-                }
+                L::loading_short(work).to_string()
+            } else if self.refreshing {
+                L::chart_refreshing(work).to_string()
             } else if !candles_match || self.candles.is_empty() {
                 if work {
                     "No series data".to_string()
@@ -941,7 +986,7 @@ impl StockApp {
             return;
         }
         self.detail_tab = tab;
-        self.persist();
+        self.schedule_persist(cx);
         cx.notify();
     }
 

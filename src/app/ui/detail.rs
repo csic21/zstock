@@ -58,6 +58,7 @@ use super::super::{
     TITLE_WORK, TREASURE_SCAN_GAP,
 };
 use super::super::helpers::*;
+use super::super::labels::L;
 
 
 
@@ -78,7 +79,8 @@ impl StockApp {
                     .gap_1()
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .children(DetailTab::all().map(|tab| {
+                    // Primary analysis tabs only — lists live in the left sidebar.
+                    .children(DetailTab::dock_tabs().map(|tab| {
                         let is_on = active == tab;
                         Button::new(("detail-tab", tab as u32))
                             .xsmall()
@@ -89,6 +91,24 @@ impl StockApp {
                                 this.set_detail_tab(tab, cx);
                             }))
                     }))
+                    // Ephemeral side tabs (opened from left list actions).
+                    .when(!active.is_dock_primary(), |row| {
+                        row.child(
+                            Button::new(("detail-tab-ephemeral", active as u32))
+                                .xsmall()
+                                .primary()
+                                .label(active.label(work)),
+                        )
+                        .child(
+                            Button::new("detail-tab-ephemeral-close")
+                                .xsmall()
+                                .ghost()
+                                .label(if work { "×" } else { "关闭" })
+                                .on_click(cx.listener(|this, _, _w, cx| {
+                                    this.set_detail_tab(DetailTab::Overview, cx);
+                                })),
+                        )
+                    })
                     .child(div().flex_1())
                     .child(
                         div()
@@ -314,13 +334,13 @@ impl StockApp {
                                     .text_xs()
                                     .font_semibold()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(if work { "Quick" } else { "快捷" }),
+                                    .child(L::quick_links(work)),
                             )
                             .child(
                                 Button::new("goto-strategy")
                                     .xsmall()
                                     .ghost()
-                                    .label(if work { "Signal →" } else { "策略 →" })
+                                    .label(L::goto_strategy(work))
                                     .on_click(cx.listener(|this, _, _w, cx| {
                                         this.set_detail_tab(DetailTab::Strategy, cx);
                                     })),
@@ -329,27 +349,37 @@ impl StockApp {
                                 Button::new("goto-ai")
                                     .xsmall()
                                     .ghost()
-                                    .label(if work { "AI →" } else { "AI →" })
+                                    .label(L::goto_ai(work))
                                     .on_click(cx.listener(|this, _, _w, cx| {
                                         this.set_detail_tab(DetailTab::Ai, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("goto-indicators")
+                                    .xsmall()
+                                    .ghost()
+                                    .label(L::goto_indicators(work))
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.set_detail_tab(DetailTab::Indicators, cx);
                                     })),
                             )
                             .child(
                                 Button::new("goto-portfolio")
                                     .xsmall()
                                     .ghost()
-                                    .label(if work { "Book →" } else { "持仓 →" })
+                                    .label(L::goto_portfolio(work))
                                     .on_click(cx.listener(|this, _, _w, cx| {
-                                        this.set_detail_tab(DetailTab::Portfolio, cx);
+                                        // Lists live in the left sidebar.
+                                        this.set_left_tab(LeftTab::Portfolio, cx);
                                     })),
                             )
                             .child(
                                 Button::new("goto-treasure")
                                     .xsmall()
                                     .ghost()
-                                    .label(if work { "Scan →" } else { "寻宝 →" })
+                                    .label(L::goto_treasure(work))
                                     .on_click(cx.listener(|this, _, _w, cx| {
-                                        this.set_detail_tab(DetailTab::Treasure, cx);
+                                        this.set_left_tab(LeftTab::Treasure, cx);
                                     })),
                             ),
                     ),

@@ -158,6 +158,10 @@ impl SettingsSection {
 }
 
 /// 底部分析台分区：一次只聚焦一个任务，避免横向信息堆叠。
+///
+/// Dock 主 Tab 只放「当前标的分析」：概览 / 策略 / AI / 指标。
+/// 持仓流水与寻宝榜以左侧为主；`Portfolio` / `Treasure` 仍可从左侧
+/// 「建议 / 详情」临时打开底栏（不出现在主 Tab 条）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u32)]
 pub(crate) enum DetailTab {
@@ -168,40 +172,42 @@ pub(crate) enum DetailTab {
     Strategy = 1,
     /// AI 点评
     Ai = 2,
-    /// 持仓与买卖建议
+    /// 持仓与买卖建议（侧栏入口，非主 Tab）
     Portfolio = 3,
-    /// 寻宝多窗口位置
+    /// 寻宝价位（侧栏入口，非主 Tab）
     Treasure = 4,
     /// MA / MACD / BOLL 指标读数
     Indicators = 5,
 }
 
 impl DetailTab {
-    pub(crate) fn all() -> [Self; 6] {
+    /// Primary analysis-dock tabs (no list duplication with the left sidebar).
+    pub(crate) fn dock_tabs() -> [Self; 4] {
         [
             Self::Overview,
             Self::Strategy,
             Self::Ai,
-            Self::Portfolio,
-            Self::Treasure,
             Self::Indicators,
         ]
     }
 
+    /// Whether this tab is a primary dock tab (shown in the strip always).
+    pub(crate) fn is_dock_primary(self) -> bool {
+        matches!(
+            self,
+            Self::Overview | Self::Strategy | Self::Ai | Self::Indicators
+        )
+    }
+
     pub(crate) fn label(self, work: bool) -> &'static str {
-        match (self, work) {
-            (Self::Overview, true) => "Overview",
-            (Self::Overview, false) => "概览",
-            (Self::Strategy, true) => "Signal",
-            (Self::Strategy, false) => "策略",
-            (Self::Ai, true) => "AI",
-            (Self::Ai, false) => "AI",
-            (Self::Portfolio, true) => "Book",
-            (Self::Portfolio, false) => "持仓",
-            (Self::Treasure, true) => "Scan",
-            (Self::Treasure, false) => "寻宝",
-            (Self::Indicators, true) => "Tech",
-            (Self::Indicators, false) => "指标",
+        use super::labels::L;
+        match self {
+            Self::Overview => L::detail_overview(work),
+            Self::Strategy => L::detail_strategy(work),
+            Self::Ai => L::detail_ai(work),
+            Self::Portfolio => L::detail_portfolio(work),
+            Self::Treasure => L::detail_treasure(work),
+            Self::Indicators => L::detail_indicators(work),
         }
     }
 
@@ -220,8 +226,10 @@ impl DetailTab {
         match s.trim().to_ascii_lowercase().as_str() {
             "strategy" | "signal" | "策略" => Self::Strategy,
             "ai" => Self::Ai,
-            "portfolio" | "book" | "持仓" => Self::Portfolio,
-            "treasure" | "scan" | "寻宝" => Self::Treasure,
+            // Legacy config: list tabs used to live in the dock; restore to overview
+            // so the strip stays analysis-only. Side panel still owns lists.
+            "portfolio" | "book" | "持仓" => Self::Overview,
+            "treasure" | "scan" | "寻宝" => Self::Overview,
             "indicators" | "tech" | "指标" => Self::Indicators,
             _ => Self::Overview,
         }

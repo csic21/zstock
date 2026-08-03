@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use gpui::{
     canvas, div, point, px, size, App, AppContext, Bounds, Context, Entity, FocusHandle,
-    InteractiveElement, IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, Timer, Window, WindowBounds, WindowOptions,
+    InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
+    SharedString, StatefulInteractiveElement, Styled, Timer, Window, WindowBounds, WindowOptions,
     prelude::FluentBuilder,
 };
 use gpui_component::{
@@ -58,6 +58,7 @@ use super::super::{
     TITLE_WORK, TREASURE_SCAN_GAP,
 };
 use super::super::helpers::*;
+use super::super::labels::L;
 
 
 
@@ -69,6 +70,9 @@ impl StockApp {
             .filter_map(|&i| self.symbols.get(i).cloned().map(|s| (i, s)))
             .collect();
         let remote = self.palette_hits.clone();
+        let n_local = local.len();
+        let highlight = self.palette_index;
+        let work = self.work_mode;
 
         div()
             .absolute()
@@ -81,9 +85,26 @@ impl StockApp {
             // Same modal isolation as the settings overlay: don't let wheel
             // scrolling or hover styles reach the app behind the palette.
             .occlude()
+            // Capture ↑↓ while the search input is focused (Input would otherwise
+            // eat MoveUp/MoveDown for multi-line caret motion).
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _w, cx| {
+                let key = event.keystroke.key.as_str();
+                match key {
+                    "up" => {
+                        this.palette_move(-1, cx);
+                        cx.stop_propagation();
+                    }
+                    "down" => {
+                        this.palette_move(1, cx);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }))
             .child(
                 v_flex()
                     .id("palette-panel")
+                    .key_context("stock_palette")
                     .w(px(560.))
                     .max_h(px(480.))
                     .rounded(cx.theme().radius_lg)
@@ -117,13 +138,14 @@ impl StockApp {
                                     .py_1()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(if self.work_mode { "List" } else { "自选" }),
+                                    .child(L::palette_section_local(work)),
                             );
                             for (i, (_, sym)) in local.into_iter().enumerate() {
                                 list = list.child(palette_row(
                                     sym,
                                     true,
                                     i as u64,
+                                    highlight == i,
                                     self.color_scheme,
                                     self.work_mode,
                                     self.work_identity_reveal,
@@ -138,17 +160,15 @@ impl StockApp {
                                     .py_1()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(if self.work_mode {
-                                        "Results (click to add)"
-                                    } else {
-                                        "搜索结果（点击添加）"
-                                    }),
+                                    .child(L::palette_section_remote(work)),
                             );
                             for (i, sym) in remote.into_iter().enumerate() {
+                                let flat = n_local + i;
                                 list = list.child(palette_row(
                                     sym,
                                     false,
                                     10_000 + i as u64,
+                                    highlight == flat,
                                     self.color_scheme,
                                     self.work_mode,
                                     self.work_identity_reveal,
@@ -162,11 +182,7 @@ impl StockApp {
                                     .p_4()
                                     .text_sm()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(if self.work_mode {
-                                        "Type an id or name to search"
-                                    } else {
-                                        "输入代码或名称搜索 A 股"
-                                    }),
+                                    .child(L::palette_empty(work)),
                             );
                         }
                         list
@@ -182,11 +198,7 @@ impl StockApp {
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(if self.work_mode {
-                                        "⌘K toggle · click outside to close · local config"
-                                    } else {
-                                        "⌘K 开关 · 点击外部关闭 · 配置自动保存"
-                                    }),
+                                    .child(L::palette_footer(work)),
                             ),
                     ),
             )

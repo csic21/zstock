@@ -62,6 +62,7 @@ use super::helpers::*;
 
 
 impl StockApp {
+    /// Write config.json immediately (structural changes: add/remove symbol, trades).
     pub(crate) fn persist(&self) {
         let mut dock = self.dock.clone();
         dock.window = self.window_bounds;
@@ -95,6 +96,21 @@ impl StockApp {
             left_tab: self.left_tab.to_label().into(),
         };
         let _ = storage::save_config(&cfg);
+    }
+
+    /// Debounced config write — collapses rapid UI thrash (resize, typing, tab flips).
+    pub(crate) fn schedule_persist(&mut self, cx: &mut Context<Self>) {
+        self.persist_gen = self.persist_gen.wrapping_add(1);
+        let token = self.persist_gen;
+        cx.spawn(async move |this, cx| {
+            Timer::after(super::PERSIST_DEBOUNCE).await;
+            let _ = this.update(cx, |app, _cx| {
+                if app.persist_gen == token {
+                    app.persist();
+                }
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn persist_portfolio(&self) {
@@ -290,7 +306,7 @@ impl StockApp {
                     )
                 });
                 self.detail_tab = DetailTab::Portfolio;
-                self.persist();
+                self.persist(); // immediate: trade is structural
                 // 清空表单
                 self.trade_shares_input.update(cx, |s, cx| {
                     s.set_value("", window, cx);

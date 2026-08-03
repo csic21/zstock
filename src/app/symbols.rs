@@ -70,7 +70,7 @@ impl StockApp {
         }
         self.selected = code;
         self.palette_open = false;
-        self.persist();
+        self.schedule_persist(cx);
         self.reload_chart(cx);
     }
 
@@ -192,7 +192,7 @@ impl StockApp {
             return;
         }
         self.left_tab = tab;
-        self.persist();
+        self.schedule_persist(cx);
         cx.notify();
     }
 
@@ -201,7 +201,7 @@ impl StockApp {
             return;
         }
         self.treasure_pool = pool;
-        self.persist();
+        self.schedule_persist(cx);
         cx.notify();
     }
 
@@ -210,7 +210,7 @@ impl StockApp {
             return;
         }
         self.treasure_fin = fin;
-        self.persist();
+        self.schedule_persist(cx);
         cx.notify();
     }
 
@@ -650,8 +650,9 @@ impl StockApp {
             self.select_treasure_hit(&hit, cx);
         } else {
             self.left_tab = LeftTab::Treasure;
+            // Open ephemeral levels panel from the analysis dock.
             self.detail_tab = DetailTab::Treasure;
-            self.persist();
+            self.schedule_persist(cx);
             self.select_symbol(shared(pick.code.clone()), cx);
         }
     }
@@ -702,7 +703,7 @@ impl StockApp {
         self.treasure_list_expanded = false;
         self.detail_tab = DetailTab::Treasure;
         self.left_tab = LeftTab::Treasure;
-        self.persist();
+        self.schedule_persist(cx);
 
         let first = self
             .visible_scout_picks()
@@ -809,7 +810,7 @@ impl StockApp {
         }
         self.range = range;
         self.chart_kind = ChartKind::DayK;
-        self.persist();
+        self.schedule_persist(cx);
         self.reload_klines(cx);
     }
 
@@ -818,6 +819,7 @@ impl StockApp {
         if self.palette_open {
             self.palette_hits.clear();
             self.filtered_local = (0..self.symbols.len()).collect();
+            self.palette_index = 0;
             self.palette_query.update(cx, |input, cx| {
                 input.set_value("", window, cx);
             });
@@ -831,6 +833,7 @@ impl StockApp {
 
     pub(crate) fn on_palette_query_changed(&mut self, q: &str, cx: &mut Context<Self>) {
         let q_l = q.trim().to_lowercase();
+        self.palette_index = 0;
         if q_l.is_empty() {
             self.filtered_local = (0..self.symbols.len()).collect();
             self.palette_hits.clear();
@@ -856,6 +859,13 @@ impl StockApp {
             this.update(cx, |app, cx| {
                 if let Ok(sourced) = result {
                     app.palette_hits = sourced.data;
+                    // Keep highlight in range after remote results arrive.
+                    let n = app.palette_item_count();
+                    if n > 0 {
+                        app.palette_index = app.palette_index.min(n - 1);
+                    } else {
+                        app.palette_index = 0;
+                    }
                     cx.notify();
                 }
             })
@@ -863,6 +873,63 @@ impl StockApp {
         })
         .detach();
         cx.notify();
+    }
+
+    /// Flattened palette row count: local matches first, then remote hits.
+    pub(crate) fn palette_item_count(&self) -> usize {
+        self.filtered_local.len() + self.palette_hits.len()
+    }
+
+    pub(crate) fn palette_move(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let n = self.palette_item_count();
+        if n == 0 {
+            return;
+        }
+        let cur = self.palette_index.min(n - 1);
+        let next = if delta < 0 {
+            if cur == 0 {
+                n - 1
+            } else {
+                cur - 1
+            }
+        } else {
+            (cur + 1) % n
+        };
+        self.palette_index = next;
+        cx.notify();
+    }
+
+    /// Activate the highlighted palette row, or try to add the typed code.
+    pub(crate) fn palette_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.palette_open {
+            return;
+        }
+        let n_local = self.filtered_local.len();
+        let n_remote = self.palette_hits.len();
+        let total = n_local + n_remote;
+        if total == 0 {
+            let q = self.palette_query.read(cx).value().to_string();
+            let q = q.trim();
+            if q.is_empty() {
+                return;
+            }
+            if let Some(code) = normalize_code(q) {
+                let name = q.to_string();
+                self.add_symbol(code, name, window, cx);
+            } else {
+                // Raw 5-digit HK / free-form: still try as code.
+                self.add_symbol(q.to_string(), q.to_string(), window, cx);
+            }
+            return;
+        }
+        let ix = self.palette_index.min(total - 1);
+        if ix < n_local {
+            let code = self.symbols[self.filtered_local[ix]].code.clone();
+            self.select_symbol(shared(code), cx);
+        } else {
+            let hit = self.palette_hits[ix - n_local].clone();
+            self.add_symbol(hit.code.clone(), hit.name.to_string(), window, cx);
+        }
     }
 
     pub(crate) fn current_symbol(&self) -> Option<&Symbol> {

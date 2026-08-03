@@ -112,7 +112,7 @@ impl StockApp {
             return;
         }
         self.watchlist_sort = sort;
-        self.persist();
+        self.schedule_persist(cx);
         cx.notify();
     }
 
@@ -128,7 +128,7 @@ impl StockApp {
             if let Some(w) = new.first() {
                 self.left_width = *w;
             }
-            self.persist();
+            self.schedule_persist(cx);
         }
     }
 
@@ -144,7 +144,7 @@ impl StockApp {
             if let Some(h) = new.get(1) {
                 self.bottom_height = *h;
             }
-            self.persist();
+            self.schedule_persist(cx);
         }
     }
 
@@ -153,7 +153,7 @@ impl StockApp {
             return;
         }
         self.color_scheme = scheme;
-        self.persist();
+        self.schedule_persist(cx);
         cx.notify();
     }
 
@@ -175,7 +175,7 @@ impl StockApp {
             );
         });
         window.set_window_title(self.window_title());
-        self.persist();
+        self.schedule_persist(cx);
         self.sync_status_bar();
         cx.notify();
     }
@@ -198,7 +198,7 @@ impl StockApp {
             return;
         }
         self.quote_interval_secs = secs;
-        self.persist();
+        self.schedule_persist(cx);
         cx.notify();
     }
 
@@ -219,7 +219,7 @@ impl StockApp {
         if on {
             self.ensure_status_bar_installed(cx);
         }
-        self.persist();
+        self.schedule_persist(cx);
         self.sync_status_bar();
         cx.notify();
     }
@@ -293,7 +293,7 @@ impl StockApp {
             }
         }
         self.normalize_status_bar_state();
-        self.persist();
+        self.schedule_persist(cx);
         self.sync_status_bar();
         cx.notify();
     }
@@ -306,7 +306,7 @@ impl StockApp {
             return;
         }
         self.status_bar_active = code.to_string();
-        self.persist();
+        self.schedule_persist(cx);
         self.sync_status_bar();
         cx.notify();
     }
@@ -479,7 +479,7 @@ impl StockApp {
                 // Focus that symbol in the main window (title still shows all pins).
                 self.status_bar_active = code.clone();
                 self.settings_open = false;
-                self.persist();
+                self.schedule_persist(cx);
                 self.select_symbol(shared(code), cx);
                 self.activate_main_window(cx);
             }
@@ -643,7 +643,7 @@ impl StockApp {
             return;
         }
         self.ai_config.enabled = enabled;
-        self.persist();
+        self.schedule_persist(cx);
         cx.notify();
     }
 
@@ -652,7 +652,7 @@ impl StockApp {
             return;
         }
         self.ai_config.kind = kind;
-        self.persist();
+        self.schedule_persist(cx);
         cx.notify();
     }
 
@@ -661,7 +661,7 @@ impl StockApp {
             return;
         }
         self.ai_config.transport = transport;
-        self.persist();
+        self.schedule_persist(cx);
         cx.notify();
     }
 
@@ -670,7 +670,7 @@ impl StockApp {
             return;
         }
         self.ai_config.cli_provider = provider;
-        self.persist();
+        self.schedule_persist(cx);
         cx.notify();
     }
 

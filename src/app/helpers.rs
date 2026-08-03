@@ -47,11 +47,13 @@ pub(crate) fn palette_row(
     sym: Symbol,
     in_watchlist: bool,
     row_id: u64,
+    highlighted: bool,
     color_scheme: ColorScheme,
     work_mode: bool,
     reveal_identity: bool,
     cx: &mut Context<StockApp>,
 ) -> impl IntoElement {
+    use super::labels::L;
     let code = sym.code.clone();
     let name = sym.name.to_string();
     let code_width = if work_mode && reveal_identity { 180.0 } else { 64.0 };
@@ -125,6 +127,7 @@ pub(crate) fn palette_row(
         .items_center()
         .gap_3()
         .cursor_pointer()
+        .when(highlighted, |this| this.bg(cx.theme().accent.opacity(0.22)))
         .hover(|this| this.bg(cx.theme().accent.opacity(0.15)))
         .on_click(cx.listener(move |this, _, window, cx| {
             if in_watchlist {
@@ -176,7 +179,7 @@ pub(crate) fn palette_row(
                 div()
                     .text_xs()
                     .text_color(cx.theme().accent)
-                    .child(if work_mode { "attach" } else { "添加" }),
+                    .child(L::palette_add(work_mode)),
             )
         })
 }
