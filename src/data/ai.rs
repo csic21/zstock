@@ -5,16 +5,19 @@
 //! 1. **Local rules** — a deterministic Chinese commentary generated from the
 //!    strategy-radar snapshot plus a few extra pattern features (MA alignment,
 //!    MACD cross, 60-day range position). Offline, instant, free.
-//! 2. **Optional LLM** — the same compact numeric snapshot is sent to an
-//!    OpenAI-compatible endpoint, speaking either the **Responses** or the
-//!    **Chat Completions** protocol. Only pre-computed metrics leave the
-//!    machine (never raw K-lines), keeping tokens small and the app's
-//!    local-first privacy stance intact.
+//! 2. **Optional LLM** — the same compact numeric snapshot is sent either to an
+//!    OpenAI-compatible **API** (Responses / Chat Completions) or through a local
+//!    **CLI** (`grok` / `chatgpt`·`codex` / `opencode` / `claude`). Only
+//!    pre-computed metrics leave the machine (never raw K-lines), keeping tokens
+//!    small and the app's local-first privacy stance intact.
 //!
 //! The app always shows the local commentary first and upgrades it with the
 //! LLM result when configured; a failed LLM call falls back to the local text.
 
-use std::time::Duration;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -23,7 +26,71 @@ use crate::data::levels::{self, ReferenceLevels};
 use crate::data::signals;
 use crate::model::Candle;
 
-/// LLM protocol used when talking to the configured provider.
+/// How the optional LLM is invoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AiTransport {
+    /// HTTP API (OpenAI-compatible).
+    #[default]
+    Api,
+    /// Local CLI tool (uses the user's already-authenticated agent).
+    Cli,
+}
+
+impl AiTransport {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Api => "API",
+            Self::Cli => "CLI",
+        }
+    }
+
+    pub fn all() -> [Self; 2] {
+        [Self::Api, Self::Cli]
+    }
+}
+
+/// Local CLI backend when [`AiTransport::Cli`] is selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AiCliProvider {
+    /// xAI Grok Build (`grok`).
+    #[default]
+    Grok,
+    /// OpenAI ChatGPT / Codex (`chatgpt`, falls back to `codex`).
+    Chatgpt,
+    /// OpenCode (`opencode`).
+    Opencode,
+    /// Anthropic Claude Code (`claude`).
+    Claude,
+}
+
+impl AiCliProvider {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Grok => "Grok",
+            Self::Chatgpt => "ChatGPT",
+            Self::Opencode => "OpenCode",
+            Self::Claude => "Claude",
+        }
+    }
+
+    pub fn all() -> [Self; 4] {
+        [Self::Grok, Self::Chatgpt, Self::Opencode, Self::Claude]
+    }
+
+    /// Default executable names to search, in preference order.
+    pub fn default_bins(self) -> &'static [&'static str] {
+        match self {
+            Self::Grok => &["grok"],
+            Self::Chatgpt => &["chatgpt", "codex"],
+            Self::Opencode => &["opencode"],
+            Self::Claude => &["claude"],
+        }
+    }
+}
+
+/// LLM protocol used when talking to the configured API provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum AiKind {
@@ -64,11 +131,15 @@ fn default_max_tokens() -> u32 {
 }
 
 /// User-configurable LLM settings. The API key is stored only in the local
-/// config.json, never sent anywhere except the configured endpoint.
+/// config.json, never sent anywhere except the configured endpoint. CLI mode
+/// reuses the login state of the installed agent binary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// API HTTP vs local CLI.
+    #[serde(default)]
+    pub transport: AiTransport,
     #[serde(default)]
     pub kind: AiKind,
     #[serde(default = "default_base_url")]
@@ -81,28 +152,69 @@ pub struct AiConfig {
     pub timeout_secs: u64,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    /// Which local CLI to invoke when `transport == Cli`.
+    #[serde(default)]
+    pub cli_provider: AiCliProvider,
+    /// Optional absolute/relative path or bare name overriding the default binary.
+    #[serde(default)]
+    pub cli_bin: String,
 }
 
 impl Default for AiConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            transport: AiTransport::default(),
             kind: AiKind::default(),
             base_url: default_base_url(),
             model: default_model(),
             api_key: String::new(),
             timeout_secs: default_timeout_secs(),
             max_tokens: default_max_tokens(),
+            cli_provider: AiCliProvider::default(),
+            cli_bin: String::new(),
         }
     }
 }
 
 impl AiConfig {
+    /// Whether the optional LLM layer has enough settings to attempt a call.
     pub fn is_configured(&self) -> bool {
-        self.enabled
-            && !self.base_url.trim().is_empty()
-            && !self.model.trim().is_empty()
-            && !self.api_key.trim().is_empty()
+        if !self.enabled {
+            return false;
+        }
+        match self.transport {
+            AiTransport::Api => {
+                !self.base_url.trim().is_empty()
+                    && !self.model.trim().is_empty()
+                    && !self.api_key.trim().is_empty()
+            }
+            // Binary presence is checked at call time (PATH may differ from the UI process).
+            AiTransport::Cli => true,
+        }
+    }
+
+    /// Short label used in the AI panel / scout source line.
+    pub fn source_label(&self) -> String {
+        match self.transport {
+            AiTransport::Api => {
+                let m = self.model.trim();
+                if m.is_empty() {
+                    "LLM".into()
+                } else {
+                    format!("LLM · {m}")
+                }
+            }
+            AiTransport::Cli => {
+                let p = self.cli_provider.label();
+                let m = self.model.trim();
+                if m.is_empty() {
+                    format!("CLI · {p}")
+                } else {
+                    format!("CLI · {p} · {m}")
+                }
+            }
+        }
     }
 }
 
@@ -333,9 +445,47 @@ fn regime_sentence(regime: &str) -> &'static str {
 /// Request a commentary from the configured LLM. Only the compact snapshot is
 /// sent; the returned text is expected to be plain Chinese prose.
 pub fn llm_commentary(cfg: &AiConfig, snap: &AiSnapshot) -> Result<String> {
+    let body = serde_json::to_string(snap).context("序列化分析快照失败")?;
+    let user_prompt = format!(
+        "请基于以下本地计算好的 A 股技术面量化快照进行分析：\n```json\n{body}\n```\n\
+         要求：输出结构化中文点评，覆盖趋势 / 动量 / 量能 / 位置 / 风险；\
+         若快照含 levels（参考建仓带 buy_low–buy_high、减仓带 sell_low–sell_high），\
+         必须用「约 X–Y 元」明确写出参考买入观察价与减仓观察价，并说明仅为技术位、非买卖指令；\
+         不超过 450 字，不要编造快照之外的数据或新闻基本面，结尾必须包含“不构成投资建议”提示。"
+    );
+    llm_complete(cfg, SYSTEM_PROMPT, &user_prompt)
+}
+
+/// Generic completion used by stock commentary and scout summary.
+///
+/// Routes to the HTTP API or a local CLI based on [`AiConfig::transport`].
+pub fn llm_complete(cfg: &AiConfig, system: &str, user: &str) -> Result<String> {
     if !cfg.enabled {
         bail!("AI 分析未开启（设置 → AI 分析）");
     }
+    let out = match cfg.transport {
+        AiTransport::Api => api_complete(cfg, system, user)?,
+        AiTransport::Cli => cli_complete(cfg, system, user)?,
+    };
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        bail!("LLM 返回了空内容");
+    }
+    Ok(trimmed.to_string())
+}
+
+const SYSTEM_PROMPT: &str = "你是一名严谨的 A 股技术面分析助手。\
+你只会获得一份由本地程序计算好的量化快照 JSON（技术指标、形态特征与可选参考价位带，不含原始行情）。\
+请：1) 基于快照写一段客观、结构化的中文点评，覆盖趋势、动量、量能与风险；\
+2) 若有 levels 字段，用其中 buy_low/buy_high、sell_low/sell_high 给出「参考建仓带 / 参考减仓带」元价位，并强调只是技术观察位；\
+3) 指出这些数据仅代表技术面统计，不代表基本面；\
+4) 结尾必须包含“不构成投资建议”提示；\
+5) 全文不超过 450 字；\
+6) 不得编造快照之外的数据，数值必须与快照一致。";
+
+// ---- HTTP API --------------------------------------------------------------
+
+fn api_complete(cfg: &AiConfig, system: &str, user: &str) -> Result<String> {
     if cfg.api_key.trim().is_empty() {
         bail!("未配置 API Key（设置 → AI 分析）");
     }
@@ -347,15 +497,6 @@ pub fn llm_commentary(cfg: &AiConfig, snap: &AiSnapshot) -> Result<String> {
     if model.is_empty() {
         bail!("未配置模型名称（设置 → AI 分析）");
     }
-
-    let body = serde_json::to_string(snap).context("序列化分析快照失败")?;
-    let user_prompt = format!(
-        "请基于以下本地计算好的 A 股技术面量化快照进行分析：\n```json\n{body}\n```\n\
-         要求：输出结构化中文点评，覆盖趋势 / 动量 / 量能 / 位置 / 风险；\
-         若快照含 levels（参考建仓带 buy_low–buy_high、减仓带 sell_low–sell_high），\
-         必须用「约 X–Y 元」明确写出参考买入观察价与减仓观察价，并说明仅为技术位、非买卖指令；\
-         不超过 450 字，不要编造快照之外的数据或新闻基本面，结尾必须包含“不构成投资建议”提示。"
-    );
 
     let timeout = Duration::from_secs(cfg.timeout_secs.clamp(5, 120));
     let agent = ureq::AgentBuilder::new()
@@ -369,8 +510,8 @@ pub fn llm_commentary(cfg: &AiConfig, snap: &AiSnapshot) -> Result<String> {
             format!("{base}/responses"),
             serde_json::json!({
                 "model": model,
-                "instructions": SYSTEM_PROMPT,
-                "input": user_prompt,
+                "instructions": system,
+                "input": user,
                 "max_output_tokens": cfg.max_tokens,
             })
             .to_string(),
@@ -380,8 +521,8 @@ pub fn llm_commentary(cfg: &AiConfig, snap: &AiSnapshot) -> Result<String> {
             serde_json::json!({
                 "model": model,
                 "messages": [
-                    { "role": "system", "content": SYSTEM_PROMPT },
-                    { "role": "user", "content": user_prompt },
+                    { "role": "system", "content": system },
+                    { "role": "user", "content": user },
                 ],
                 "temperature": 0.3,
                 "max_tokens": cfg.max_tokens,
@@ -400,25 +541,11 @@ pub fn llm_commentary(cfg: &AiConfig, snap: &AiSnapshot) -> Result<String> {
         .into_string()
         .map_err(|e| anyhow!("读取 LLM 响应失败：{e}"))?;
 
-    let out = match cfg.kind {
-        AiKind::Responses => parse_responses(&text)?,
-        AiKind::Chat => parse_chat(&text)?,
-    };
-    let trimmed = out.trim();
-    if trimmed.is_empty() {
-        bail!("LLM 返回了空内容");
+    match cfg.kind {
+        AiKind::Responses => parse_responses(&text),
+        AiKind::Chat => parse_chat(&text),
     }
-    Ok(trimmed.to_string())
 }
-
-const SYSTEM_PROMPT: &str = "你是一名严谨的 A 股技术面分析助手。\
-你只会获得一份由本地程序计算好的量化快照 JSON（技术指标、形态特征与可选参考价位带，不含原始行情）。\
-请：1) 基于快照写一段客观、结构化的中文点评，覆盖趋势、动量、量能与风险；\
-2) 若有 levels 字段，用其中 buy_low/buy_high、sell_low/sell_high 给出「参考建仓带 / 参考减仓带」元价位，并强调只是技术观察位；\
-3) 指出这些数据仅代表技术面统计，不代表基本面；\
-4) 结尾必须包含“不构成投资建议”提示；\
-5) 全文不超过 450 字；\
-6) 不得编造快照之外的数据，数值必须与快照一致。";
 
 fn friendly_http_error(e: ureq::Error) -> anyhow::Error {
     match e {
@@ -492,6 +619,347 @@ fn extract_api_error(v: &serde_json::Value) -> Option<String> {
         .and_then(|e| e.get("message"))
         .and_then(|m| m.as_str())
         .map(|s| truncate(s, 200))
+}
+
+// ---- Local CLI -------------------------------------------------------------
+
+fn cli_complete(cfg: &AiConfig, system: &str, user: &str) -> Result<String> {
+    let bin = resolve_cli_bin(cfg)?;
+    // Agent CLIs are often slower than a raw HTTP call (auth / first token).
+    let timeout = Duration::from_secs(cfg.timeout_secs.clamp(60, 600));
+    let model = cfg.model.trim();
+    let model = if model.is_empty() { None } else { Some(model) };
+
+    match cfg.cli_provider {
+        AiCliProvider::Grok => run_grok(&bin, system, user, model, timeout),
+        AiCliProvider::Chatgpt => {
+            let name = bin
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if name == "codex" || name.starts_with("codex") {
+                run_codex(&bin, system, user, model, timeout)
+            } else {
+                run_chatgpt_generic(&bin, system, user, model, timeout)
+            }
+        }
+        AiCliProvider::Opencode => run_opencode(&bin, system, user, model, timeout),
+        AiCliProvider::Claude => run_claude(&bin, system, user, model, timeout),
+    }
+}
+
+fn resolve_cli_bin(cfg: &AiConfig) -> Result<PathBuf> {
+    let custom = cfg.cli_bin.trim();
+    if !custom.is_empty() {
+        let p = PathBuf::from(custom);
+        if p.is_file() {
+            return Ok(p);
+        }
+        if let Some(found) = which_bin(custom) {
+            return Ok(found);
+        }
+        bail!(
+            "找不到 CLI「{}」（请确认已安装，或在设置中填写绝对路径）",
+            custom
+        );
+    }
+    for name in cfg.cli_provider.default_bins() {
+        if let Some(found) = which_bin(name) {
+            return Ok(found);
+        }
+    }
+    let names = cfg.cli_provider.default_bins().join(" / ");
+    bail!(
+        "未找到 {} CLI（已搜索 {}；可安装后重试，或在设置中填写 CLI 路径）",
+        cfg.cli_provider.label(),
+        names
+    );
+}
+
+/// Locate an executable by bare name: `$PATH` first, then common install dirs
+/// (GUI apps on macOS often inherit a stripped PATH).
+fn which_bin(name: &str) -> Option<PathBuf> {
+    if name.contains('/') || name.contains('\\') {
+        let p = PathBuf::from(name);
+        return p.is_file().then_some(p);
+    }
+
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(name);
+            if is_executable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+
+    let mut dirs: Vec<PathBuf> = vec![
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/bin"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join(".grok/bin"));
+        dirs.push(home.join(".local/bin"));
+        dirs.push(home.join(".npm-global/bin"));
+        dirs.push(home.join("bin"));
+        dirs.push(home.join(".cargo/bin"));
+    }
+    for dir in dirs {
+        let candidate = dir.join(name);
+        if is_executable(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn is_executable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn combined_prompt(system: &str, user: &str) -> String {
+    format!("{system}\n\n---\n\n{user}")
+}
+
+fn write_temp_prompt(content: &str) -> Result<PathBuf> {
+    let path = std::env::temp_dir().join(format!(
+        "zstock-ai-{}-{}.txt",
+        std::process::id(),
+        Instant::now().elapsed().as_nanos()
+    ));
+    std::fs::write(&path, content).with_context(|| format!("写入临时提示失败：{}", path.display()))?;
+    Ok(path)
+}
+
+fn run_grok(
+    bin: &Path,
+    system: &str,
+    user: &str,
+    model: Option<&str>,
+    timeout: Duration,
+) -> Result<String> {
+    let prompt_file = write_temp_prompt(user)?;
+    let mut cmd = Command::new(bin);
+    cmd.arg("--prompt-file")
+        .arg(&prompt_file)
+        .arg("--output-format")
+        .arg("plain")
+        .arg("--system-prompt-override")
+        .arg(system)
+        .arg("--max-turns")
+        .arg("1")
+        .arg("--no-subagents")
+        .arg("--disable-web-search")
+        .arg("--permission-mode")
+        .arg("dontAsk");
+    if let Some(m) = model {
+        cmd.arg("-m").arg(m);
+    }
+    let result = run_command(cmd, timeout);
+    let _ = std::fs::remove_file(&prompt_file);
+    result
+}
+
+fn run_claude(
+    bin: &Path,
+    system: &str,
+    user: &str,
+    model: Option<&str>,
+    timeout: Duration,
+) -> Result<String> {
+    let mut cmd = Command::new(bin);
+    cmd.arg("-p")
+        .arg("--output-format")
+        .arg("text")
+        .arg("--system-prompt")
+        .arg(system)
+        // Empty tool set: pure completion, no interactive permission prompts.
+        .arg("--tools")
+        .arg("")
+        .arg("--bare")
+        .arg("--permission-mode")
+        .arg("dontAsk");
+    if let Some(m) = model {
+        cmd.arg("--model").arg(m);
+    }
+    cmd.arg("--").arg(user);
+    run_command(cmd, timeout)
+}
+
+fn run_opencode(
+    bin: &Path,
+    system: &str,
+    user: &str,
+    model: Option<&str>,
+    timeout: Duration,
+) -> Result<String> {
+    let prompt = combined_prompt(system, user);
+    let mut cmd = Command::new(bin);
+    cmd.arg("run").arg("--format").arg("default");
+    if let Some(m) = model {
+        cmd.arg("-m").arg(m);
+    }
+    // Positional message after options.
+    cmd.arg("--").arg(prompt);
+    run_command(cmd, timeout)
+}
+
+fn run_codex(
+    bin: &Path,
+    system: &str,
+    user: &str,
+    model: Option<&str>,
+    timeout: Duration,
+) -> Result<String> {
+    let prompt = combined_prompt(system, user);
+    let out_path = std::env::temp_dir().join(format!(
+        "zstock-codex-{}-{}.txt",
+        std::process::id(),
+        Instant::now().elapsed().as_nanos()
+    ));
+    let mut cmd = Command::new(bin);
+    cmd.arg("exec")
+        .arg("--ephemeral")
+        .arg("--skip-git-repo-check")
+        .arg("-s")
+        .arg("read-only")
+        .arg("-o")
+        .arg(&out_path);
+    if let Some(m) = model {
+        cmd.arg("-m").arg(m);
+    }
+    cmd.arg(prompt);
+    let run = run_command(cmd, timeout);
+    let file_out = std::fs::read_to_string(&out_path).ok();
+    let _ = std::fs::remove_file(&out_path);
+    match run {
+        Ok(stdout) => {
+            if let Some(text) = file_out.filter(|s| !s.trim().is_empty()) {
+                Ok(text)
+            } else {
+                Ok(stdout)
+            }
+        }
+        Err(e) => {
+            if let Some(text) = file_out.filter(|s| !s.trim().is_empty()) {
+                Ok(text)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Generic `chatgpt` (and similar) one-shot CLIs: pass the full prompt as the
+/// sole argument; optional `-m MODEL` when configured.
+fn run_chatgpt_generic(
+    bin: &Path,
+    system: &str,
+    user: &str,
+    model: Option<&str>,
+    timeout: Duration,
+) -> Result<String> {
+    let prompt = combined_prompt(system, user);
+    let mut cmd = Command::new(bin);
+    if let Some(m) = model {
+        cmd.arg("-m").arg(m);
+    }
+    cmd.arg(prompt);
+    run_command(cmd, timeout)
+}
+
+fn run_command(mut cmd: Command, timeout: Duration) -> Result<String> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("NO_COLOR", "1")
+        .env("TERM", "dumb")
+        // Avoid accidental interactive prompts when PATH-less GUI spawns shells.
+        .env("CI", "1");
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow!("启动 CLI 失败：{e}（请确认二进制在 PATH 中或已填写绝对路径）"))?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let out_handle = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(mut r) = stdout {
+            let _ = r.read_to_string(&mut s);
+        }
+        s
+    });
+    let err_handle = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(mut r) = stderr {
+            let _ = r.read_to_string(&mut s);
+        }
+        s
+    });
+
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = out_handle.join();
+                let _ = err_handle.join();
+                bail!("CLI 超时（{}s）", timeout.as_secs());
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(40)),
+            Err(e) => {
+                let _ = out_handle.join();
+                let _ = err_handle.join();
+                bail!("等待 CLI 失败：{e}");
+            }
+        }
+    };
+
+    let stdout = out_handle.join().unwrap_or_default();
+    let stderr = err_handle.join().unwrap_or_default();
+
+    if !status.success() {
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim()
+        } else {
+            stdout.trim()
+        };
+        let code = status.code().unwrap_or(-1);
+        if detail.is_empty() {
+            bail!("CLI 退出码 {code}");
+        }
+        bail!("CLI 退出码 {code}：{}", truncate(detail, 240));
+    }
+
+    let text = stdout.trim();
+    if text.is_empty() {
+        // Some CLIs print the answer to stderr in edge cases.
+        let err = stderr.trim();
+        if !err.is_empty() {
+            return Ok(err.to_string());
+        }
+        bail!("CLI 返回了空内容");
+    }
+    Ok(text.to_string())
 }
 
 // ---- pattern helpers -------------------------------------------------------
@@ -731,7 +1199,41 @@ mod tests {
         let cfg: AiConfig = serde_json::from_str("{}").unwrap();
         assert!(!cfg.enabled);
         assert_eq!(cfg.kind, AiKind::Responses);
+        assert_eq!(cfg.transport, AiTransport::Api);
+        assert_eq!(cfg.cli_provider, AiCliProvider::Grok);
+        assert!(cfg.cli_bin.is_empty());
         assert_eq!(cfg.timeout_secs, 30);
         assert!(!cfg.is_configured());
+    }
+
+    #[test]
+    fn cli_transport_is_configured_when_enabled() {
+        let mut cfg = AiConfig::default();
+        cfg.enabled = true;
+        cfg.transport = AiTransport::Cli;
+        cfg.model.clear();
+        assert!(cfg.is_configured());
+        assert_eq!(cfg.source_label(), "CLI · Grok");
+        cfg.model = "grok-4.5".into();
+        assert_eq!(cfg.source_label(), "CLI · Grok · grok-4.5");
+    }
+
+    #[test]
+    fn api_transport_requires_key_and_model() {
+        let mut cfg = AiConfig::default();
+        cfg.enabled = true;
+        cfg.transport = AiTransport::Api;
+        assert!(!cfg.is_configured());
+        cfg.api_key = "sk-test".into();
+        assert!(cfg.is_configured());
+        assert_eq!(cfg.source_label(), "LLM · gpt-5-mini");
+    }
+
+    #[test]
+    fn combined_prompt_joins_system_and_user() {
+        let p = combined_prompt("SYS", "USER");
+        assert!(p.contains("SYS"));
+        assert!(p.contains("USER"));
+        assert!(p.contains("---"));
     }
 }

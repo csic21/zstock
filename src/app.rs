@@ -25,7 +25,7 @@ use crate::chart::{
     chart_layout, index_from_x, paint_chart, paint_sparkline, price_from_y, BollPaintData,
     ChartPaintData, ChartStyle, MacdPaintData, MinutePaintData,
 };
-use crate::data::ai::{self, AiConfig, AiKind};
+use crate::data::ai::{self, AiCliProvider, AiConfig, AiKind, AiTransport};
 use crate::data::levels;
 use crate::data::scout::{self, ScoutPick, ScoutVerdict, SCOUT_CANDIDATE_N};
 use crate::data::treasure::{self, fmt_dd, fmt_pos, TreasureHit, TREASURE_KLINE_LIMIT};
@@ -274,8 +274,9 @@ enum AiPanelState {
 #[derive(Debug, Clone)]
 enum AiSource {
     Local,
+    /// Optional LLM / CLI result. `label` is the full source line (e.g. `LLM · gpt-5-mini` or `CLI · Grok`).
     Llm {
-        model: String,
+        label: String,
     },
 }
 
@@ -283,7 +284,7 @@ impl AiSource {
     fn label(&self, work: bool) -> SharedString {
         match self {
             Self::Local => shared(if work { "Local rules" } else { "本地规则" }),
-            Self::Llm { model } => shared(format!("LLM · {model}")),
+            Self::Llm { label } => shared(label.clone()),
         }
     }
 
@@ -426,6 +427,8 @@ pub struct StockApp {
     ai_base_url_input: Entity<InputState>,
     ai_model_input: Entity<InputState>,
     ai_api_key_input: Entity<InputState>,
+    /// Optional override path/name for the local AI CLI binary.
+    ai_cli_bin_input: Entity<InputState>,
     /// macOS menu bar: show live quotes for pinned watchlist codes.
     status_bar_enabled: bool,
     /// Codes pinned to the status bar menu (subset of watchlist, max 5).
@@ -479,6 +482,9 @@ impl StockApp {
                 .placeholder("sk-…")
                 .masked(true)
         });
+        let ai_cli_bin_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("可选：CLI 绝对路径，如 /opt/homebrew/bin/claude")
+        });
         ai_base_url_input.update(cx, |state, cx| {
             state.set_value(ai_cfg.base_url.clone(), window, cx);
         });
@@ -487,6 +493,9 @@ impl StockApp {
         });
         ai_api_key_input.update(cx, |state, cx| {
             state.set_value(ai_cfg.api_key.clone(), window, cx);
+        });
+        ai_cli_bin_input.update(cx, |state, cx| {
+            state.set_value(ai_cfg.cli_bin.clone(), window, cx);
         });
 
         let _subscriptions = vec![
@@ -520,6 +529,15 @@ impl StockApp {
                 move |this, state: &Entity<InputState>, event: &InputEvent, _window, cx| {
                     if matches!(event, InputEvent::Change) {
                         this.ai_config.api_key = state.read(cx).unmask_value().to_string();
+                        this.persist();
+                        cx.notify();
+                    }
+                }
+            }),
+            cx.subscribe_in(&ai_cli_bin_input, window, {
+                move |this, state: &Entity<InputState>, event: &InputEvent, _window, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        this.ai_config.cli_bin = state.read(cx).value().to_string();
                         this.persist();
                         cx.notify();
                     }
@@ -645,6 +663,7 @@ impl StockApp {
             ai_base_url_input,
             ai_model_input,
             ai_api_key_input,
+            ai_cli_bin_input,
             status_bar_enabled,
             status_bar_codes,
             status_bar_active,
@@ -1969,7 +1988,7 @@ impl StockApp {
         self.ai_gen = self.ai_gen.wrapping_add(1);
         let req_id = self.ai_gen;
         let cfg = self.ai_config.clone();
-        let llm_model = cfg.model.clone();
+        let source_label = cfg.source_label();
         cx.spawn(async move |this, cx| {
             let res = smol::unblock(move || ai::llm_commentary(&cfg, &snap)).await;
             let _ = this.update(cx, |app, cx| {
@@ -1979,7 +1998,7 @@ impl StockApp {
                 match res {
                     Ok(text) if !text.trim().is_empty() => {
                         let source = AiSource::Llm {
-                            model: llm_model.clone(),
+                            label: source_label.clone(),
                         };
                         app.ai_cache.insert(
                             cache_key.clone(),
@@ -2030,6 +2049,24 @@ impl StockApp {
             return;
         }
         self.ai_config.kind = kind;
+        self.persist();
+        cx.notify();
+    }
+
+    fn set_ai_transport(&mut self, transport: AiTransport, cx: &mut Context<Self>) {
+        if self.ai_config.transport == transport {
+            return;
+        }
+        self.ai_config.transport = transport;
+        self.persist();
+        cx.notify();
+    }
+
+    fn set_ai_cli_provider(&mut self, provider: AiCliProvider, cx: &mut Context<Self>) {
+        if self.ai_config.cli_provider == provider {
+            return;
+        }
+        self.ai_config.cli_provider = provider;
         self.persist();
         cx.notify();
     }
@@ -2695,7 +2732,7 @@ impl StockApp {
 
             let picks_for_llm = picks.clone();
             let cfg = ai_cfg;
-            let llm_model = cfg.model.clone();
+            let source_label = cfg.source_label();
             let res = smol::unblock(move || scout::llm_summary(&cfg, &picks_for_llm)).await;
 
             let _ = this.update(cx, |app, cx| {
@@ -2711,7 +2748,7 @@ impl StockApp {
                 match res {
                     Ok(text) if !text.trim().is_empty() => {
                         app.scout_summary = shared(text);
-                        app.scout_source = shared(format!("LLM · {llm_model}"));
+                        app.scout_source = shared(source_label.clone());
                         app.status = shared(format!(
                             "🎯 可关注 {buy_n} / 共 {} · LLM",
                             app.scout_picks.len()
@@ -4218,39 +4255,98 @@ impl StockApp {
                         }),
                 )
                 .child(
-                    h_flex().gap_1().flex_wrap().children(self.symbols.iter().map(|sym| {
-                        let code = sym.code.clone();
-                        let is_pinned = pinned.iter().any(|c| c == &code);
-                        let label = if work {
-                            disguise_label(&sym.code, sym.name.as_ref())
-                        } else if is_real_name(sym.name.as_ref(), &sym.code) {
-                            format!(
-                                "{} {}",
-                                short_status_name(sym.name.as_ref(), &sym.code),
-                                sym.code
-                            )
-                        } else {
-                            sym.code.clone()
-                        };
-                        let btn_id = format!("sb-pin-{}", sym.code);
-                        Button::new(SharedString::from(btn_id))
-                            .xsmall()
-                            .when(is_pinned, |b| b.primary())
-                            .when(!is_pinned, |b| b.ghost())
-                            .label(label)
-                            .on_click(cx.listener(move |this, _, _w, cx| {
-                                this.toggle_status_bar_code(&code, cx);
-                            }))
-                    })),
+                    // Vertical list: name (left) + code (muted) + pin state.
+                    // Horizontal wrap chips looked cramped and double-coded ETFs.
+                    v_flex()
+                        .gap_0()
+                        .max_w(px(480.))
+                        .border_1()
+                        .border_color(cx.theme().border.opacity(0.5))
+                        .rounded(px(6.))
+                        .overflow_hidden()
+                        .children(self.symbols.iter().enumerate().map(|(ix, sym)| {
+                            let code = sym.code.clone();
+                            let is_pinned = pinned.iter().any(|c| c == &code);
+                            let name_raw = sym.name.as_ref();
+                            let (name_show, code_show) = if work {
+                                (
+                                    disguise_label(&sym.code, name_raw),
+                                    String::new(),
+                                )
+                            } else if is_real_name(name_raw, &sym.code) {
+                                (
+                                    short_status_name(name_raw, &sym.code),
+                                    sym.code.clone(),
+                                )
+                            } else {
+                                (sym.code.clone(), String::new())
+                            };
+                            let pin_hint = if work {
+                                if is_pinned { "pinned" } else { "pin" }
+                            } else if is_pinned {
+                                "已固定"
+                            } else {
+                                "固定"
+                            };
+                            let row_id = SharedString::from(format!("sb-pin-{}", sym.code));
+                            div()
+                                .id(row_id)
+                                .w_full()
+                                .h(px(32.))
+                                .px_3()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .cursor_pointer()
+                                .when(ix > 0, |r| {
+                                    r.border_t_1()
+                                        .border_color(cx.theme().border.opacity(0.35))
+                                })
+                                .when(is_pinned, |r| {
+                                    r.bg(cx.theme().accent.opacity(0.16))
+                                })
+                                .hover(|r| r.bg(cx.theme().accent.opacity(0.10)))
+                                .on_click(cx.listener(move |this, _, _w, cx| {
+                                    this.toggle_status_bar_code(&code, cx);
+                                }))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_sm()
+                                        .font_semibold()
+                                        .text_color(cx.theme().foreground)
+                                        .child(name_show),
+                                )
+                                .when(!code_show.is_empty(), |r| {
+                                    r.child(
+                                        div()
+                                            .text_xs()
+                                            .font_family("Menlo")
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(code_show),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(if is_pinned {
+                                            cx.theme().accent_foreground
+                                        } else {
+                                            cx.theme().muted_foreground.opacity(0.8)
+                                        })
+                                        .child(pin_hint),
+                                )
+                        })),
                 )
                 .child(
                     div()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground.opacity(0.75))
                         .child(if work {
-                            "Primary = pinned (shown) · Ghost = not pinned."
+                            "Highlighted = pinned (shown in menu bar) · click to toggle."
                         } else {
-                            "主色 = 已固定并显示 · 幽灵 = 未固定。可多选。"
+                            "高亮 = 已固定并显示在菜单栏 · 点击切换。可多选。"
                         }),
                 )
             })
@@ -4545,7 +4641,9 @@ impl StockApp {
     }
 
     fn render_settings_ai(&self, work: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
+        let use_cli = self.ai_config.transport == AiTransport::Cli;
+
+        let mut col = v_flex()
             .gap_3()
             .max_w(px(640.))
             .child(
@@ -4560,9 +4658,9 @@ impl StockApp {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground.opacity(0.9))
                     .child(if work {
-                        "Optional LLM brief for the selected stock. Falls back to local rules when disabled or offline."
+                        "Optional LLM brief via API or local CLI (grok / chatgpt·codex / opencode / claude). Falls back to local rules when disabled or offline."
                     } else {
-                        "为当前标的生成 AI 点评；未开启或请求失败时自动使用本地规则点评。"
+                        "为当前标的生成 AI 点评；支持 API 或本地 CLI（Grok / ChatGPT·Codex / OpenCode / Claude）；未开启或请求失败时自动使用本地规则点评。"
                     }),
             )
             .child(
@@ -4590,87 +4688,186 @@ impl StockApp {
                     ),
             )
             .child(
-                h_flex().gap_1().children(AiKind::all().map(|kind| {
-                    let active = self.ai_config.kind == kind;
-                    let id = match kind {
-                        AiKind::Responses => "ai-kind-responses",
-                        AiKind::Chat => "ai-kind-chat",
-                    };
-                    Button::new(id)
-                        .xsmall()
-                        .when(active, |b| b.primary())
-                        .when(!active, |b| b.ghost())
-                        .label(kind.label())
-                        .on_click(cx.listener(move |this, _, _w, cx| {
-                            this.set_ai_kind(kind, cx);
-                        }))
-                })),
-            )
-            .child(
                 v_flex()
                     .gap_1()
                     .child(
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(if work { "Base URL" } else { "API 地址" }),
+                            .child(if work { "Transport" } else { "调用方式" }),
                     )
-                    .child(Input::new(&self.ai_base_url_input).small()),
-            )
-            .child(
-                v_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(if work { "Model" } else { "模型" }),
-                    )
-                    .child(Input::new(&self.ai_model_input).small()),
-            )
-            .child(
-                v_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(if work { "API key" } else { "API Key" }),
-                    )
-                    .child(Input::new(&self.ai_api_key_input).small().mask_toggle()),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground.opacity(0.75))
-                    .child(if work {
-                        "Key stays in local config.json. Only the computed metric snapshot is sent to the endpoint."
-                    } else {
-                        "Key 仅保存在本机 config.json；只上传本地算好的指标快照，不上传原始行情。"
-                    }),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(if self.ai_config.enabled {
-                        if self.ai_config.is_configured() {
-                            if work {
-                                "Enabled · configured."
-                            } else {
-                                "已开启 · 配置完整。"
-                            }
-                        } else if work {
-                            "Enabled · missing base URL / model / key."
+                    .child(h_flex().gap_1().children(AiTransport::all().map(|t| {
+                        let active = self.ai_config.transport == t;
+                        let id = match t {
+                            AiTransport::Api => "ai-transport-api",
+                            AiTransport::Cli => "ai-transport-cli",
+                        };
+                        Button::new(id)
+                            .xsmall()
+                            .when(active, |b| b.primary())
+                            .when(!active, |b| b.ghost())
+                            .label(t.label())
+                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                this.set_ai_transport(t, cx);
+                            }))
+                    }))),
+            );
+
+        if use_cli {
+            col = col
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if work { "CLI" } else { "CLI 工具" }),
+                        )
+                        .child(h_flex().gap_1().children(AiCliProvider::all().map(|p| {
+                            let active = self.ai_config.cli_provider == p;
+                            let id = match p {
+                                AiCliProvider::Grok => "ai-cli-grok",
+                                AiCliProvider::Chatgpt => "ai-cli-chatgpt",
+                                AiCliProvider::Opencode => "ai-cli-opencode",
+                                AiCliProvider::Claude => "ai-cli-claude",
+                            };
+                            Button::new(id)
+                                .xsmall()
+                                .when(active, |b| b.primary())
+                                .when(!active, |b| b.ghost())
+                                .label(p.label())
+                                .on_click(cx.listener(move |this, _, _w, cx| {
+                                    this.set_ai_cli_provider(p, cx);
+                                }))
+                        }))),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if work {
+                                    "Model (optional)"
+                                } else {
+                                    "模型（可选，留空用 CLI 默认）"
+                                }),
+                        )
+                        .child(Input::new(&self.ai_model_input).small()),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if work {
+                                    "CLI path (optional)"
+                                } else {
+                                    "CLI 路径（可选，默认搜 PATH）"
+                                }),
+                        )
+                        .child(Input::new(&self.ai_cli_bin_input).small()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground.opacity(0.75))
+                        .child(if work {
+                            "Uses your already-logged-in CLI (grok / chatgpt or codex / opencode / claude). Only the metric snapshot is sent as the prompt."
                         } else {
-                            "已开启 · 尚未填全 API 地址 / 模型 / Key。"
+                            "使用本机已登录的 CLI（Grok / ChatGPT 或 Codex / OpenCode / Claude）。只把指标快照作为提示词传入，不上传原始行情。"
+                        }),
+                );
+        } else {
+            col = col
+                .child(
+                    h_flex().gap_1().children(AiKind::all().map(|kind| {
+                        let active = self.ai_config.kind == kind;
+                        let id = match kind {
+                            AiKind::Responses => "ai-kind-responses",
+                            AiKind::Chat => "ai-kind-chat",
+                        };
+                        Button::new(id)
+                            .xsmall()
+                            .when(active, |b| b.primary())
+                            .when(!active, |b| b.ghost())
+                            .label(kind.label())
+                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                this.set_ai_kind(kind, cx);
+                            }))
+                    })),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if work { "Base URL" } else { "API 地址" }),
+                        )
+                        .child(Input::new(&self.ai_base_url_input).small()),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if work { "Model" } else { "模型" }),
+                        )
+                        .child(Input::new(&self.ai_model_input).small()),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if work { "API key" } else { "API Key" }),
+                        )
+                        .child(Input::new(&self.ai_api_key_input).small().mask_toggle()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground.opacity(0.75))
+                        .child(if work {
+                            "Key stays in local config.json. Only the computed metric snapshot is sent to the endpoint."
+                        } else {
+                            "Key 仅保存在本机 config.json；只上传本地算好的指标快照，不上传原始行情。"
+                        }),
+                );
+        }
+
+        col.child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(if self.ai_config.enabled {
+                    if self.ai_config.is_configured() {
+                        if work {
+                            format!("Enabled · {}", self.ai_config.source_label())
+                        } else {
+                            format!("已开启 · {}", self.ai_config.source_label())
                         }
                     } else if work {
-                        "Disabled · local rules only."
+                        "Enabled · missing base URL / model / key.".to_string()
                     } else {
-                        "未开启 · 仅使用本地点评。"
-                    }),
-            )
+                        "已开启 · 尚未填全 API 地址 / 模型 / Key。".to_string()
+                    }
+                } else if work {
+                    "Disabled · local rules only.".to_string()
+                } else {
+                    "未开启 · 仅使用本地点评。".to_string()
+                }),
+        )
     }
 
     fn render_settings_about(&self, work: bool, cx: &mut Context<Self>) -> impl IntoElement {
@@ -8009,21 +8206,70 @@ fn display_name_str(name: &str, code: &str) -> String {
     }
 }
 
-/// Compact label for the macOS menu bar (space is tight).
-fn short_status_name(name: &str, code: &str) -> String {
-    if is_real_name(name, code) {
-        let n = name.trim();
-        // Prefer short Chinese names; fall back to code for long titles.
-        let chars: Vec<char> = n.chars().collect();
-        if chars.len() <= 4 {
-            n.to_string()
-        } else if chars.len() <= 6 {
-            n.to_string()
-        } else {
-            code.to_string()
+/// Strip common fund/ETF suffixes so long names can be shortened cleanly.
+/// e.g. `华泰柏瑞沪深300ETF` → `华泰柏瑞沪深300`
+fn strip_fund_suffix(name: &str) -> &str {
+    let n = name.trim();
+    for suffix in ["ETF联接", "ETF", "LOF", "基金"] {
+        if let Some(rest) = n.strip_suffix(suffix) {
+            let rest = rest.trim_end();
+            if !rest.is_empty() {
+                return rest;
+            }
         }
+    }
+    n
+}
+
+/// Compact label for the macOS menu bar (space is tight).
+/// Keeps a real Chinese/name fragment even for long ETF titles — never
+/// collapses a known name to the bare code (that produced `588710 588710`).
+fn short_status_name(name: &str, code: &str) -> String {
+    if !is_real_name(name, code) {
+        return code.to_string();
+    }
+    let n = strip_fund_suffix(name);
+    let chars: Vec<char> = n.chars().collect();
+    // ≤6: show full (most stocks + short fund nicknames).
+    // Longer: keep first 4 chars (e.g. 华泰柏瑞沪深300 → 华泰柏瑞).
+    if chars.len() <= 6 {
+        n.to_string()
     } else {
-        code.to_string()
+        chars.into_iter().take(4).collect()
+    }
+}
+
+#[cfg(test)]
+mod name_label_tests {
+    use super::{is_real_name, short_status_name, strip_fund_suffix};
+
+    #[test]
+    fn strip_etf_suffix() {
+        assert_eq!(strip_fund_suffix("华泰柏瑞沪深300ETF"), "华泰柏瑞沪深300");
+        assert_eq!(strip_fund_suffix("科创板50ETF"), "科创板50");
+        assert_eq!(strip_fund_suffix("比亚迪"), "比亚迪");
+    }
+
+    #[test]
+    fn short_name_keeps_etf_fragment() {
+        // Long ETF names must NOT collapse to bare code (was: "588710 588710").
+        let s = short_status_name("华泰柏瑞沪深300ETF", "510300");
+        assert_ne!(s, "510300");
+        assert!(s.chars().count() <= 6);
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn short_name_keeps_stock() {
+        assert_eq!(short_status_name("比亚迪", "002594"), "比亚迪");
+        assert_eq!(short_status_name("贵州茅台", "600519"), "贵州茅台");
+    }
+
+    #[test]
+    fn missing_name_falls_back_to_code() {
+        assert_eq!(short_status_name("", "588710"), "588710");
+        assert_eq!(short_status_name("588710", "588710"), "588710");
+        assert!(!is_real_name("588710", "588710"));
     }
 }
 
