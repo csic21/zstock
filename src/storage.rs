@@ -134,6 +134,9 @@ pub struct AppConfig {
     /// Work mode: neutral copy + muted up/down colors (in-app toggle).
     #[serde(default)]
     pub work_mode: bool,
+    /// Work-mode private service nicknames (`code` → alias). Never shown as stock ids.
+    #[serde(default)]
+    pub work_aliases: std::collections::HashMap<String, String>,
     /// Quote poll interval in seconds (clamped 1..=120). Default 1.
     #[serde(default = "default_quote_interval_secs")]
     pub quote_interval_secs: u64,
@@ -225,6 +228,7 @@ impl Default for AppConfig {
             bottom_height: 168.0,
             color_scheme: ColorScheme::Cn,
             work_mode: false,
+            work_aliases: std::collections::HashMap::new(),
             quote_interval_secs: default_quote_interval_secs(),
             watchlist_sort: WatchlistSort::Manual,
             ai_api: AiConfig::default(),

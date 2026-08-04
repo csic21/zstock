@@ -357,6 +357,49 @@ impl StockApp {
                                     ),
                             ),
                     )
+                    .when(self.work_alias_editing, |col| {
+                        col.child(
+                            h_flex()
+                                .h(px(36.))
+                                .flex_shrink_0()
+                                .px_3()
+                                .gap_2()
+                                .items_center()
+                                .border_b_1()
+                                .border_color(cx.theme().border.opacity(0.5))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("tag"),
+                                )
+                                .child(
+                                    div().flex_1().child(
+                                        Input::new(&self.work_alias_input)
+                                            .small()
+                                            .cleanable(true),
+                                    ),
+                                )
+                                .child(
+                                    Button::new("work-alias-save")
+                                        .xsmall()
+                                        .primary()
+                                        .label("Save")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.commit_work_alias(window, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("work-alias-cancel")
+                                        .xsmall()
+                                        .ghost()
+                                        .label("Esc")
+                                        .on_click(cx.listener(|this, _, _w, cx| {
+                                            this.cancel_work_alias_edit(cx);
+                                        })),
+                                ),
+                        )
+                    })
                     .child(
                         div()
                             .id("work-spark")

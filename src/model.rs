@@ -17,6 +17,25 @@ pub fn disguise_label(code: &str, _name: &str) -> String {
     format!("{group}-{instance:03x}")
 }
 
+/// Sanitize a user-chosen work-mode nickname.
+///
+/// Returns `None` when the input is empty (caller should clear the alias).
+/// Keeps ASCII letters/digits plus `-_./`, max 24 chars — looks like a service
+/// id, not a ticker.
+pub fn sanitize_work_alias(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+        .take(24)
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
 fn fnv1a32(bytes: &[u8]) -> u32 {
     let mut hash: u32 = 0x811c_9dc5;
     for &b in bytes {
@@ -28,7 +47,7 @@ fn fnv1a32(bytes: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod disguise_tests {
-    use super::disguise_label;
+    use super::{disguise_label, sanitize_work_alias};
 
     #[test]
     fn alias_is_stable_and_does_not_leak_identity() {
@@ -37,6 +56,22 @@ mod disguise_tests {
         assert!(!alias.contains("600519"));
         assert!(!alias.contains("gzmt"));
         assert_ne!(alias, disguise_label("000001", "平安银行"));
+    }
+
+    #[test]
+    fn sanitize_work_alias_accepts_service_like_names() {
+        assert_eq!(
+            sanitize_work_alias("  core-db_v2  ").as_deref(),
+            Some("core-db_v2")
+        );
+        assert_eq!(sanitize_work_alias("edge/cdn").as_deref(), Some("edge/cdn"));
+        assert_eq!(sanitize_work_alias("   ").as_deref(), None);
+        assert_eq!(
+            sanitize_work_alias("茅台600519!!!").as_deref(),
+            Some("600519")
+        );
+        let long = "a".repeat(40);
+        assert_eq!(sanitize_work_alias(&long).unwrap().len(), 24);
     }
 }
 

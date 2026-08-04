@@ -79,14 +79,39 @@ impl StockApp {
                                 Button::new("work-identity-map")
                                     .ghost()
                                     .xsmall()
-                                    .label(if self.work_identity_reveal { "Hide" } else { "Map" })
-                                    .tooltip(if self.work_identity_reveal {
-                                        "Hide stock identity mapping"
+                                    .when(self.work_identity_map_latched, |b| b.primary())
+                                    .when(!self.work_identity_map_latched, |b| b.ghost())
+                                    .label(if self.work_identity_map_latched {
+                                        "Hide"
                                     } else {
-                                        "Temporarily map services to stock names and codes"
+                                        "Map"
+                                    })
+                                    .tooltip(if self.work_identity_map_latched {
+                                        "Hide identity · auto-hides in ~6s · hold ` or Space to peek"
+                                    } else {
+                                        "Latch identity map (~6s) · hold ` or Space to peek"
                                     })
                                     .on_click(cx.listener(|this, _, _w, cx| {
                                         this.toggle_work_identity(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("work-alias-tag")
+                                    .ghost()
+                                    .xsmall()
+                                    .when(self.work_alias_editing, |b| b.primary())
+                                    .label(if self.work_alias_editing { "Save" } else { "Tag" })
+                                    .tooltip(if self.work_alias_editing {
+                                        "Save private service tag · Enter · Esc cancel"
+                                    } else {
+                                        "Set a private nickname for the selected service"
+                                    })
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        if this.work_alias_editing {
+                                            this.commit_work_alias(window, cx);
+                                        } else {
+                                            this.start_work_alias_edit(window, cx);
+                                        }
                                     })),
                             )
                         })
@@ -597,9 +622,9 @@ impl StockApp {
                             .text_xs()
                             .text_color(cx.theme().muted_foreground.opacity(0.9))
                             .child(if work {
-                                "Metrics dashboard + neutral chrome. Toggle with ⌘⇧W."
+                                "Full-page metrics dashboard with neutral chrome. Looks like a service monitor; quotes stay readable under the skin."
                             } else {
-                                "服务指标台 + 中性文案。快捷键 ⌘⇧W。"
+                                "整页服务监控台 + 中性文案。外人看像运维面板，你自己仍能读行情。"
                             }),
                     )
                     .child(
@@ -625,7 +650,248 @@ impl StockApp {
                                         this.set_work_mode(true, window, cx);
                                     })),
                             ),
+                    )
+                    .child(self.render_work_mode_help(work, cx)),
+            )
+    }
+
+    /// Full keyboard map + Focus/work-mode field legend (settings help panel).
+    fn render_work_mode_help(&self, work: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let border = cx.theme().border;
+        let muted = cx.theme().muted_foreground;
+        let fg = cx.theme().foreground;
+        let bg = cx.theme().muted.opacity(0.35);
+
+        // Global app shortcuts (mirror README / bind_keys).
+        let app_shortcuts: &[(&str, &str, &str)] = if work {
+            &[
+                ("⌘K / Ctrl+K", "Command palette", "Search or add symbols · ↑↓ · Enter"),
+                ("⌘P / Ctrl+P", "Command palette", "Same as ⌘K"),
+                ("⌘, / Ctrl+,", "Settings", "This page (interval · colors · Focus)"),
+                ("⌘R / Ctrl+R", "Refresh", "Quotes + current series"),
+                ("⌘T / Ctrl+T", "Treasure tab", "Toggle watchlist / treasure (hidden in Focus)"),
+                ("⌘⇧W / Ctrl+Shift+W", "Focus layout", "Service monitor skin · window title Notes"),
+                ("↑ / ↓  or  k / j", "Prev / next symbol", "Watchlist navigation (disabled while typing)"),
+                ("Backspace / Delete", "Remove symbol", "Drop selected from watchlist (min 1)"),
+                ("0  or  double-click chart", "Reset zoom", "Restore full candle window"),
+                ("Esc", "Dismiss overlay", "Close palette · settings · Tag edit · draw mode"),
+                ("⌘Q / Alt+F4", "Quit", "Exit the app"),
+            ]
+        } else {
+            &[
+                ("⌘K / Ctrl+K", "命令面板", "搜索 / 添加自选 · ↑↓ 选择 · Enter 确认"),
+                ("⌘P / Ctrl+P", "命令面板", "与 ⌘K 相同"),
+                ("⌘, / Ctrl+,", "设置", "本页（刷新间隔 · 涨跌色 · 工作模式）"),
+                ("⌘R / Ctrl+R", "刷新", "行情 + 当前 K 线 / 分时"),
+                ("⌘T / Ctrl+T", "寻宝鼠", "左侧在「自选 / 寻宝」间切换（工作模式下无效）"),
+                ("⌘⇧W / Ctrl+Shift+W", "工作模式", "服务监控台皮肤 · 窗口标题 Notes"),
+                ("↑ / ↓  或  k / j", "上一只 / 下一只", "自选切换（输入框聚焦时不触发）"),
+                ("Backspace / Delete", "删除自选", "移除当前选中（至少保留 1 只）"),
+                ("0  或  图表双击", "重置缩放", "K 线缩放/平移恢复全览"),
+                ("Esc", "关闭浮层", "命令面板 · 设置 · Tag 编辑 · 画线模式"),
+                ("⌘Q / Alt+F4", "退出", "退出应用"),
+            ]
+        };
+
+        let focus_shortcuts: &[(&str, &str, &str)] = if work {
+            &[
+                ("` or Space (hold)", "Peek identity", "Show real names while held; release to cloak"),
+                ("Map / Hide", "Latch identity ~6s", "Title-bar; auto-hides so Map is not left open"),
+                ("Tag", "Private nickname", "Name the selected service; empty + Save clears; local config"),
+                ("Find", "Command palette", "Same as ⌘K under Focus chrome"),
+                ("Sync", "Refresh", "Same as ⌘R"),
+            ]
+        } else {
+            &[
+                ("` 或 Space（按住）", "窥视真身份", "按住显示代码/名称，松手立刻恢复伪装"),
+                ("Map / Hide", "锁定约 6 秒", "标题栏按钮；超时自动 Hide，避免忘记关掉"),
+                ("Tag", "私有服务昵称", "给当前选中起助记名；清空保存即删除；写入本地 config"),
+                ("Find", "命令面板", "工作模式标题栏，等同 ⌘K"),
+                ("Sync", "刷新", "工作模式标题栏，等同 ⌘R"),
+            ]
+        };
+
+        let fields: &[(&str, &str)] = if work {
+            &[
+                ("service", "Stable alias or your Tag (not the ticker)"),
+                ("p50", "Last price (shown as latency ms)"),
+                ("drift", "Day change %"),
+                ("load", "Relative volume vs busiest row"),
+                ("health", "Strategy score + state (optimal / degraded…)"),
+                ("cpu / mem / disk", "SSE / CSI 300 / ChiNext index points"),
+                ("process cpu / rss", "Abs change heat / volume-sized memory"),
+                ("window title", "Notes"),
+            ]
+        } else {
+            &[
+                ("service", "稳定伪装名，或你设的 Tag（不是股票代码）"),
+                ("p50", "现价（伪装成延迟 ms）"),
+                ("drift", "涨跌幅 %"),
+                ("load", "相对成交量（相对最活跃那只）"),
+                ("health", "策略评分 + 状态（optimal / degraded…）"),
+                ("cpu / mem / disk", "上证 / 沪深300 / 创业板点位"),
+                ("process cpu / rss", "波动热度 / 量能伪装的内存占用"),
+                ("窗口标题", "Notes"),
+            ]
+        };
+
+        let tips: &[&str] = if work {
+            &[
+                "Plain keys (↑↓ j k 0 Backspace) yield to focused text fields.",
+                "Default Focus view never shows stock codes or Chinese quote jargon.",
+                "Prefer hold-to-peek over leaving Map latched; hover still shows a temporary tip.",
+                "Tags are private local mnemonics; unset rows fall back to the hash alias.",
+            ]
+        } else {
+            &[
+                "纯按键（↑↓ j k 0 Backspace）在输入框聚焦时让位，不会误删/切股。",
+                "工作模式默认不出现股票代码与行情黑话。",
+                "日常更推荐按住窥视，而不是长期开着 Map；悬停行仍可短暂看到真身份。",
+                "Tag 只存在本机；未设置时仍用 hash 伪装名。",
+            ]
+        };
+
+        let row = |key: &'static str, title: &'static str, desc: &'static str| {
+            h_flex()
+                .w_full()
+                .gap_2()
+                .items_start()
+                .child(
+                    div()
+                        .min_w(px(168.))
+                        .max_w(px(200.))
+                        .text_xs()
+                        .font_semibold()
+                        .text_color(fg)
+                        .child(key),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().text_xs().text_color(fg).child(title))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted.opacity(0.9))
+                                .child(desc),
+                        ),
+                )
+        };
+
+        v_flex()
+            .mt_1()
+            .gap_3()
+            .p_3()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(border)
+            .bg(bg)
+            .child(
+                div()
+                    .text_xs()
+                    .font_semibold()
+                    .text_color(fg)
+                    .child(if work {
+                        "Shortcuts & features"
+                    } else {
+                        "快捷键与功能说明"
+                    }),
+            )
+            .child(
+                v_flex()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(muted)
+                            .child(if work {
+                                "App shortcuts"
+                            } else {
+                                "全局快捷键"
+                            }),
+                    )
+                    .children(
+                        app_shortcuts
+                            .iter()
+                            .map(|(key, title, desc)| row(key, title, desc)),
                     ),
+            )
+            .child(
+                v_flex()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(muted)
+                            .child(if work {
+                                "Focus layout"
+                            } else {
+                                "工作模式专用"
+                            }),
+                    )
+                    .children(
+                        focus_shortcuts
+                            .iter()
+                            .map(|(key, title, desc)| row(key, title, desc)),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(muted)
+                            .child(if work {
+                                "Field map (skin → real)"
+                            } else {
+                                "字段对照（伪装 → 真实）"
+                            }),
+                    )
+                    .children(fields.iter().map(|(field, meaning)| {
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .items_start()
+                            .child(
+                                div()
+                                    .min_w(px(120.))
+                                    .max_w(px(140.))
+                                    .text_xs()
+                                    .font_semibold()
+                                    .text_color(fg)
+                                    .child(*field),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .text_color(muted.opacity(0.95))
+                                    .child(*meaning),
+                            )
+                    })),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(muted)
+                            .child(if work { "Tips" } else { "使用提示" }),
+                    )
+                    .children(tips.iter().map(|line| {
+                        div()
+                            .text_xs()
+                            .text_color(muted.opacity(0.9))
+                            .child(format!("· {line}"))
+                    })),
             )
     }
 

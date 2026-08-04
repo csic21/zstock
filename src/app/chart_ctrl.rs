@@ -292,7 +292,7 @@ impl StockApp {
         })
     }
 
-    /// Display id: real code, or stable camouflage label in work mode.
+    /// Display id: real code, or stable camouflage / private nickname in work mode.
     pub(crate) fn display_code(&self, code: &str) -> String {
         if self.work_mode {
             let name = self
@@ -307,6 +307,8 @@ impl StockApp {
                 } else {
                     code.to_string()
                 }
+            } else if let Some(alias) = self.work_aliases.get(code) {
+                alias.clone()
             } else {
                 disguise_label(code, name)
             }

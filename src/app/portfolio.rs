@@ -83,6 +83,7 @@ impl StockApp {
             bottom_height: self.bottom_height,
             color_scheme: self.color_scheme,
             work_mode: self.work_mode,
+            work_aliases: self.work_aliases.clone(),
             quote_interval_secs: self.quote_interval_secs,
             watchlist_sort: self.watchlist_sort,
             ai_api: self.ai_config.clone(),
@@ -165,6 +166,10 @@ impl StockApp {
     }
 
     pub(crate) fn dismiss_overlay(&mut self, cx: &mut Context<Self>) {
+        if self.work_alias_editing {
+            self.cancel_work_alias_edit(cx);
+            return;
+        }
         if self.palette_open {
             self.palette_open = false;
             cx.notify();

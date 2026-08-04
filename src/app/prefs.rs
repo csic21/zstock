@@ -43,8 +43,8 @@ use crate::data::market::Sourced;
 use crate::data::session::{filter_codes_in_session, idle_delay_secs, open_markets_now, MarketSet};
 use crate::model::{
     board_for_code, disguise_index, disguise_label, format_index, format_pct, format_price,
-    format_volume, normalize_code, shared, Candle, IndexSnap, MinutePeriod, MinuteSeries,
-    QuoteSnapshot, Symbol, TrendLine,
+    format_volume, normalize_code, sanitize_work_alias, shared, Candle, IndexSnap, MinutePeriod,
+    MinuteSeries, QuoteSnapshot, Symbol, TrendLine,
 };
 use crate::storage::{
     self, clamp_quote_interval_secs, normalize_status_bar, AppConfig, ColorScheme, DockLayout,
@@ -55,7 +55,7 @@ use crate::update::{self, UpdateState};
 use super::{
     AiCacheEntry, AiPanelState, AiSource, ChartKind, ChartRange, DetailTab, LeftTab, SettingsSection,
     StockApp, CHART_MIN_VISIBLE, QUOTE_INTERVAL_ERR_MAX, QUOTE_INTERVAL_PRESETS, TITLE_NORMAL,
-    TITLE_WORK, TREASURE_SCAN_GAP,
+    TITLE_WORK, TREASURE_SCAN_GAP, WORK_IDENTITY_AUTO_HIDE,
 };
 use super::helpers::*;
 
@@ -162,7 +162,8 @@ impl StockApp {
             return;
         }
         self.work_mode = on;
-        self.work_identity_reveal = false;
+        self.clear_work_identity(cx);
+        self.cancel_work_alias_edit(cx);
         self.palette_query.update(cx, |input, cx| {
             input.set_placeholder(
                 if on {
@@ -184,11 +185,164 @@ impl StockApp {
         self.set_work_mode(!self.work_mode, window, cx);
     }
 
+    /// Refresh `work_identity_reveal` from peek / Map latch state.
+    fn sync_work_identity_reveal(&mut self) {
+        self.work_identity_reveal =
+            self.work_identity_peek_held || self.work_identity_map_latched;
+    }
+
+    fn clear_work_identity(&mut self, _cx: &mut Context<Self>) {
+        self.work_identity_peek_held = false;
+        self.work_identity_map_latched = false;
+        self.work_identity_reveal = false;
+        self.work_identity_hide_gen = self.work_identity_hide_gen.wrapping_add(1);
+    }
+
+    /// Map button: latch open with auto-hide, or Hide immediately.
     pub(crate) fn toggle_work_identity(&mut self, cx: &mut Context<Self>) {
         if !self.work_mode {
             return;
         }
-        self.work_identity_reveal = !self.work_identity_reveal;
+        if self.work_identity_map_latched {
+            self.work_identity_map_latched = false;
+            self.work_identity_hide_gen = self.work_identity_hide_gen.wrapping_add(1);
+            self.sync_work_identity_reveal();
+        } else {
+            self.work_identity_map_latched = true;
+            self.sync_work_identity_reveal();
+            self.schedule_work_identity_auto_hide(cx);
+        }
+        cx.notify();
+    }
+
+    fn schedule_work_identity_auto_hide(&mut self, cx: &mut Context<Self>) {
+        self.work_identity_hide_gen = self.work_identity_hide_gen.wrapping_add(1);
+        let token = self.work_identity_hide_gen;
+        cx.spawn(async move |this, cx| {
+            Timer::after(WORK_IDENTITY_AUTO_HIDE).await;
+            let _ = this.update(cx, |app, cx| {
+                if app.work_identity_hide_gen != token {
+                    return;
+                }
+                if !app.work_identity_map_latched {
+                    return;
+                }
+                app.work_identity_map_latched = false;
+                app.sync_work_identity_reveal();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Hold-to-peek key down (` or Space). Returns true if handled.
+    pub(crate) fn handle_work_peek_key_down(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.work_mode
+            || self.settings_open
+            || self.palette_open
+            || self.work_alias_editing
+            || event.is_held
+            || !is_work_peek_keystroke(&event.keystroke)
+        {
+            return false;
+        }
+        if self.work_identity_peek_held {
+            return true;
+        }
+        self.work_identity_peek_held = true;
+        self.sync_work_identity_reveal();
+        cx.notify();
+        true
+    }
+
+    /// Hold-to-peek key up. Returns true if handled.
+    pub(crate) fn handle_work_peek_key_up(
+        &mut self,
+        event: &gpui::KeyUpEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !is_work_peek_keystroke(&event.keystroke) {
+            return false;
+        }
+        if !self.work_identity_peek_held {
+            return false;
+        }
+        self.work_identity_peek_held = false;
+        self.sync_work_identity_reveal();
+        cx.notify();
+        true
+    }
+
+    /// Open the alias editor for the currently selected service.
+    pub(crate) fn start_work_alias_edit(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.work_mode {
+            return;
+        }
+        let code = self.selected.to_string();
+        if code.is_empty() {
+            return;
+        }
+        let current = self
+            .work_aliases
+            .get(&code)
+            .cloned()
+            .unwrap_or_default();
+        let placeholder = disguise_label(
+            &code,
+            self.symbols
+                .iter()
+                .find(|s| s.code == code)
+                .map(|s| s.name.as_ref())
+                .unwrap_or(""),
+        );
+        self.work_alias_editing = true;
+        self.work_alias_input.update(cx, |input, cx| {
+            input.set_placeholder(format!("tag for {placeholder} · empty clears"), window, cx);
+            input.set_value(current, window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_work_alias_edit(&mut self, cx: &mut Context<Self>) {
+        if !self.work_alias_editing {
+            return;
+        }
+        self.work_alias_editing = false;
+        cx.notify();
+    }
+
+    pub(crate) fn commit_work_alias(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.work_alias_editing {
+            return;
+        }
+        let code = self.selected.to_string();
+        let raw = self.work_alias_input.read(cx).value().to_string();
+        self.work_alias_editing = false;
+        if code.is_empty() {
+            cx.notify();
+            return;
+        }
+        match sanitize_work_alias(&raw) {
+            Some(alias) => {
+                self.work_aliases.insert(code, alias);
+            }
+            None => {
+                self.work_aliases.remove(&code);
+            }
+        }
+        self.work_alias_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        self.schedule_persist(cx);
         cx.notify();
     }
 
@@ -829,4 +983,12 @@ impl StockApp {
         }
     }
 
+}
+
+/// Hold-to-peek keys: backtick or Space, without modifiers.
+fn is_work_peek_keystroke(ks: &gpui::Keystroke) -> bool {
+    if ks.modifiers.modified() {
+        return false;
+    }
+    matches!(ks.key.as_str(), "`" | "space")
 }

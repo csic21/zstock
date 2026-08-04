@@ -22,8 +22,9 @@ use std::time::Duration;
 
 use gpui::{
     actions, div, point, px, size, App, AppContext, Bounds, Context, Entity, FocusHandle,
-    InteractiveElement, IntoElement, KeyBinding, ParentElement, Pixels, Point, Render,
-    SharedString, Styled, Window, WindowBounds, WindowOptions, prelude::FluentBuilder,
+    InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, KeyUpEvent, ParentElement, Pixels,
+    Point, Render, SharedString, Styled, Window, WindowBounds, WindowOptions,
+    prelude::FluentBuilder,
 };
 use gpui_component::{
     input::{InputEvent, InputState},
@@ -83,6 +84,8 @@ const CHART_MIN_VISIBLE: usize = 15;
 const TREASURE_SCAN_GAP: Duration = Duration::from_millis(150);
 /// Debounce window for config.json writes (typing / layout thrash).
 pub(crate) const PERSIST_DEBOUNCE: Duration = Duration::from_millis(400);
+/// Latched Map reveal auto-hides after this delay (hold-to-peek is separate).
+pub(crate) const WORK_IDENTITY_AUTO_HIDE: Duration = Duration::from_secs(6);
 
 pub struct StockApp {
     symbols: Vec<Symbol>,
@@ -167,7 +170,19 @@ pub struct StockApp {
     /// 工作模式：中性文案 + 去红绿
     work_mode: bool,
     /// Temporary owner map in work mode; intentionally never persisted.
+    /// True when peek-held **or** Map is latched.
     work_identity_reveal: bool,
+    /// Hold-to-peek (` / Space) is currently pressed.
+    work_identity_peek_held: bool,
+    /// Map button latched open (auto-hides after [`WORK_IDENTITY_AUTO_HIDE`]).
+    work_identity_map_latched: bool,
+    /// Cancels stale auto-hide timers.
+    work_identity_hide_gen: u64,
+    /// User-defined service nicknames for work mode (`code` → alias).
+    work_aliases: HashMap<String, String>,
+    /// Inline alias editor open for the selected service.
+    work_alias_editing: bool,
+    work_alias_input: Entity<InputState>,
     /// Sidebar row order.
     watchlist_sort: WatchlistSort,
     quote_fail_streak: u32,
@@ -333,6 +348,10 @@ impl StockApp {
             state.set_value(format!("{:.2}", portfolio.cash), window, cx);
         });
 
+        let work_alias_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("service tag · e.g. core-db")
+        });
+
         let _subscriptions = vec![
             cx.subscribe_in(&palette_query, window, {
                 move |this, state: &Entity<InputState>, event: &InputEvent, window, cx| {
@@ -381,6 +400,16 @@ impl StockApp {
                         this.ai_config.cli_bin = state.read(cx).value().to_string();
                         this.schedule_persist(cx);
                         cx.notify();
+                    }
+                }
+            }),
+            cx.subscribe_in(&work_alias_input, window, {
+                move |this, _state: &Entity<InputState>, event: &InputEvent, window, cx| {
+                    match event {
+                        InputEvent::PressEnter { .. } => {
+                            this.commit_work_alias(window, cx);
+                        }
+                        _ => {}
                     }
                 }
             }),
@@ -476,6 +505,12 @@ impl StockApp {
             color_scheme: cfg.color_scheme,
             work_mode: cfg.work_mode,
             work_identity_reveal: false,
+            work_identity_peek_held: false,
+            work_identity_map_latched: false,
+            work_identity_hide_gen: 0,
+            work_aliases: cfg.work_aliases.clone(),
+            work_alias_editing: false,
+            work_alias_input,
             watchlist_sort: cfg.watchlist_sort,
             quote_fail_streak: 0,
             left_tab: LeftTab::from_label(&cfg.left_tab),
@@ -579,6 +614,16 @@ impl Render for StockApp {
             .bg(cx.theme().background)
             .track_focus(&self.palette_focus)
             .key_context("stock")
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _w, cx| {
+                if this.handle_work_peek_key_down(event, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_key_up(cx.listener(|this, event: &KeyUpEvent, _w, cx| {
+                if this.handle_work_peek_key_up(event, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
                 this.toggle_palette(window, cx);
             }))

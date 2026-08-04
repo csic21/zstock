@@ -769,6 +769,7 @@ impl StockApp {
         };
         let was_selected = self.selected.as_ref() == code;
         self.symbols.remove(pos);
+        self.work_aliases.remove(code);
         self.filtered_local = (0..self.symbols.len()).collect();
         if was_selected {
             self.selected = shared(
@@ -778,6 +779,9 @@ impl StockApp {
                     .map(|s| s.code.clone())
                     .unwrap_or_default(),
             );
+            if self.work_alias_editing {
+                self.work_alias_editing = false;
+            }
         }
         // Drop from status-bar pins if present.
         if let Some(ix) = self.status_bar_codes.iter().position(|c| c == code) {
