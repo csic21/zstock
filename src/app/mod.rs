@@ -33,9 +33,11 @@ use gpui_component::{
 
 use crate::data::ai::AiConfig;
 use crate::data::indicators::{BollSeries, MaSeries, MacdSeries};
+use crate::data::levels;
 use crate::data::market as market_data;
 use crate::data::portfolio::{Portfolio, TradeSide};
 use crate::data::scout::ScoutPick;
+use crate::data::signals;
 use crate::data::treasure::TreasureHit;
 use crate::data::universe::{FinFilter, TreasurePool};
 use crate::model::{
@@ -90,6 +92,9 @@ pub struct StockApp {
     /// Monotonic token so stale async kline responses are dropped.
     kline_gen: u64,
     candles: Vec<Candle>,
+    /// Strategy / levels for current `candles` (refreshed on series apply).
+    signal_cache: Option<signals::SignalSnapshot>,
+    levels_cache: Option<levels::ReferenceLevels>,
     ma: MaSeries,
     range: ChartRange,
     chart_kind: ChartKind,
@@ -421,6 +426,8 @@ impl StockApp {
             candles_code: None,
             kline_gen: 0,
             candles: Vec::new(),
+            signal_cache: None,
+            levels_cache: None,
             ma: MaSeries::default(),
             range,
             chart_kind: ChartKind::from_label(&cfg.chart_kind),

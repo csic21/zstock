@@ -315,24 +315,42 @@ impl StockApp {
         }
     }
 
-    pub(crate) fn apply_index_ticks(&mut self, ticks: &[(String, String, f64, f64)]) {
+    /// Apply index quotes; returns true if any displayed index value changed.
+    pub(crate) fn apply_index_ticks(&mut self, ticks: &[(String, String, f64, f64)]) -> bool {
+        let mut changed = false;
         for (code, name, last, change_pct) in ticks {
             let snap = IndexSnap {
                 last: *last,
                 change_pct: *change_pct,
             };
             let n = name.as_str();
-            if n.contains("上证") || (*code == "000001" && n.contains("指数")) {
-                self.index_sh = Some(snap);
+            let slot = if n.contains("上证") || (*code == "000001" && n.contains("指数")) {
+                Some(&mut self.index_sh)
             } else if n.contains("沪深300") || code == "000300" {
-                self.index_hs300 = Some(snap);
+                Some(&mut self.index_hs300)
             } else if n.contains("创业板") || code == "399006" {
-                self.index_cyb = Some(snap);
+                Some(&mut self.index_cyb)
             } else if code == "000001" && *last > 1000.0 {
                 // 上证点位通常 >1000；个股平安银行不会这么高
-                self.index_sh = Some(snap);
+                Some(&mut self.index_sh)
+            } else {
+                None
+            };
+            if let Some(slot) = slot {
+                let dirty = match slot.as_ref() {
+                    Some(old) => {
+                        (old.last - snap.last).abs() > 1e-6
+                            || (old.change_pct - snap.change_pct).abs() > 1e-6
+                    }
+                    None => true,
+                };
+                if dirty {
+                    *slot = Some(snap);
+                    changed = true;
+                }
             }
         }
+        changed
     }
 
     /// Price base for index rebased display (first visible close, else last).
@@ -426,12 +444,33 @@ impl StockApp {
         base + vol
     }
 
+    /// Strategy snapshot for the selected series (filled in `apply_klines` / minute).
     pub(crate) fn current_signal(&self) -> Option<signals::SignalSnapshot> {
         self.candles_code
             .as_ref()
             .is_some_and(|code| code == self.selected.as_ref())
-            .then(|| signals::analyze(&self.candles))
+            .then(|| self.signal_cache.clone())
             .flatten()
+    }
+
+    /// Reference buy/sell bands for the selected series (filled with the candles).
+    pub(crate) fn current_levels(&self) -> Option<levels::ReferenceLevels> {
+        self.candles_code
+            .as_ref()
+            .is_some_and(|code| code == self.selected.as_ref())
+            .then(|| self.levels_cache.clone())
+            .flatten()
+    }
+
+    /// Recompute strategy + levels once when the candle series changes.
+    pub(crate) fn refresh_analysis_cache(&mut self) {
+        if self.candles.is_empty() {
+            self.signal_cache = None;
+            self.levels_cache = None;
+        } else {
+            self.signal_cache = signals::analyze(&self.candles);
+            self.levels_cache = levels::compute(&self.candles);
+        }
     }
 
     pub(crate) fn spark_closes(&self) -> Vec<f64> {

@@ -269,16 +269,34 @@ impl StockApp {
                                 .enumerate()
                                 .map(|(ix, h)| (h.code.clone(), ix))
                                 .collect();
+                            let mut quotes_changed = false;
+                            let mut status_bar_dirty = false;
                             for t in sourced.data {
                                 if let Some(&ix) = symbol_ix.get(&t.code) {
                                     let sym = &mut app.symbols[ix];
-                                    if is_real_name(&t.name, &t.code) {
+                                    if is_real_name(&t.name, &t.code)
+                                        && sym.name.as_ref() != t.name.as_str()
+                                    {
                                         sym.name = shared(t.name.clone());
+                                        quotes_changed = true;
+                                        if app.status_bar_codes.iter().any(|c| c == &t.code) {
+                                            status_bar_dirty = true;
+                                        }
                                     }
                                     if t.last > 0.0 {
-                                        sym.last = t.last;
-                                        sym.change_pct = t.change_pct;
-                                        sym.volume = t.volume;
+                                        let price_dirty = (sym.last - t.last).abs() > 1e-9
+                                            || (sym.change_pct - t.change_pct).abs() > 1e-6
+                                            || sym.volume != t.volume;
+                                        if price_dirty {
+                                            sym.last = t.last;
+                                            sym.change_pct = t.change_pct;
+                                            sym.volume = t.volume;
+                                            quotes_changed = true;
+                                            if app.status_bar_codes.iter().any(|c| c == &t.code)
+                                            {
+                                                status_bar_dirty = true;
+                                            }
+                                        }
                                     }
                                 }
                                 // 顺带补寻宝列表中文名
@@ -287,10 +305,12 @@ impl StockApp {
                                         let hit = &mut app.treasure_hits[ix];
                                         if hit.name != t.name {
                                             hit.name = t.name.clone();
+                                            quotes_changed = true;
                                         }
                                     }
                                 }
                             }
+                            let mut index_changed = false;
                             if let Some(Ok(idx)) = &idx_result {
                                 let rows: Vec<_> = idx
                                     .data
@@ -299,24 +319,29 @@ impl StockApp {
                                         (t.code.clone(), t.name.clone(), t.last, t.change_pct)
                                     })
                                     .collect();
-                                app.apply_index_ticks(&rows);
+                                index_changed = app.apply_index_ticks(&rows);
                             }
-                            // Don't clobber an in-flight kline status unless idle
-                            if !app.loading {
-                                let mkt = match (open.a, open.hk) {
-                                    (true, true) => "A+港",
-                                    (true, false) => "A股",
-                                    (false, true) => "港股",
-                                    _ => "—",
-                                };
-                                app.status = shared(format!(
-                                    "行情已更新 · {mkt} · {} · {}",
-                                    sourced.source,
-                                    chrono::Local::now().format("%H:%M:%S")
-                                ));
+                            // Skip full UI rebuild when nothing visible changed.
+                            if quotes_changed || index_changed {
+                                // Don't clobber an in-flight kline status unless idle.
+                                // Omit wall-clock seconds so identical ticks don't thrash status.
+                                if !app.loading {
+                                    let mkt = match (open.a, open.hk) {
+                                        (true, true) => "A+港",
+                                        (true, false) => "A股",
+                                        (false, true) => "港股",
+                                        _ => "—",
+                                    };
+                                    app.status = shared(format!(
+                                        "行情已更新 · {mkt} · {}",
+                                        sourced.source
+                                    ));
+                                }
+                                if app.status_bar_enabled && status_bar_dirty {
+                                    app.sync_status_bar();
+                                }
+                                cx.notify();
                             }
-                            app.sync_status_bar();
-                            cx.notify();
                             Duration::from_secs(app.quote_interval_secs)
                         }
                         Err(e) => {
@@ -336,7 +361,7 @@ impl StockApp {
                                         (t.code.clone(), t.name.clone(), t.last, t.change_pct)
                                     })
                                     .collect();
-                                app.apply_index_ticks(&rows);
+                                let _ = app.apply_index_ticks(&rows);
                             }
                             cx.notify();
                             Duration::from_secs(backoff_secs)
@@ -394,6 +419,9 @@ impl StockApp {
                         return;
                     }
                     if let Ok(sourced) = result {
+                        if app.minute_unchanged(&selected, &sourced.data) {
+                            return;
+                        }
                         app.apply_minute(&selected, sourced.data);
                         cx.notify();
                     }
@@ -612,6 +640,7 @@ impl StockApp {
         self.macd = MacdSeries::from_candles(&self.candles);
         self.boll = BollSeries::from_candles(&self.candles);
         self.hover_ix = None;
+        self.refresh_analysis_cache();
         if same_series {
             let n = self.candles.len();
             if self.chart_view_count > 0 {
@@ -626,6 +655,31 @@ impl StockApp {
             }
         } else {
             self.reset_chart_view();
+        }
+    }
+
+    /// True when the fetched minute series matches what we already paint (skip apply/notify).
+    pub(crate) fn minute_unchanged(&self, code: &str, series: &MinuteSeries) -> bool {
+        if self.minute_code.as_deref() != Some(code) {
+            return false;
+        }
+        let Some(old) = self.minute.as_ref() else {
+            return false;
+        };
+        if old.date != series.date
+            || (old.prev_close - series.prev_close).abs() > 1e-9
+            || old.points.len() != series.points.len()
+        {
+            return false;
+        }
+        match (old.points.last(), series.points.last()) {
+            (Some(a), Some(b)) => {
+                a.time == b.time
+                    && (a.price - b.price).abs() < 1e-9
+                    && a.cum_volume == b.cum_volume
+            }
+            (None, None) => true,
+            _ => false,
         }
     }
 
@@ -656,6 +710,7 @@ impl StockApp {
         self.macd = MacdSeries::default();
         self.boll = BollSeries::default();
         self.hover_ix = None;
+        self.refresh_analysis_cache();
         if !same_series {
             self.reset_chart_view();
         }

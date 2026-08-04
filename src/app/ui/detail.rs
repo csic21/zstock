@@ -1463,12 +1463,8 @@ impl StockApp {
             .find(|h| h.code == self.selected.as_ref())
             .cloned();
 
-        // 参考建仓/减仓带：优先用当前图表日 K（与选中标的匹配时）。
-        let levels = self
-            .candles_code
-            .as_ref()
-            .filter(|c| c.as_str() == self.selected.as_ref())
-            .and_then(|_| levels::compute(&self.candles));
+        // 参考建仓/减仓带：用 K 线 apply 时缓存的结果（与选中标的匹配时）。
+        let levels = self.current_levels();
 
         let mut col = v_flex().gap_2().w_full().max_w(px(640.)).child(section_title(
             if work {

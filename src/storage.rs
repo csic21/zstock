@@ -178,7 +178,8 @@ fn default_chart_kind() -> String {
 }
 
 fn default_quote_interval_secs() -> u64 {
-    1
+    // 2s balances live feel vs full-UI cost of each poll notify.
+    2
 }
 
 fn default_treasure_pool() -> String {
