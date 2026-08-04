@@ -6,6 +6,12 @@
 //!
 //! When no symbols are pinned, the status item shows the embedded S logo
 //! (template image) instead of the "ZStock · 未固定" text placeholder.
+//!
+//! ## Menu update policy
+//! Quote ticks refresh labels every second. Rebuilding an open `NSMenu`
+//! (remove/add items) freezes AppKit tracking and can deadlock if close
+//! callbacks re-enter our mutex. While the dropdown is open we only stash a
+//! pending snapshot; structure-stable refreshes update titles in place.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -35,6 +41,15 @@ pub enum StatusBarAction {
     Quit,
 }
 
+/// Snapshot applied after the dropdown closes (or immediately if closed).
+#[derive(Clone)]
+struct PendingMenu {
+    entries: Vec<MenuEntry>,
+    work_mode: bool,
+    /// Full fingerprint (labels + selection + work_mode).
+    sig: String,
+}
+
 /// AppKit object pointer held as `usize` so the state can be `Send`/`Sync`.
 /// Only touch from the main thread.
 struct StatusBarState {
@@ -46,8 +61,14 @@ struct StatusBarState {
     showing_logo: bool,
     /// Last applied visibility (avoid setLength thrash every quote tick).
     last_visible: Option<bool>,
-    /// Fingerprint of last rebuilt menu (labels + active flags + work_mode).
+    /// Fingerprint of last applied menu (labels + active flags + work_mode).
     last_menu_sig: String,
+    /// Codes + work_mode + active — used to decide full rebuild vs in-place.
+    last_structure_sig: String,
+    /// True between `menuWillOpen` and `menuDidClose`.
+    menu_open: bool,
+    /// Latest rebuild requested while the menu was open.
+    pending_menu: Option<PendingMenu>,
 }
 
 impl StatusBarState {
@@ -95,6 +116,8 @@ pub fn install() -> Receiver<StatusBarAction> {
 
         let menu = NSMenu::new(nil);
         let _: () = msg_send![menu, setAutoenablesItems: NO];
+        // Track open/close so quote ticks never tear down a live menu.
+        let _: () = msg_send![menu, setDelegate: target];
         item.setMenu_(menu);
 
         *STATE.lock().unwrap() = Some(StatusBarState {
@@ -105,6 +128,9 @@ pub fn install() -> Receiver<StatusBarAction> {
             showing_logo: true,
             last_visible: None,
             last_menu_sig: String::new(),
+            last_structure_sig: String::new(),
+            menu_open: false,
+            pending_menu: None,
         });
     }
     INSTALLED.store(true, Ordering::SeqCst);
@@ -191,20 +217,110 @@ fn menu_sig(entries: &[MenuEntry], work_mode: bool) -> String {
     s
 }
 
+/// Codes / selection / work_mode — independent of live price text.
+fn structure_sig(entries: &[MenuEntry], work_mode: bool) -> String {
+    let mut s = String::with_capacity(entries.len() * 16 + 4);
+    s.push(if work_mode { 'W' } else { 'N' });
+    for e in entries {
+        s.push('|');
+        s.push_str(&e.code);
+        s.push(if e.active { '*' } else { '.' });
+    }
+    s
+}
+
 /// Rebuild the dropdown: pinned quotes + Show Window + Quit.
-/// Skips AppKit work when labels / selection / work_mode are unchanged.
+///
+/// - Skips work when the full signature is unchanged.
+/// - While the menu is open, never mutates items (defer to close).
+/// - When only prices change, updates titles/checkmarks in place.
 pub fn rebuild_menu(entries: &[MenuEntry], work_mode: bool) {
-    let mut guard = STATE.lock().unwrap();
-    let Some(st) = guard.as_mut() else {
+    let sig = menu_sig(entries, work_mode);
+    let struct_sig = structure_sig(entries, work_mode);
+
+    // Snapshot + decide under the lock; AppKit work runs unlocked so menu
+    // open/close delegates cannot deadlock on `STATE`.
+    let plan = {
+        let mut guard = STATE.lock().unwrap();
+        let Some(st) = guard.as_mut() else {
+            return;
+        };
+        if st.last_menu_sig == sig {
+            return;
+        }
+        if st.menu_open {
+            st.pending_menu = Some(PendingMenu {
+                entries: entries.to_vec(),
+                work_mode,
+                sig,
+            });
+            return;
+        }
+        let in_place = !st.last_structure_sig.is_empty() && st.last_structure_sig == struct_sig;
+        st.last_menu_sig = sig;
+        st.last_structure_sig = struct_sig;
+        st.pending_menu = None;
+        Some((
+            st.item() as usize,
+            st.target() as usize,
+            in_place,
+            entries.to_vec(),
+            work_mode,
+        ))
+    };
+
+    let Some((item, target, in_place, entries, work_mode)) = plan else {
         return;
     };
-    let sig = menu_sig(entries, work_mode);
-    if st.last_menu_sig == sig {
-        return;
+    unsafe {
+        if in_place {
+            update_menu_in_place(item as id, &entries, work_mode);
+        } else {
+            rebuild_menu_items(item as id, target as id, &entries, work_mode);
+        }
     }
-    st.last_menu_sig = sig;
-    let item = st.item();
-    let target = st.target();
+}
+
+fn apply_pending_menu(pending: PendingMenu) {
+    let plan = {
+        let mut guard = STATE.lock().unwrap();
+        let Some(st) = guard.as_mut() else {
+            return;
+        };
+        if st.menu_open {
+            // Nested open — keep pending for the next close.
+            st.pending_menu = Some(pending);
+            return;
+        }
+        if st.last_menu_sig == pending.sig {
+            return;
+        }
+        let struct_sig = structure_sig(&pending.entries, pending.work_mode);
+        let in_place = !st.last_structure_sig.is_empty() && st.last_structure_sig == struct_sig;
+        st.last_menu_sig = pending.sig;
+        st.last_structure_sig = struct_sig;
+        st.pending_menu = None;
+        Some((
+            st.item() as usize,
+            st.target() as usize,
+            in_place,
+            pending.entries,
+            pending.work_mode,
+        ))
+    };
+    let Some((item, target, in_place, entries, work_mode)) = plan else {
+        return;
+    };
+    unsafe {
+        if in_place {
+            update_menu_in_place(item as id, &entries, work_mode);
+        } else {
+            rebuild_menu_items(item as id, target as id, &entries, work_mode);
+        }
+    }
+}
+
+unsafe fn rebuild_menu_items(item: id, target: id, entries: &[MenuEntry], work_mode: bool) {
     unsafe {
         let menu: id = item.menu();
         if menu == nil {
@@ -253,6 +369,47 @@ pub fn rebuild_menu(entries: &[MenuEntry], work_mode: bool) {
     }
 }
 
+/// Update prices/checkmarks without destroying menu items (structure unchanged).
+unsafe fn update_menu_in_place(item: id, entries: &[MenuEntry], work_mode: bool) {
+    unsafe {
+        let menu: id = item.menu();
+        if menu == nil {
+            return;
+        }
+        let count: isize = msg_send![menu, numberOfItems];
+        if entries.is_empty() {
+            // Placeholder row only.
+            if count >= 1 {
+                let row: id = msg_send![menu, itemAtIndex: 0isize];
+                if row != nil {
+                    let title = if work_mode {
+                        "No symbols pinned"
+                    } else {
+                        "未固定标的 · 在设置中选择"
+                    };
+                    let ns = NSString::alloc(nil).init_str(title);
+                    let _: () = msg_send![row, setTitle: ns];
+                }
+            }
+            return;
+        }
+        // Expect: N symbols + separator + Show + Quit.
+        if count < entries.len() as isize {
+            return;
+        }
+        for (i, e) in entries.iter().enumerate() {
+            let row: id = msg_send![menu, itemAtIndex: i as isize];
+            if row == nil {
+                continue;
+            }
+            let ns = NSString::alloc(nil).init_str(&e.label);
+            let _: () = msg_send![row, setTitle: ns];
+            let state: isize = if e.active { 1 } else { 0 };
+            let _: () = msg_send![row, setState: state];
+        }
+    }
+}
+
 /// Tear down the status item (optional; process exit also clears it).
 #[allow(dead_code)]
 pub fn uninstall() {
@@ -263,6 +420,11 @@ pub fn uninstall() {
             let item = st.item();
             let target = st.target();
             let logo = st.logo();
+            // Drop delegate before release so AppKit does not call into freed target.
+            let menu: id = item.menu();
+            if menu != nil {
+                let _: () = msg_send![menu, setDelegate: nil];
+            }
             bar.removeStatusItem_(item);
             let _: () = msg_send![item, release];
             let _: () = msg_send![target, release];
@@ -389,6 +551,15 @@ unsafe fn register_target_class() {
         );
         decl.add_method(sel!(quitApp:), quit_app as extern "C" fn(&Object, Sel, id));
         decl.add_method(sel!(noop:), noop as extern "C" fn(&Object, Sel, id));
+        // NSMenuDelegate — keep quote-driven rebuilds off the open menu.
+        decl.add_method(
+            sel!(menuWillOpen:),
+            menu_will_open as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
+            sel!(menuDidClose:),
+            menu_did_close as extern "C" fn(&Object, Sel, id),
+        );
         decl.register();
     }
 }
@@ -426,7 +597,37 @@ extern "C" fn show_window(_this: &Object, _sel: Sel, _sender: id) {
 }
 
 extern "C" fn quit_app(_this: &Object, _sel: Sel, _sender: id) {
+    // Terminate immediately on the AppKit menu-action thread. Going through the
+    // 50ms GPUI poll + async `cx.quit()` made "退出" feel dead, especially when
+    // the main thread was busy applying quote ticks.
     send_action(StatusBarAction::Quit);
+    unsafe {
+        let app: id = msg_send![class!(NSApplication), sharedApplication];
+        if app != nil {
+            let _: () = msg_send![app, terminate: nil];
+        }
+    }
 }
 
 extern "C" fn noop(_this: &Object, _sel: Sel, _sender: id) {}
+
+extern "C" fn menu_will_open(_this: &Object, _sel: Sel, _menu: id) {
+    let mut guard = STATE.lock().unwrap();
+    if let Some(st) = guard.as_mut() {
+        st.menu_open = true;
+    }
+}
+
+extern "C" fn menu_did_close(_this: &Object, _sel: Sel, _menu: id) {
+    let pending = {
+        let mut guard = STATE.lock().unwrap();
+        let Some(st) = guard.as_mut() else {
+            return;
+        };
+        st.menu_open = false;
+        st.pending_menu.take()
+    };
+    if let Some(pending) = pending {
+        apply_pending_menu(pending);
+    }
+}
