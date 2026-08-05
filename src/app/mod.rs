@@ -46,6 +46,7 @@ use crate::model::{
 };
 use crate::storage::{
     self, clamp_quote_interval_secs, normalize_status_bar, ColorScheme, DockLayout, WatchlistSort,
+    WorkDensity,
 };
 use crate::update::UpdateState;
 
@@ -169,6 +170,12 @@ pub struct StockApp {
     color_scheme: ColorScheme,
     /// 工作模式：中性文案 + 去红绿
     work_mode: bool,
+    /// Work-mode layout density (Wide / Fit / Mini); persisted.
+    work_density: WorkDensity,
+    /// Host-panel width in work mode (px). 0 = density default.
+    work_right_width: f32,
+    /// Window bounds captured before entering Fit/Mini (restore on Wide).
+    work_restore_bounds: Option<(f32, f32, f32, f32)>,
     /// Temporary owner map in work mode; intentionally never persisted.
     /// True when peek-held **or** Map is latched.
     work_identity_reveal: bool,
@@ -504,6 +511,9 @@ impl StockApp {
             window_bounds,
             color_scheme: cfg.color_scheme,
             work_mode: cfg.work_mode,
+            work_density: cfg.work_density,
+            work_right_width: cfg.work_right_width,
+            work_restore_bounds: None,
             work_identity_reveal: false,
             work_identity_peek_held: false,
             work_identity_map_latched: false,
@@ -829,7 +839,8 @@ pub fn run() {
         // 完整 Dock 布局序列化：上次窗口位置/大小直接恢复（无记录则居中默认）。
         let cfg = storage::load_config();
         let window_bounds = match cfg.dock.window {
-            Some((x, y, w, h)) if w >= 800.0 && h >= 500.0 => {
+            // Allow Mini focus footprint (~720×440) to restore across restarts.
+            Some((x, y, w, h)) if w >= 640.0 && h >= 400.0 => {
                 WindowBounds::Windowed(Bounds {
                     origin: point(px(x), px(y)),
                     size: size(px(w), px(h)),

@@ -48,7 +48,7 @@ use crate::model::{
 };
 use crate::storage::{
     self, clamp_quote_interval_secs, normalize_status_bar, AppConfig, ColorScheme, DockLayout,
-    WatchlistSort, STATUS_BAR_MAX_CODES,
+    WatchlistSort, WorkDensity, STATUS_BAR_MAX_CODES,
 };
 use crate::update::{self, UpdateState};
 
@@ -59,7 +59,84 @@ use super::super::{
 };
 use super::super::helpers::*;
 
+/// Pixel metrics for a work-mode density level.
+#[derive(Clone, Copy)]
+struct WorkMetrics {
+    header_h: f32,
+    row_h: f32,
+    proc_row_h: f32,
+    footer_h: f32,
+    spark_h: f32,
+    journal_h: f32,
+    col_service: f32,
+    col_p50: f32,
+    col_drift: f32,
+    col_load: f32,
+    col_proc: f32,
+    pad_x: f32,
+    left_min: f32,
+    show_journal: bool,
+    /// Drop the trailing status chip in the footer (Mini).
+    compact_footer: bool,
+}
 
+impl WorkDensity {
+    fn metrics(self) -> WorkMetrics {
+        match self {
+            Self::Wide => WorkMetrics {
+                header_h: 32.0,
+                row_h: 34.0,
+                proc_row_h: 28.0,
+                footer_h: 32.0,
+                spark_h: 72.0,
+                journal_h: 120.0,
+                col_service: 210.0,
+                col_p50: 90.0,
+                col_drift: 74.0,
+                col_load: 58.0,
+                col_proc: 160.0,
+                pad_x: 12.0,
+                left_min: 300.0,
+                show_journal: true,
+                compact_footer: false,
+            },
+            Self::Fit => WorkMetrics {
+                header_h: 26.0,
+                row_h: 26.0,
+                proc_row_h: 22.0,
+                footer_h: 26.0,
+                spark_h: 48.0,
+                journal_h: 72.0,
+                col_service: 150.0,
+                col_p50: 72.0,
+                col_drift: 58.0,
+                col_load: 46.0,
+                col_proc: 120.0,
+                pad_x: 8.0,
+                left_min: 240.0,
+                show_journal: true,
+                compact_footer: false,
+            },
+            Self::Mini => WorkMetrics {
+                header_h: 22.0,
+                row_h: 22.0,
+                proc_row_h: 20.0,
+                footer_h: 24.0,
+                spark_h: 36.0,
+                journal_h: 0.0,
+                col_service: 120.0,
+                col_p50: 64.0,
+                col_drift: 50.0,
+                col_load: 40.0,
+                col_proc: 96.0,
+                pad_x: 6.0,
+                left_min: 180.0,
+                show_journal: false,
+                compact_footer: true,
+            },
+        }
+    }
+}
 
 impl StockApp {
     pub(crate) fn render_work_dashboard(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -100,6 +177,10 @@ impl StockApp {
             .as_ref()
             .map(|s| s.regime.service_state())
             .unwrap_or("warming");
+        let m = self.work_density.metrics();
+        let right_w = self.work_right_width_px();
+        let (right_lo, right_hi) = self.work_density.right_width_range();
+        let entity_h = cx.entity().clone();
 
         v_flex()
             .w_full()
@@ -108,162 +189,246 @@ impl StockApp {
             .overflow_hidden()
             .bg(cx.theme().background)
             .child(
-                h_flex()
+                div()
                     .flex_1()
                     .min_h_0()
                     .w_full()
                     .overflow_hidden()
-                    // ── left: service table ──
                     .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w(px(360.))
-                            .min_h_0()
-                            .h_full()
-                            .overflow_hidden()
+                        h_resizable("work-h")
+                            .on_resize(move |state, _window, cx| {
+                                entity_h.update(cx, |this, cx| {
+                                    this.on_work_h_resize(state, cx);
+                                });
+                            })
+                            // ── left: service table ──
                             .child(
-                                h_flex()
-                                    .h(px(32.))
-                                    .flex_shrink_0()
-                                    .px_3()
-                                    .items_center()
-                                    .border_b_1()
-                                    .border_color(cx.theme().border)
-                                    .bg(cx.theme().sidebar)
+                                resizable_panel()
+                                    .size_range(px(m.left_min)..px(900.))
                                     .child(
-                                        div()
-                                            .w(px(210.))
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child("service"),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("work-p50-header")
-                                            .w(px(90.))
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child("p50")
-                                            .tooltip(|window, cx| {
-                                                Tooltip::new(
-                                                    "owner key · p50=现价 · drift=涨跌幅 · health=策略评分",
-                                                )
-                                                .build(window, cx)
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .w(px(74.))
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child("drift"),
-                                    )
-                                    .child(
-                                        div()
-                                            .w(px(58.))
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child("load"),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(format!("{} workers", self.symbols.len())),
+                                        v_flex()
+                                            .size_full()
+                                            .min_h_0()
+                                            .overflow_hidden()
+                                            .child(
+                                                h_flex()
+                                                    .h(px(m.header_h))
+                                                    .flex_shrink_0()
+                                                    .px(px(m.pad_x))
+                                                    .items_center()
+                                                    .border_b_1()
+                                                    .border_color(cx.theme().border)
+                                                    .bg(cx.theme().sidebar)
+                                                    .child(
+                                                        div()
+                                                            .w(px(m.col_service))
+                                                            .text_xs()
+                                                            .text_color(cx.theme().muted_foreground)
+                                                            .child("service"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .id("work-p50-header")
+                                                            .w(px(m.col_p50))
+                                                            .text_xs()
+                                                            .text_color(cx.theme().muted_foreground)
+                                                            .child("p50")
+                                                            .tooltip(|window, cx| {
+                                                                Tooltip::new(
+                                                                    "owner key · p50=现价 · drift=涨跌幅 · health=策略评分",
+                                                                )
+                                                                .build(window, cx)
+                                                            }),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .w(px(m.col_drift))
+                                                            .text_xs()
+                                                            .text_color(cx.theme().muted_foreground)
+                                                            .child("drift"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .w(px(m.col_load))
+                                                            .text_xs()
+                                                            .text_color(cx.theme().muted_foreground)
+                                                            .child("load"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .text_xs()
+                                                            .text_color(cx.theme().muted_foreground)
+                                                            .child(format!(
+                                                                "{} workers",
+                                                                self.symbols.len()
+                                                            )),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("work-metrics-scroll")
+                                                    .flex_1()
+                                                    .min_h_0()
+                                                    .w_full()
+                                                    .overflow_y_scroll()
+                                                    .children(self.symbols.iter().enumerate().map(
+                                                        |(ix, sym)| {
+                                                            let is_selected =
+                                                                sym.code == selected.as_ref();
+                                                            let code = shared(sym.code.clone());
+                                                            let alias = self.display_code(&sym.code);
+                                                            let p50 = if sym.last > 0.0 {
+                                                                format!(
+                                                                    "{}ms",
+                                                                    format_price(sym.last)
+                                                                )
+                                                            } else {
+                                                                "--".into()
+                                                            };
+                                                            let delta =
+                                                                format!("{:+.2}%", sym.change_pct);
+                                                            let load = format!(
+                                                                "{:.2}",
+                                                                Self::load_factor(
+                                                                    sym.volume, max_vol
+                                                                )
+                                                            );
+                                                            let identity = format!(
+                                                                "{} · {} · 现价 {}",
+                                                                sym.code,
+                                                                sym.name,
+                                                                format_price(sym.last)
+                                                            );
+                                                            let dense = m.compact_footer;
+
+                                                            div()
+                                                                .id(("work-row", ix))
+                                                                .h(px(m.row_h))
+                                                                .w_full()
+                                                                .px(px(m.pad_x))
+                                                                .flex()
+                                                                .items_center()
+                                                                .flex_shrink_0()
+                                                                .cursor_pointer()
+                                                                .border_b_1()
+                                                                .border_color(
+                                                                    cx.theme()
+                                                                        .border
+                                                                        .opacity(0.3),
+                                                                )
+                                                                .when(is_selected, |this| {
+                                                                    this.bg(cx
+                                                                        .theme()
+                                                                        .accent
+                                                                        .opacity(0.14))
+                                                                })
+                                                                .hover(|this| {
+                                                                    this.bg(cx
+                                                                        .theme()
+                                                                        .accent
+                                                                        .opacity(0.08))
+                                                                })
+                                                                .tooltip(move |window, cx| {
+                                                                    Tooltip::new(identity.clone())
+                                                                        .build(window, cx)
+                                                                })
+                                                                .on_click(cx.listener(
+                                                                    move |this, _, _w, cx| {
+                                                                        this.select_symbol(
+                                                                            code.clone(),
+                                                                            cx,
+                                                                        );
+                                                                    },
+                                                                ))
+                                                                .child(
+                                                                    div()
+                                                                        .w(px(m.col_service))
+                                                                        .when(dense, |d| {
+                                                                            d.text_xs()
+                                                                        })
+                                                                        .when(!dense, |d| {
+                                                                            d.text_sm()
+                                                                        })
+                                                                        .font_semibold()
+                                                                        .text_color(
+                                                                            cx.theme().foreground,
+                                                                        )
+                                                                        .truncate()
+                                                                        .child(alias),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .w(px(m.col_p50))
+                                                                        .when(dense, |d| {
+                                                                            d.text_xs()
+                                                                        })
+                                                                        .when(!dense, |d| {
+                                                                            d.text_sm()
+                                                                        })
+                                                                        .font_medium()
+                                                                        .text_color(
+                                                                            cx.theme().foreground,
+                                                                        )
+                                                                        .child(p50),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .w(px(m.col_drift))
+                                                                        .when(dense, |d| {
+                                                                            d.text_xs()
+                                                                        })
+                                                                        .when(!dense, |d| {
+                                                                            d.text_sm()
+                                                                        })
+                                                                        .text_color(
+                                                                            cx.theme()
+                                                                                .muted_foreground,
+                                                                        )
+                                                                        .child(delta),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .w(px(m.col_load))
+                                                                        .when(dense, |d| {
+                                                                            d.text_xs()
+                                                                        })
+                                                                        .when(!dense, |d| {
+                                                                            d.text_sm()
+                                                                        })
+                                                                        .text_color(
+                                                                            cx.theme()
+                                                                                .muted_foreground,
+                                                                        )
+                                                                        .child(load),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .flex_1()
+                                                                        .text_xs()
+                                                                        .text_color(
+                                                                            cx.theme()
+                                                                                .muted_foreground,
+                                                                        )
+                                                                        .child(if is_selected {
+                                                                            "run"
+                                                                        } else {
+                                                                            "·"
+                                                                        }),
+                                                                )
+                                                        },
+                                                    )),
+                                            ),
                                     ),
                             )
-                            // Scroll on a plain div (more reliable than v_flex + overflow).
+                            // ── right: host / process panel ──
                             .child(
-                                div()
-                                    .id("work-metrics-scroll")
-                                    .flex_1()
-                                    .min_h_0()
-                                    .w_full()
-                                    .overflow_y_scroll()
-                                    .children(self.symbols.iter().enumerate().map(|(ix, sym)| {
-                                        let is_selected = sym.code == selected.as_ref();
-                                        let code = shared(sym.code.clone());
-                                        let alias = self.display_code(&sym.code);
-                                        let p50 = if sym.last > 0.0 {
-                                            format!("{}ms", format_price(sym.last))
-                                        } else {
-                                            "--".into()
-                                        };
-                                        let delta = format!("{:+.2}%", sym.change_pct);
-                                        let load =
-                                            format!("{:.2}", Self::load_factor(sym.volume, max_vol));
-                                        let identity = format!(
-                                            "{} · {} · 现价 {}",
-                                            sym.code,
-                                            sym.name,
-                                            format_price(sym.last)
-                                        );
-
-                                        div()
-                                            .id(("work-row", ix))
-                                            .h(px(34.))
-                                            .w_full()
-                                            .px_3()
-                                            .flex()
-                                            .items_center()
-                                            .flex_shrink_0()
-                                            .cursor_pointer()
-                                            .border_b_1()
-                                            .border_color(cx.theme().border.opacity(0.3))
-                                            .when(is_selected, |this| {
-                                                this.bg(cx.theme().accent.opacity(0.14))
-                                            })
-                                            .hover(|this| this.bg(cx.theme().accent.opacity(0.08)))
-                                            .tooltip(move |window, cx| {
-                                                Tooltip::new(identity.clone()).build(window, cx)
-                                            })
-                                            .on_click(cx.listener(move |this, _, _w, cx| {
-                                                this.select_symbol(code.clone(), cx);
-                                            }))
-                                            .child(
-                                                div()
-                                                    .w(px(210.))
-                                                    .text_sm()
-                                                    .font_semibold()
-                                                    .text_color(cx.theme().foreground)
-                                                    .truncate()
-                                                    .child(alias),
-                                            )
-                                            .child(
-                                                div()
-                                                    .w(px(90.))
-                                                    .text_sm()
-                                                    .font_medium()
-                                                    .text_color(cx.theme().foreground)
-                                                    .child(p50),
-                                            )
-                                            .child(
-                                                div()
-                                                    .w(px(74.))
-                                                    .text_sm()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child(delta),
-                                            )
-                                            .child(
-                                                div()
-                                                    .w(px(58.))
-                                                    .text_sm()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child(load),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .text_xs()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child(if is_selected { "run" } else { "·" }),
-                                            )
-                                    })),
+                                resizable_panel()
+                                    .size(px(right_w))
+                                    .size_range(px(right_lo)..px(right_hi))
+                                    .child(self.render_work_system_panel(cx)),
                             ),
-                    )
-                    // ── right: host / process panel (real data, system skin) ──
-                    .child(self.render_work_system_panel(cx)),
+                    ),
             )
             // footer: selected + sparkline
             .child(
@@ -274,17 +439,20 @@ impl StockApp {
                     .bg(cx.theme().sidebar)
                     .child(
                         h_flex()
-                            .h(px(32.))
+                            .h(px(m.footer_h))
                             .flex_shrink_0()
-                            .px_3()
+                            .px(px(m.pad_x))
                             .items_center()
                             .justify_between()
+                            .gap_2()
                             .border_b_1()
                             .border_color(cx.theme().border.opacity(0.5))
                             .child(
                                 h_flex()
-                                    .gap_3()
+                                    .gap_2()
                                     .items_baseline()
+                                    .min_w_0()
+                                    .overflow_hidden()
                                     .child(
                                         div()
                                             .text_xs()
@@ -294,7 +462,7 @@ impl StockApp {
                                     .child(
                                         div()
                                             .id("work-selected-alias")
-                                            .text_sm()
+                                            .text_xs()
                                             .font_semibold()
                                             .text_color(cx.theme().foreground)
                                             .child(sel_alias)
@@ -314,29 +482,36 @@ impl StockApp {
                                             .text_color(cx.theme().muted_foreground)
                                             .child(format!("Δ {delta}")),
                                     )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(format!("load {load}")),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(format!("health {health} · {service_state}")),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(format!("window {range_label} · {pts} pts")),
-                                    ),
+                                    .when(!m.compact_footer, |row| {
+                                        row.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(format!("load {load}")),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(format!(
+                                                    "health {health} · {service_state}"
+                                                )),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(format!(
+                                                    "window {range_label} · {pts} pts"
+                                                )),
+                                        )
+                                    }),
                             )
                             .child(
                                 h_flex()
                                     .gap_1()
                                     .items_center()
+                                    .flex_shrink_0()
                                     .children(ChartRange::all().map(|range| {
                                         let active = self.range == range;
                                         Button::new(("work-range", range as u32))
@@ -348,21 +523,23 @@ impl StockApp {
                                                 this.set_range(range, cx);
                                             }))
                                     }))
-                                    .child(
-                                        div()
-                                            .ml_2()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(status),
-                                    ),
+                                    .when(!m.compact_footer, |row| {
+                                        row.child(
+                                            div()
+                                                .ml_2()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(status),
+                                        )
+                                    }),
                             ),
                     )
                     .when(self.work_alias_editing, |col| {
                         col.child(
                             h_flex()
-                                .h(px(36.))
+                                .h(px(32.))
                                 .flex_shrink_0()
-                                .px_3()
+                                .px(px(m.pad_x))
                                 .gap_2()
                                 .items_center()
                                 .border_b_1()
@@ -403,10 +580,10 @@ impl StockApp {
                     .child(
                         div()
                             .id("work-spark")
-                            .h(px(72.))
+                            .h(px(m.spark_h))
                             .w_full()
-                            .px_2()
-                            .pb_2()
+                            .px(px(m.pad_x.max(4.0) - 2.0))
+                            .pb(px(if m.compact_footer { 4.0 } else { 8.0 }))
                             .child(
                                 div()
                                     .id("work-spark-surface")
@@ -448,6 +625,12 @@ impl StockApp {
         } else {
             (1.2, 0.8)
         };
+        let m = self.work_density.metrics();
+        let proc_limit = match self.work_density {
+            WorkDensity::Wide => 12,
+            WorkDensity::Fit => 10,
+            WorkDensity::Mini => 8,
+        };
 
         // Major-index direction is encoded around a neutral 50% telemetry baseline.
         let sh = self.index_sh;
@@ -463,7 +646,7 @@ impl StockApp {
                 .partial_cmp(&a.change_pct.abs())
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let top_procs: Vec<&Symbol> = procs.into_iter().take(12).collect();
+        let top_procs: Vec<&Symbol> = procs.into_iter().take(proc_limit).collect();
 
         let t = chrono::Local::now().format("%H:%M:%S").to_string();
         let sh_load = sh.map(|s| telemetry(s.change_pct));
@@ -499,30 +682,28 @@ impl StockApp {
             format!("{t}  scheduler tick · node={host_name}"),
             format!("{t}  sample cpu={sh_pct} mem={hs300_pct} disk={cyb_pct}"),
             format!("{t}  net rx={net_in:.1} tx={net_out:.1} MB/s"),
-            format!(
-                "{t}  cluster nodes={}",
-                self.symbols.len()
-            ),
+            format!("{t}  cluster nodes={}", self.symbols.len()),
             format!("{t}  gc pause ok · heap stable"),
             format!("{t}  worker pool active"),
         ];
+        let journal_lines: usize = match self.work_density {
+            WorkDensity::Wide => 6,
+            WorkDensity::Fit => 3,
+            WorkDensity::Mini => 0,
+        };
 
         v_flex()
-            .w(px(340.))
-            .min_w(px(300.))
-            .max_w(px(380.))
-            .h_full()
+            .size_full()
             .min_h_0()
-            .flex_shrink_0()
             .overflow_hidden()
             .border_l_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().sidebar)
             .child(
                 h_flex()
-                    .h(px(32.))
+                    .h(px(m.header_h))
                     .flex_shrink_0()
-                    .px_3()
+                    .px(px(m.pad_x))
                     .items_center()
                     .justify_between()
                     .border_b_1()
@@ -549,8 +730,8 @@ impl StockApp {
             .child(
                 v_flex()
                     .flex_shrink_0()
-                    .p_3()
-                    .gap_2()
+                    .p(px(if m.compact_footer { 6.0 } else { 12.0 }))
+                    .gap(px(if m.compact_footer { 4.0 } else { 8.0 }))
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(sys_gauge(
@@ -604,22 +785,22 @@ impl StockApp {
             )
             .child(
                 h_flex()
-                    .h(px(28.))
+                    .h(px(m.header_h.min(28.0)))
                     .flex_shrink_0()
-                    .px_3()
+                    .px(px(m.pad_x))
                     .items_center()
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(
                         div()
-                            .w(px(160.))
+                            .w(px(m.col_proc))
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child("process"),
                     )
                     .child(
                         div()
-                            .w(px(48.))
+                            .w(px(40.))
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child("cpu"),
@@ -648,9 +829,9 @@ impl StockApp {
 
                         div()
                             .id(("work-proc", ix))
-                            .h(px(28.))
+                            .h(px(m.proc_row_h))
                             .w_full()
-                            .px_3()
+                            .px(px(m.pad_x))
                             .flex()
                             .items_center()
                             .flex_shrink_0()
@@ -666,7 +847,7 @@ impl StockApp {
                             }))
                             .child(
                                 div()
-                                    .w(px(160.))
+                                    .w(px(m.col_proc))
                                     .text_xs()
                                     .font_medium()
                                     .text_color(cx.theme().foreground)
@@ -675,7 +856,7 @@ impl StockApp {
                             )
                             .child(
                                 div()
-                                    .w(px(48.))
+                                    .w(px(40.))
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(format!("{proc_cpu:.0}%")),
@@ -689,29 +870,31 @@ impl StockApp {
                             )
                     })),
             )
-            .child(
-                v_flex()
-                    .h(px(120.))
-                    .flex_shrink_0()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .p_2()
-                    .gap_0p5()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .mb_1()
-                            .child("journal"),
-                    )
-                    .children(journal.into_iter().map(|line| {
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground.opacity(0.9))
-                            .truncate()
-                            .child(line)
-                    })),
-            )
+            .when(m.show_journal && journal_lines > 0, |col| {
+                col.child(
+                    v_flex()
+                        .h(px(m.journal_h))
+                        .flex_shrink_0()
+                        .border_t_1()
+                        .border_color(cx.theme().border)
+                        .p(px(if m.compact_footer { 4.0 } else { 8.0 }))
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .mb_1()
+                                .child("journal"),
+                        )
+                        .children(journal.into_iter().take(journal_lines).map(|line| {
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground.opacity(0.9))
+                                .truncate()
+                                .child(line)
+                        })),
+                )
+            })
     }
 
 }

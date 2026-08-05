@@ -48,7 +48,7 @@ use crate::model::{
 };
 use crate::storage::{
     self, clamp_quote_interval_secs, normalize_status_bar, AppConfig, ColorScheme, DockLayout,
-    WatchlistSort, STATUS_BAR_MAX_CODES,
+    WatchlistSort, WorkDensity, STATUS_BAR_MAX_CODES,
 };
 use crate::update::{self, UpdateState};
 
@@ -112,6 +112,17 @@ impl StockApp {
                                         } else {
                                             this.start_work_alias_edit(window, cx);
                                         }
+                                    })),
+                            )
+                            .child(
+                                Button::new("work-density")
+                                    .ghost()
+                                    .xsmall()
+                                    .when(self.work_density != WorkDensity::Wide, |b| b.primary())
+                                    .label(self.work_density.label())
+                                    .tooltip(self.work_density.tooltip())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.cycle_work_density(window, cx);
                                     })),
                             )
                         })
@@ -651,6 +662,34 @@ impl StockApp {
                                     })),
                             ),
                     )
+                    .when(work, |col| {
+                        col.child(
+                            v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground.opacity(0.9))
+                                        .child(
+                                            "Window size · layout density (also in title bar): Wide → Fit → Mini. Drag the split between service list and host panel.",
+                                        ),
+                                )
+                                .child(
+                                    h_flex().gap_1().children(WorkDensity::all().map(|d| {
+                                        let active = self.work_density == d;
+                                        Button::new(("set-work-density", d as u32))
+                                            .xsmall()
+                                            .when(active, |b| b.primary())
+                                            .when(!active, |b| b.ghost())
+                                            .label(d.label())
+                                            .tooltip(d.tooltip())
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.set_work_density(d, window, cx);
+                                            }))
+                                    })),
+                                ),
+                        )
+                    })
                     .child(self.render_work_mode_help(work, cx)),
             )
     }
@@ -698,6 +737,7 @@ impl StockApp {
                 ("` or Space (hold)", "Peek identity", "Show real names while held; release to cloak"),
                 ("Map / Hide", "Latch identity ~6s", "Title-bar; auto-hides so Map is not left open"),
                 ("Tag", "Private nickname", "Name the selected service; empty + Save clears; local config"),
+                ("Wide / Fit / Mini", "Window size", "Cycle density + OS window; Mini is ~720×440; drag the host split"),
                 ("Find", "Command palette", "Same as ⌘K under Focus chrome"),
                 ("Sync", "Refresh", "Same as ⌘R"),
             ]
@@ -706,6 +746,7 @@ impl StockApp {
                 ("` 或 Space（按住）", "窥视真身份", "按住显示代码/名称，松手立刻恢复伪装"),
                 ("Map / Hide", "锁定约 6 秒", "标题栏按钮；超时自动 Hide，避免忘记关掉"),
                 ("Tag", "私有服务昵称", "给当前选中起助记名；清空保存即删除；写入本地 config"),
+                ("Wide / Fit / Mini", "窗口大小", "循环压缩布局与窗口；Mini 约 720×440；可拖右侧分栏"),
                 ("Find", "命令面板", "工作模式标题栏，等同 ⌘K"),
                 ("Sync", "刷新", "工作模式标题栏，等同 ⌘R"),
             ]

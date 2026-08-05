@@ -96,6 +96,101 @@ impl WatchlistSort {
     }
 }
 
+/// Work-mode chrome density + companion window size.
+///
+/// Cycles Wide → Fit → Mini → Wide. Fit/Mini shrink row heights, hide journal
+/// (Mini), and resize the OS window so the monitor skin fits a smaller desk
+/// footprint without looking like a full trading terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+#[repr(u32)]
+pub enum WorkDensity {
+    /// Current roomy layout; restores the pre-compact window when leaving Fit/Mini.
+    #[default]
+    Wide = 0,
+    /// Tighter rows + medium window (~920×580).
+    Fit = 1,
+    /// Densest chrome + small window (~720×440); journal hidden.
+    Mini = 2,
+}
+
+impl WorkDensity {
+    pub fn all() -> [Self; 3] {
+        [Self::Wide, Self::Fit, Self::Mini]
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Wide => Self::Fit,
+            Self::Fit => Self::Mini,
+            Self::Mini => Self::Wide,
+        }
+    }
+
+    /// Title-bar label (Focus chrome).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Wide => "Wide",
+            Self::Fit => "Fit",
+            Self::Mini => "Mini",
+        }
+    }
+
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            Self::Wide => "Window size · Wide (roomy) · click for Fit",
+            Self::Fit => "Window size · Fit (~920×580, denser) · click for Mini",
+            Self::Mini => "Window size · Mini (~720×440, densest) · click for Wide",
+        }
+    }
+
+    /// Target content size when entering this density. `None` = restore saved bounds.
+    pub fn window_size(self) -> Option<(f32, f32)> {
+        match self {
+            Self::Wide => None,
+            Self::Fit => Some((920.0, 580.0)),
+            Self::Mini => Some((720.0, 440.0)),
+        }
+    }
+
+    /// Default host-panel width for this density (px).
+    pub fn default_right_width(self) -> f32 {
+        match self {
+            Self::Wide => 340.0,
+            Self::Fit => 280.0,
+            Self::Mini => 220.0,
+        }
+    }
+
+    pub fn right_width_range(self) -> (f32, f32) {
+        match self {
+            Self::Wide => (260.0, 420.0),
+            Self::Fit => (200.0, 360.0),
+            Self::Mini => (160.0, 300.0),
+        }
+    }
+}
+
+#[cfg(test)]
+mod work_density_tests {
+    use super::WorkDensity;
+
+    #[test]
+    fn density_cycles_wide_fit_mini() {
+        assert_eq!(WorkDensity::Wide.next(), WorkDensity::Fit);
+        assert_eq!(WorkDensity::Fit.next(), WorkDensity::Mini);
+        assert_eq!(WorkDensity::Mini.next(), WorkDensity::Wide);
+    }
+
+    #[test]
+    fn mini_window_is_smaller_than_fit() {
+        let fit = WorkDensity::Fit.window_size().unwrap();
+        let mini = WorkDensity::Mini.window_size().unwrap();
+        assert!(mini.0 < fit.0 && mini.1 < fit.1);
+        assert!(WorkDensity::Wide.window_size().is_none());
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     /// Pure A-share codes in watchlist order.
@@ -134,6 +229,12 @@ pub struct AppConfig {
     /// Work mode: neutral copy + muted up/down colors (in-app toggle).
     #[serde(default)]
     pub work_mode: bool,
+    /// Work-mode layout density + companion window size (Wide / Fit / Mini).
+    #[serde(default)]
+    pub work_density: WorkDensity,
+    /// Right host-panel width in work mode (px). 0 = use density default.
+    #[serde(default)]
+    pub work_right_width: f32,
     /// Work-mode private service nicknames (`code` → alias). Never shown as stock ids.
     #[serde(default)]
     pub work_aliases: std::collections::HashMap<String, String>,
@@ -228,6 +329,8 @@ impl Default for AppConfig {
             bottom_height: 168.0,
             color_scheme: ColorScheme::Cn,
             work_mode: false,
+            work_density: WorkDensity::Wide,
+            work_right_width: 0.0,
             work_aliases: std::collections::HashMap::new(),
             quote_interval_secs: default_quote_interval_secs(),
             watchlist_sort: WatchlistSort::Manual,

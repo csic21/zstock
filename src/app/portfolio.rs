@@ -83,6 +83,8 @@ impl StockApp {
             bottom_height: self.bottom_height,
             color_scheme: self.color_scheme,
             work_mode: self.work_mode,
+            work_density: self.work_density,
+            work_right_width: self.work_right_width,
             work_aliases: self.work_aliases.clone(),
             quote_interval_secs: self.quote_interval_secs,
             watchlist_sort: self.watchlist_sort,

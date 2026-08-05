@@ -48,7 +48,7 @@ use crate::model::{
 };
 use crate::storage::{
     self, clamp_quote_interval_secs, normalize_status_bar, AppConfig, ColorScheme, DockLayout,
-    WatchlistSort, STATUS_BAR_MAX_CODES,
+    WatchlistSort, WorkDensity, STATUS_BAR_MAX_CODES,
 };
 use crate::update::{self, UpdateState};
 
@@ -176,6 +176,10 @@ impl StockApp {
             );
         });
         window.set_window_title(self.window_title());
+        // Re-apply density window size when entering Focus (Fit/Mini).
+        if on {
+            self.apply_work_density_window(window);
+        }
         self.schedule_persist(cx);
         self.sync_status_bar();
         cx.notify();
@@ -183,6 +187,90 @@ impl StockApp {
 
     pub(crate) fn toggle_work_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_work_mode(!self.work_mode, window, cx);
+    }
+
+    /// Effective host-panel width for the current density.
+    pub(crate) fn work_right_width_px(&self) -> f32 {
+        let (lo, hi) = self.work_density.right_width_range();
+        let raw = if self.work_right_width > 0.0 {
+            self.work_right_width
+        } else {
+            self.work_density.default_right_width()
+        };
+        raw.clamp(lo, hi)
+    }
+
+    pub(crate) fn on_work_h_resize(
+        &mut self,
+        state: &Entity<ResizableState>,
+        cx: &mut Context<Self>,
+    ) {
+        let sizes = state.read(cx).sizes().clone();
+        // Two panels: [service list, host panel]. Persist the right width.
+        if let Some(w) = sizes.get(1).map(|s| s.as_f32()) {
+            if (w - self.work_right_width).abs() > 0.5 {
+                self.work_right_width = w;
+                self.schedule_persist(cx);
+            }
+        }
+    }
+
+    /// Cycle Wide → Fit → Mini → Wide; resizes the OS window to match.
+    pub(crate) fn cycle_work_density(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.work_mode {
+            return;
+        }
+        self.set_work_density(self.work_density.next(), window, cx);
+    }
+
+    pub(crate) fn set_work_density(
+        &mut self,
+        density: WorkDensity,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.work_density == density {
+            return;
+        }
+        let prev = self.work_density;
+        // Snapshot roomy bounds before the first compact step.
+        if prev == WorkDensity::Wide && density != WorkDensity::Wide {
+            if let Some(b) = self.window_bounds {
+                self.work_restore_bounds = Some(b);
+            }
+        }
+        // If the user hand-resized while in Fit/Mini and right width still
+        // matches the old density default, snap to the new default so Mini
+        // does not keep a Wide-sized host panel.
+        let prev_default = prev.default_right_width();
+        if self.work_right_width <= 0.0
+            || (self.work_right_width - prev_default).abs() < 1.0
+        {
+            self.work_right_width = density.default_right_width();
+        } else {
+            let (lo, hi) = density.right_width_range();
+            self.work_right_width = self.work_right_width.clamp(lo, hi);
+        }
+        self.work_density = density;
+        self.apply_work_density_window(window);
+        self.schedule_persist(cx);
+        cx.notify();
+    }
+
+    fn apply_work_density_window(&mut self, window: &mut Window) {
+        if window.is_fullscreen() {
+            return;
+        }
+        match self.work_density.window_size() {
+            Some((w, h)) => {
+                window.resize(size(px(w), px(h)));
+            }
+            None => {
+                if let Some((_x, _y, w, h)) = self.work_restore_bounds {
+                    window.resize(size(px(w.max(640.0)), px(h.max(400.0))));
+                }
+            }
+        }
     }
 
     /// Refresh `work_identity_reveal` from peek / Map latch state.
