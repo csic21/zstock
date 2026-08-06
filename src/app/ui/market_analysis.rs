@@ -26,14 +26,18 @@ impl StockApp {
     ) -> impl IntoElement {
         let region = self.market_analysis_region;
         let sectors = self.market_analysis_sectors.clone();
-        let total = sectors.len();
-        let advances = sectors.iter().filter(|s| s.change_pct > 0.0).count();
-        let declines = sectors.iter().filter(|s| s.change_pct < 0.0).count();
-        let unchanged = total.saturating_sub(advances + declines);
-        let average_change = if total == 0 {
+        let sector_total = sectors.len();
+        let sector_advances = sectors.iter().filter(|s| s.change_pct > 0.0).count();
+        let sector_declines = sectors.iter().filter(|s| s.change_pct < 0.0).count();
+        let sector_unchanged = sector_total.saturating_sub(sector_advances + sector_declines);
+        let stock_advances: u64 = sectors.iter().map(|s| s.advances).sum();
+        let stock_declines: u64 = sectors.iter().map(|s| s.declines).sum();
+        let stock_unchanged: u64 = sectors.iter().map(|s| s.unchanged).sum();
+        let stock_total = stock_advances + stock_declines + stock_unchanged;
+        let average_change = if sector_total == 0 {
             None
         } else {
-            Some(sectors.iter().map(|s| s.change_pct).sum::<f64>() / total as f64)
+            Some(sectors.iter().map(|s| s.change_pct).sum::<f64>() / sector_total as f64)
         };
         let strongest = sectors
             .iter()
@@ -52,11 +56,11 @@ impl StockApp {
         } else {
             cx.theme().muted_foreground
         };
-        let total_for_meter = total.max(1) as f32;
+        let total_for_meter = stock_total.max(1) as f32;
         let meter_w = 288.0;
-        let up_w = (advances as f32 / total_for_meter * meter_w).clamp(0.0, meter_w);
-        let flat_w = (unchanged as f32 / total_for_meter * meter_w).clamp(0.0, meter_w);
-        let down_w = (declines as f32 / total_for_meter * meter_w).clamp(0.0, meter_w);
+        let up_w = (stock_advances as f32 / total_for_meter * meter_w).clamp(0.0, meter_w);
+        let flat_w = (stock_unchanged as f32 / total_for_meter * meter_w).clamp(0.0, meter_w);
+        let down_w = (stock_declines as f32 / total_for_meter * meter_w).clamp(0.0, meter_w);
 
         v_flex()
             .id("market-analysis-page")
@@ -217,8 +221,18 @@ impl StockApp {
                                     ),
                                     self.render_analysis_stat(
                                         "行业涨跌",
-                                        &format!("↑ {} · ↓ {}", advances, declines),
-                                        &format!("共 {} 个行业板块", total),
+                                        &format!("↑ {} · ↓ {}", sector_advances, sector_declines),
+                                        &format!(
+                                            "共 {} 个行业板块，平 {}",
+                                            sector_total, sector_unchanged
+                                        ),
+                                        cx.theme().foreground,
+                                        cx,
+                                    ),
+                                    self.render_analysis_stat(
+                                        "成分股涨跌",
+                                        &format!("↑ {} · ↓ {}", stock_advances, stock_declines),
+                                        &format!("接口合计 {} 只", stock_total),
                                         cx.theme().foreground,
                                         cx,
                                     ),
@@ -329,7 +343,7 @@ impl StockApp {
                                                     .bg(cx.theme().sidebar)
                                                     .child(self.render_analysis_section_title(
                                                         "市场宽度",
-                                                        "行业板块涨跌分布",
+                                                        "行业成分股涨跌分布",
                                                         cx,
                                                     ))
                                                     .child(
@@ -373,8 +387,8 @@ impl StockApp {
                                                                 div()
                                                                     .text_color(cx.theme().red)
                                                                     .child(format!(
-                                                                        "上涨 {}",
-                                                                        advances
+                                                                        "上涨个股 {}",
+                                                                        stock_advances
                                                                     )),
                                                             )
                                                             .child(
@@ -383,16 +397,16 @@ impl StockApp {
                                                                         cx.theme().muted_foreground,
                                                                     )
                                                                     .child(format!(
-                                                                        "平 {}",
-                                                                        unchanged
+                                                                        "平盘 {}",
+                                                                        stock_unchanged
                                                                     )),
                                                             )
                                                             .child(
                                                                 div()
                                                                     .text_color(cx.theme().green)
                                                                     .child(format!(
-                                                                        "下跌 {}",
-                                                                        declines
+                                                                        "下跌个股 {}",
+                                                                        stock_declines
                                                                     )),
                                                             ),
                                                     )
@@ -474,7 +488,7 @@ impl StockApp {
                                                     .bg(cx.theme().sidebar)
                                                     .child(self.render_analysis_section_title(
                                                         "分析提示",
-                                                        "基于当前快照的快速判断",
+                                                        "基于行业与成分股快照的快速判断",
                                                         cx,
                                                     ))
                                                     .child(
@@ -483,9 +497,9 @@ impl StockApp {
                                                             .text_color(cx.theme().foreground)
                                                             .child(self.analysis_summary(
                                                                 average_change,
-                                                                advances,
-                                                                declines,
-                                                                total,
+                                                                stock_advances,
+                                                                stock_declines,
+                                                                stock_total,
                                                                 strongest,
                                                             )),
                                                     )
@@ -713,13 +727,19 @@ impl StockApp {
                 a.change_pct.total_cmp(&b.change_pct)
             }
         });
-        rows.truncate(6);
+        let sector_count = rows.len();
         let has_rows = !rows.is_empty();
         let row_elements: Vec<_> = rows
             .into_iter()
             .enumerate()
             .map(|(ix, sector)| self.render_sector_row(ix, sector, cx).into_any_element())
             .collect();
+        let list_id = if strongest {
+            "market-analysis-strong-list"
+        } else {
+            "market-analysis-weak-list"
+        };
+        let subtitle = format!("{subtitle} · 全部 {sector_count} 个");
 
         v_flex()
             .gap_3()
@@ -728,24 +748,26 @@ impl StockApp {
             .border_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().sidebar)
-            .child(self.render_analysis_section_title(title, subtitle, cx))
+            .child(self.render_analysis_section_title(title, &subtitle, cx))
             .child(
-                v_flex()
-                    .gap_0()
-                    .when(!has_rows, |col| {
-                        col.child(
-                            div()
-                                .py_4()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(if self.market_analysis_loading {
-                                    "板块数据加载中…"
-                                } else {
-                                    "暂无板块快照，点击右上角刷新"
-                                }),
-                        )
-                    })
-                    .children(row_elements),
+                div().id(list_id).max_h(px(520.)).overflow_y_scroll().child(
+                    v_flex()
+                        .gap_0()
+                        .when(!has_rows, |col| {
+                            col.child(
+                                div()
+                                    .py_4()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if self.market_analysis_loading {
+                                        "板块数据加载中…"
+                                    } else {
+                                        "暂无板块快照，点击右上角刷新"
+                                    }),
+                            )
+                        })
+                        .children(row_elements),
+                ),
             )
             .into_any_element()
     }
@@ -854,20 +876,20 @@ impl StockApp {
     fn analysis_summary(
         &self,
         average_change: Option<f64>,
-        advances: usize,
-        declines: usize,
-        total: usize,
+        advances: u64,
+        declines: u64,
+        total: u64,
         strongest: Option<&SectorTick>,
     ) -> String {
         if total == 0 {
-            return "市场宽度数据尚未返回，刷新后可查看行业扩散与强弱方向。".into();
+            return "市场宽度数据尚未返回，刷新后可查看成分股扩散与行业强弱方向。".into();
         }
         let bias = if advances > declines {
-            "上涨行业占优，市场情绪偏积极"
+            "上涨个股占优，市场情绪偏积极"
         } else if declines > advances {
-            "下跌行业占优，市场情绪偏谨慎"
+            "下跌个股占优，市场情绪偏谨慎"
         } else {
-            "行业涨跌接近平衡，市场处于分化状态"
+            "个股涨跌接近平衡，市场处于分化状态"
         };
         let avg = average_change
             .map(|v| format!("平均 {v:+.2}%"))

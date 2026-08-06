@@ -171,10 +171,10 @@ pub fn fetch_major_indices() -> Result<Vec<QuoteTick>> {
 
 /// A 股行业板块涨跌榜（东财行业口径）。
 pub fn fetch_a_share_industry_sectors() -> Result<Vec<SectorTick>> {
-    // Eastmoney's industry-board universe. Keep the request deliberately
-    // small: the analysis page only needs the first 100 rows.
+    // Request the complete industry-board universe. The UI presents the
+    // result in a scrollable list instead of silently dropping rows.
     let path = "/api/qt/clist/get?\
-        pn=1&pz=100&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281\
+        pn=1&pz=2000&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281\
         &fltt=2&invt=2&fid=f3&fs=m:90%2Bt:2\
         &fields=f12,f14,f2,f3,f4,f5,f6,f104,f105,f106";
     let mut last_err = anyhow!("板块接口未返回数据");
