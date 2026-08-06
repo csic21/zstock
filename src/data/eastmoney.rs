@@ -1,16 +1,18 @@
-//! Free A-share market data via Eastmoney public HTTP APIs (no API key).
+//! Free A 股 + 港股 market data via Eastmoney public HTTP APIs (no API key).
 //!
 //! Endpoints (unofficial, same as used by many open-source tools e.g. AKShare):
-//! - Quotes: `push2.eastmoney.com/api/qt/ulist.np/get`
-//! - History K: `push2his.eastmoney.com/api/qt/stock/kline/get`
-//! - Search: `searchapi.eastmoney.com/api/suggest/get`
+//! - Quotes: `push2.eastmoney.com/api/qt/ulist.np/get`（港股 secid `116.xxxxx`，delay 节点更稳）
+//! - History K: `push2his.eastmoney.com/api/qt/stock/kline/get`（港股 K 常空，靠腾讯备源）
+//! - Search: `searchapi.eastmoney.com/api/suggest/get`（含港股）
 //!
 //! These are free for personal tooling but have no SLA; rate-limit politely.
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 
-use crate::model::{Candle, Symbol, board_for_code, secid_for_code, shared};
+use crate::model::{
+    Candle, Symbol, board_for_code, is_hk_code, normalize_code, secid_for_code, shared,
+};
 
 const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
@@ -40,6 +42,14 @@ const PUSH2_HOSTS: &[&str] = &[
     "82.push2.eastmoney.com",
     "80.push2.eastmoney.com",
     "push2delay.eastmoney.com",
+];
+
+/// Prefer delay node first when the request includes 港股（主节点对 116.* 常 empty-reply）。
+const PUSH2_HOSTS_HK: &[&str] = &[
+    "push2delay.eastmoney.com",
+    "push2.eastmoney.com",
+    "82.push2.eastmoney.com",
+    "80.push2.eastmoney.com",
 ];
 
 fn get_json(url: &str) -> Result<Value> {
@@ -81,17 +91,33 @@ pub fn short_http_err(msg: &str) -> String {
     if msg.len() > 80 { format!("{s}…") } else { s }
 }
 
-/// Batch quotes for a list of pure codes (`600519`, `000001`, …).
+/// Batch quotes for a list of pure codes (`600519`, `000001`, `00700`, …).
 pub fn fetch_quotes(codes: &[String]) -> Result<Vec<QuoteTick>> {
     if codes.is_empty() {
         return Ok(vec![]);
     }
     let secids: Vec<String> = codes.iter().map(|c| secid_for_code(c)).collect();
-    fetch_quotes_by_secids(&secids)
+    let prefer_hk = codes.iter().any(|c| is_hk_code(c));
+    fetch_quotes_by_secids_with_hosts(&secids, if prefer_hk { PUSH2_HOSTS_HK } else { PUSH2_HOSTS })
 }
 
 /// Quotes by raw Eastmoney `secid` list (e.g. `1.000001` 上证指数).
 pub fn fetch_quotes_by_secids(secids: &[String]) -> Result<Vec<QuoteTick>> {
+    let prefer_hk = secids.iter().any(|s| s.starts_with("116."));
+    fetch_quotes_by_secids_with_hosts(
+        secids,
+        if prefer_hk {
+            PUSH2_HOSTS_HK
+        } else {
+            PUSH2_HOSTS
+        },
+    )
+}
+
+fn fetch_quotes_by_secids_with_hosts(
+    secids: &[String],
+    hosts: &[&str],
+) -> Result<Vec<QuoteTick>> {
     if secids.is_empty() {
         return Ok(vec![]);
     }
@@ -104,7 +130,7 @@ pub fn fetch_quotes_by_secids(secids: &[String]) -> Result<Vec<QuoteTick>> {
     );
 
     let mut last_err = anyhow!("no host tried");
-    for host in PUSH2_HOSTS {
+    for host in hosts {
         let url = format!("https://{host}{path}");
         match get_json(&url) {
             Ok(v) => {
@@ -250,34 +276,53 @@ pub fn search_symbols(query: &str, limit: usize) -> Result<Vec<Symbol>> {
         .and_then(|x| x.as_array())
     {
         for it in arr {
-            let code = it
+            let raw_code = it
                 .get("Code")
                 .and_then(|x| x.as_str())
                 .unwrap_or_default()
                 .trim()
                 .to_string();
-            if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
-                continue;
-            }
             let typ = it
                 .get("SecurityTypeName")
                 .and_then(|x| x.as_str())
                 .unwrap_or("");
-            let mkt = it.get("MktNum").and_then(|x| x.as_str()).unwrap_or("");
-            if !(typ.contains('A')
-                || typ.contains("ETF")
-                || typ.contains("股票")
-                || typ.is_empty()
-                || mkt == "0"
-                || mkt == "1")
-            {
+            let mkt = mkt_num_str(it.get("MktNum"));
+            let classify = it
+                .get("Classify")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let jys = it.get("JYS").and_then(|x| x.as_str()).unwrap_or("");
+            let is_hk = mkt == "116"
+                || classify.eq_ignore_ascii_case("HK")
+                || jys.eq_ignore_ascii_case("HK")
+                || typ.contains("港股");
+            let is_a = raw_code.len() == 6
+                && raw_code.chars().all(|c| c.is_ascii_digit())
+                && (typ.contains('A')
+                    || typ.contains("ETF")
+                    || typ.contains("股票")
+                    || typ.is_empty()
+                    || mkt == "0"
+                    || mkt == "1"
+                    || classify.eq_ignore_ascii_case("AStock"));
+            let code = if is_hk {
+                match pad_hk_code(&raw_code) {
+                    Some(c) => c,
+                    None => continue,
+                }
+            } else if is_a {
+                raw_code.clone()
+            } else {
                 continue;
-            }
+            };
             let name = it
                 .get("Name")
                 .and_then(|x| x.as_str())
                 .unwrap_or(&code)
                 .to_string();
+            if out.iter().any(|s: &Symbol| s.code == code) {
+                continue;
+            }
             out.push(Symbol {
                 code: code.clone(),
                 name: shared(name),
@@ -292,19 +337,37 @@ pub fn search_symbols(query: &str, limit: usize) -> Result<Vec<Symbol>> {
         }
     }
 
-    // Fallback: pure 6-digit code
-    if out.is_empty() && q.chars().all(|c| c.is_ascii_digit()) && q.len() == 6 {
-        return Ok(vec![Symbol {
-            code: q.to_string(),
-            name: shared(q),
-            last: 0.0,
-            change_pct: 0.0,
-            volume: 0,
-            board: board_for_code(q),
-        }]);
+    // Fallback: pure 6-digit A / 5-digit HK / hk-prefixed
+    if out.is_empty() {
+        if let Some(code) = normalize_code(q) {
+            return Ok(vec![Symbol {
+                code: code.clone(),
+                name: shared(code.clone()),
+                last: 0.0,
+                change_pct: 0.0,
+                volume: 0,
+                board: board_for_code(&code),
+            }]);
+        }
     }
 
     Ok(out)
+}
+
+fn mkt_num_str(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn pad_hk_code(raw: &str) -> Option<String> {
+    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() || digits.len() > 5 {
+        return None;
+    }
+    Some(format!("{digits:0>5}"))
 }
 
 fn num_f64(v: Option<&Value>) -> f64 {

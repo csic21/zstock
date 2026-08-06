@@ -1,8 +1,8 @@
-//! Free A-share data via Tencent Finance public HTTP APIs (no API key).
+//! Free A 股 + 港股 data via Tencent Finance public HTTP APIs (no API key).
 //!
-//! - Quotes: `qt.gtimg.cn/q=sh600519,sz000001` (GBK text, `~` fields)
+//! - Quotes: `qt.gtimg.cn/q=sh600519,sz000001,hk00700` (GBK text, `~` fields)
 //! - Daily K: `web.ifzq.gtimg.cn/.../newfqkline/get` 前复权 (`qfq`；旧 `fqkline` 兜底)
-//! - Search: `smartbox.gtimg.cn/s3/?q=…&t=all`
+//! - Search: `smartbox.gtimg.cn/s3/?q=…&t=all`（含 `hk~` 港股）
 //!
 //! Used as failover when Eastmoney is unavailable. No SLA; rate-limit politely.
 //! K-line window is capped (~640 bars on this endpoint).
@@ -11,7 +11,8 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 
 use crate::model::{
-    Candle, MinutePeriod, MinutePoint, MinuteSeries, Symbol, board_for_code, shared,
+    Candle, MinutePeriod, MinutePoint, MinuteSeries, Symbol, board_for_code, is_hk_code, normalize_code,
+    shared,
 };
 
 use super::eastmoney::QuoteTick;
@@ -27,10 +28,12 @@ fn agent() -> ureq::Agent {
         .build()
 }
 
-/// `sh600519` / `sz000001` / `bj830799`
+/// `sh600519` / `sz000001` / `bj830799` / `hk00700`
 pub fn tencent_symbol(code: &str) -> String {
     let code = code.trim();
-    if is_sh_market(code) {
+    if is_hk_code(code) {
+        format!("hk{code}")
+    } else if is_sh_market(code) {
         format!("sh{code}")
     } else if is_bj_market(code) {
         format!("bj{code}")
@@ -40,12 +43,13 @@ pub fn tencent_symbol(code: &str) -> String {
 }
 
 fn is_sh_market(code: &str) -> bool {
-    code.starts_with('6') || code.starts_with('5') || code.starts_with('9')
+    !is_hk_code(code)
+        && (code.starts_with('6') || code.starts_with('5') || code.starts_with('9'))
 }
 
 fn is_bj_market(code: &str) -> bool {
-    // 北交所常见 4xxxxx / 8xxxxx
-    code.starts_with('4') || code.starts_with('8')
+    // 北交所常见 4xxxxx / 8xxxxx（6 位 A 股）
+    !is_hk_code(code) && (code.starts_with('4') || code.starts_with('8'))
 }
 
 fn decode_body_bytes(bytes: &[u8]) -> String {
@@ -89,7 +93,7 @@ fn fetch_json(url: &str) -> Result<Value> {
     serde_json::from_str(json_str).context("parse tencent json")
 }
 
-/// Batch quotes for pure codes (`600519`, `000001`, …).
+/// Batch quotes for pure codes (`600519`, `000001`, `00700`, …).
 pub fn fetch_quotes(codes: &[String]) -> Result<Vec<QuoteTick>> {
     if codes.is_empty() {
         return Ok(vec![]);
@@ -393,7 +397,7 @@ fn format_minute_label(ts: &str) -> String {
     }
 }
 
-/// SmartBox search (name / pinyin / code). Filters to A-share style 6-digit codes.
+/// SmartBox search (name / pinyin / code). A 股 6 位 + 港股 5 位。
 pub fn search_symbols(query: &str, limit: usize) -> Result<Vec<Symbol>> {
     let q = query.trim();
     if q.is_empty() {
@@ -407,22 +411,24 @@ pub fn search_symbols(query: &str, limit: usize) -> Result<Vec<Symbol>> {
     let body = fetch_text(&url, "https://finance.qq.com")?;
     let mut out = parse_smartbox(&body, limit);
 
-    // Fallback: pure 6-digit code
-    if out.is_empty() && q.chars().all(|c| c.is_ascii_digit()) && q.len() == 6 {
-        out.push(Symbol {
-            code: q.to_string(),
-            name: shared(q),
-            last: 0.0,
-            change_pct: 0.0,
-            volume: 0,
-            board: board_for_code(q),
-        });
+    // Fallback: pure 6-digit A / 5-digit HK / explicit hk prefix
+    if out.is_empty() {
+        if let Some(code) = normalize_code(q) {
+            out.push(Symbol {
+                code: code.clone(),
+                name: shared(code.clone()),
+                last: 0.0,
+                change_pct: 0.0,
+                volume: 0,
+                board: board_for_code(&code),
+            });
+        }
     }
     Ok(out)
 }
 
 fn parse_smartbox(body: &str, limit: usize) -> Vec<Symbol> {
-    // v_hint="sh~600519~\u8d35\u5dde\u8305\u53f0~gzmt~GP-A^sz~000001~…"
+    // v_hint="sh~600519~\u8d35\u5dde\u8305\u53f0~gzmt~GP-A^hk~00700~\u817e\u8baf\u63a7\u80a1~…"
     let payload = body
         .find("=\"")
         .map(|i| &body[i + 2..])
@@ -446,16 +452,26 @@ fn parse_smartbox(body: &str, limit: usize) -> Vec<Symbol> {
             continue;
         }
         let market = parts[0].trim().to_ascii_lowercase();
-        if market != "sh" && market != "sz" && market != "bj" {
+        let is_hk = market == "hk";
+        if market != "sh" && market != "sz" && market != "bj" && !is_hk {
             continue;
         }
-        let code = parts[1].trim().to_string();
-        if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
+        let raw_code = parts[1].trim();
+        let code = if is_hk {
+            match pad_hk_search_code(raw_code) {
+                Some(c) => c,
+                None => continue,
+            }
+        } else {
+            let code = raw_code.to_string();
+            if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            code
+        };
         let typ = parts.get(4).map(|s| s.trim()).unwrap_or("");
-        // Drop pure indices / open-end funds; keep A-shares and common listed funds.
-        if typ == "ZS" || typ == "KJ" {
+        // Drop pure indices / open-end funds; keep equities and common listed funds.
+        if typ == "ZS" || typ == "KJ" || typ.starts_with("KJ-") {
             continue;
         }
         let name = decode_json_unicode_escapes(parts[2].trim());
@@ -478,6 +494,14 @@ fn parse_smartbox(body: &str, limit: usize) -> Vec<Symbol> {
         }
     }
     out
+}
+
+fn pad_hk_search_code(raw: &str) -> Option<String> {
+    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() || digits.len() > 5 {
+        return None;
+    }
+    Some(format!("{digits:0>5}"))
 }
 
 /// SmartBox returns literal `\uXXXX` sequences (not real UTF-8 Chinese).

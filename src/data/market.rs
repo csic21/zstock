@@ -1,12 +1,14 @@
 //! Multi-source market data with automatic failover.
 //!
-//! Quotes: Eastmoney → Tencent  
-//! Daily K: Eastmoney (前复权) → Tencent (前复权, ≤~640)  
-//! Search: Eastmoney → Tencent SmartBox
+//! Quotes: Eastmoney → Tencent（港股 secid `116.*` / `hkxxxxx`）  
+//! Daily K: Eastmoney (前复权) → Tencent (前复权, ≤~640；港股东财常空，腾讯可拉)  
+//! Search: Eastmoney → Tencent SmartBox（A 股 + 港股）
 
 use anyhow::{Result, anyhow};
 
-use crate::model::{Candle, MinutePeriod, MinuteSeries, Symbol, board_for_code, shared};
+use crate::model::{
+    Candle, MinutePeriod, MinuteSeries, Symbol, board_for_code, is_hk_code, shared,
+};
 
 use super::eastmoney::{self, QuoteTick};
 use super::tencent;
@@ -43,8 +45,35 @@ pub fn fetch_major_indices() -> Result<Sourced<Vec<QuoteTick>>> {
 }
 
 /// Batch quotes: Eastmoney → Tencent.
+///
+/// 纯港股列表优先腾讯（`qt.gtimg.cn/q=hk…` 更稳）；混仓 / 纯 A 仍东财优先。
 pub fn fetch_quotes(codes: &[String]) -> Result<Sourced<Vec<QuoteTick>>> {
     let n = codes.len();
+    let hk_only = !codes.is_empty() && codes.iter().all(|c| is_hk_code(c));
+    if hk_only {
+        match tencent::fetch_quotes(codes) {
+            Ok(data) if quotes_usable(&data, n) => {
+                return Ok(Sourced {
+                    data,
+                    source: SRC_TENCENT,
+                });
+            }
+            Ok(_) | Err(_) => {
+                // fall through to Eastmoney
+            }
+        }
+        match eastmoney::fetch_quotes(codes) {
+            Ok(data) if quotes_usable(&data, n) => {
+                return Ok(Sourced {
+                    data,
+                    source: SRC_EASTMONEY,
+                });
+            }
+            Ok(_) => return Err(anyhow!("行情为空（腾讯与东财均无有效港股数据）")),
+            Err(e) => return Err(anyhow!("港股行情失败: {e}")),
+        }
+    }
+
     match eastmoney::fetch_quotes(codes) {
         Ok(data) if quotes_usable(&data, n) => Ok(Sourced {
             data,
@@ -87,6 +116,31 @@ fn try_klines_chain(
     limit: usize,
     errors: &mut Vec<String>,
 ) -> Result<Sourced<(String, String, Vec<Candle>)>> {
+    // 港股：东财 his 常 empty / 空 klines，腾讯 `hkxxxxx` 日 K 可用 → 先腾讯。
+    if is_hk_code(code) {
+        match tencent::fetch_klines(code, limit) {
+            Ok(data) if !data.2.is_empty() => {
+                return Ok(Sourced {
+                    data,
+                    source: SRC_TENCENT,
+                });
+            }
+            Ok(_) => errors.push("腾讯无数据".into()),
+            Err(e) => errors.push(format!("腾讯: {e}")),
+        }
+        match eastmoney::fetch_klines(code, limit) {
+            Ok(data) if !data.2.is_empty() => {
+                return Ok(Sourced {
+                    data,
+                    source: SRC_EASTMONEY,
+                });
+            }
+            Ok(_) => errors.push("东财无数据".into()),
+            Err(e) => errors.push(format!("东财: {e}")),
+        }
+        return Err(anyhow!("K线失败: {}", errors.join("; ")));
+    }
+
     match eastmoney::fetch_klines(code, limit) {
         Ok(data) if !data.2.is_empty() => {
             return Ok(Sourced {

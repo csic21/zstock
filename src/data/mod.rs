@@ -3,7 +3,11 @@
 pub mod ai;
 pub mod eastmoney;
 pub mod indicators;
+pub mod levels;
 pub mod market;
+pub mod portfolio;
+pub mod scout;
+pub mod session;
 pub mod signals;
 pub mod sina;
 pub mod tencent;

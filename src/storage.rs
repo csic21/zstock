@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::data::ai::AiConfig;
+use crate::data::portfolio::Portfolio;
 use crate::data::treasure::TreasureCache;
 use crate::model::{TrendLine, default_watchlist_codes};
 
@@ -95,6 +96,101 @@ impl WatchlistSort {
     }
 }
 
+/// Work-mode chrome density + companion window size.
+///
+/// Cycles Wide → Fit → Mini → Wide. Fit/Mini shrink row heights, hide journal
+/// (Mini), and resize the OS window so the monitor skin fits a smaller desk
+/// footprint without looking like a full trading terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+#[repr(u32)]
+pub enum WorkDensity {
+    /// Current roomy layout; restores the pre-compact window when leaving Fit/Mini.
+    #[default]
+    Wide = 0,
+    /// Tighter rows + medium window (~920×580).
+    Fit = 1,
+    /// Densest chrome + small window (~720×440); journal hidden.
+    Mini = 2,
+}
+
+impl WorkDensity {
+    pub fn all() -> [Self; 3] {
+        [Self::Wide, Self::Fit, Self::Mini]
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Wide => Self::Fit,
+            Self::Fit => Self::Mini,
+            Self::Mini => Self::Wide,
+        }
+    }
+
+    /// Title-bar label (Focus chrome).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Wide => "Wide",
+            Self::Fit => "Fit",
+            Self::Mini => "Mini",
+        }
+    }
+
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            Self::Wide => "Window size · Wide (roomy) · click for Fit",
+            Self::Fit => "Window size · Fit (~920×580, denser) · click for Mini",
+            Self::Mini => "Window size · Mini (~720×440, densest) · click for Wide",
+        }
+    }
+
+    /// Target content size when entering this density. `None` = restore saved bounds.
+    pub fn window_size(self) -> Option<(f32, f32)> {
+        match self {
+            Self::Wide => None,
+            Self::Fit => Some((920.0, 580.0)),
+            Self::Mini => Some((720.0, 440.0)),
+        }
+    }
+
+    /// Default host-panel width for this density (px).
+    pub fn default_right_width(self) -> f32 {
+        match self {
+            Self::Wide => 340.0,
+            Self::Fit => 280.0,
+            Self::Mini => 220.0,
+        }
+    }
+
+    pub fn right_width_range(self) -> (f32, f32) {
+        match self {
+            Self::Wide => (260.0, 420.0),
+            Self::Fit => (200.0, 360.0),
+            Self::Mini => (160.0, 300.0),
+        }
+    }
+}
+
+#[cfg(test)]
+mod work_density_tests {
+    use super::WorkDensity;
+
+    #[test]
+    fn density_cycles_wide_fit_mini() {
+        assert_eq!(WorkDensity::Wide.next(), WorkDensity::Fit);
+        assert_eq!(WorkDensity::Fit.next(), WorkDensity::Mini);
+        assert_eq!(WorkDensity::Mini.next(), WorkDensity::Wide);
+    }
+
+    #[test]
+    fn mini_window_is_smaller_than_fit() {
+        let fit = WorkDensity::Fit.window_size().unwrap();
+        let mini = WorkDensity::Mini.window_size().unwrap();
+        assert!(mini.0 < fit.0 && mini.1 < fit.1);
+        assert!(WorkDensity::Wide.window_size().is_none());
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     /// Pure A-share codes in watchlist order.
@@ -133,6 +229,15 @@ pub struct AppConfig {
     /// Work mode: neutral copy + muted up/down colors (in-app toggle).
     #[serde(default)]
     pub work_mode: bool,
+    /// Work-mode layout density + companion window size (Wide / Fit / Mini).
+    #[serde(default)]
+    pub work_density: WorkDensity,
+    /// Right host-panel width in work mode (px). 0 = use density default.
+    #[serde(default)]
+    pub work_right_width: f32,
+    /// Work-mode private service nicknames (`code` → alias). Never shown as stock ids.
+    #[serde(default)]
+    pub work_aliases: std::collections::HashMap<String, String>,
     /// Quote poll interval in seconds (clamped 1..=120). Default 1.
     #[serde(default = "default_quote_interval_secs")]
     pub quote_interval_secs: u64,
@@ -151,6 +256,21 @@ pub struct AppConfig {
     /// Treasure financial-percentile filter (`off` / `pe` / `pb` / `value`).
     #[serde(default = "default_treasure_fin")]
     pub treasure_fin: String,
+    /// Show live quotes in the macOS menu bar (no-op on other platforms).
+    #[serde(default)]
+    pub status_bar_enabled: bool,
+    /// Watchlist codes pinned to the status bar (max 5). All pinned codes are shown together.
+    #[serde(default)]
+    pub status_bar_codes: Vec<String>,
+    /// Preferred pin when focusing a symbol from the menu (still all codes are displayed).
+    #[serde(default)]
+    pub status_bar_active: String,
+    /// Bottom analysis dock tab: `overview` | `strategy` | `ai` | `portfolio` | `treasure` | `indicators`.
+    #[serde(default = "default_detail_tab")]
+    pub detail_tab: String,
+    /// Left sidebar tab: `watchlist` | `portfolio` | `treasure`.
+    #[serde(default = "default_left_tab")]
+    pub left_tab: String,
 }
 
 fn default_true() -> bool {
@@ -162,7 +282,8 @@ fn default_chart_kind() -> String {
 }
 
 fn default_quote_interval_secs() -> u64 {
-    1
+    // 2s balances live feel vs full-UI cost of each poll notify.
+    2
 }
 
 fn default_treasure_pool() -> String {
@@ -171,6 +292,14 @@ fn default_treasure_pool() -> String {
 
 fn default_treasure_fin() -> String {
     "off".into()
+}
+
+fn default_detail_tab() -> String {
+    "overview".into()
+}
+
+fn default_left_tab() -> String {
+    "watchlist".into()
 }
 
 /// Clamp user-facing quote interval.
@@ -196,16 +325,81 @@ impl Default for AppConfig {
             show_boll: false,
             dock: DockLayout::default(),
             left_width: 280.0,
-            bottom_height: 200.0,
+            // Compact by default so the overview strip doesn't sit in a tall empty dock.
+            bottom_height: 168.0,
             color_scheme: ColorScheme::Cn,
             work_mode: false,
+            work_density: WorkDensity::Wide,
+            work_right_width: 0.0,
+            work_aliases: std::collections::HashMap::new(),
             quote_interval_secs: default_quote_interval_secs(),
             watchlist_sort: WatchlistSort::Manual,
             ai_api: AiConfig::default(),
             chart_lines: std::collections::HashMap::new(),
             treasure_pool: default_treasure_pool(),
             treasure_fin: default_treasure_fin(),
+            status_bar_enabled: false,
+            status_bar_codes: Vec::new(),
+            status_bar_active: String::new(),
+            detail_tab: default_detail_tab(),
+            left_tab: default_left_tab(),
         }
+    }
+}
+
+/// Max codes that can be pinned to the status bar (menu bar space is limited).
+pub const STATUS_BAR_MAX_CODES: usize = 5;
+
+/// Keep only watchlist members, preserve order, cap length, and fix active.
+pub fn normalize_status_bar(
+    enabled: bool,
+    codes: &[String],
+    active: &str,
+    watchlist: &[String],
+) -> (bool, Vec<String>, String) {
+    let mut out = Vec::new();
+    for c in codes {
+        if watchlist.iter().any(|w| w == c) && !out.iter().any(|x| x == c) {
+            out.push(c.clone());
+            if out.len() >= STATUS_BAR_MAX_CODES {
+                break;
+            }
+        }
+    }
+    let active = if out.iter().any(|c| c == active) {
+        active.to_string()
+    } else {
+        out.first().cloned().unwrap_or_default()
+    };
+    // Enabling with no pins is allowed; UI can auto-pin selected on toggle.
+    (enabled, out, active)
+}
+
+#[cfg(test)]
+mod status_bar_tests {
+    use super::{normalize_status_bar, STATUS_BAR_MAX_CODES};
+
+    #[test]
+    fn drops_codes_not_in_watchlist_and_caps() {
+        let watch: Vec<String> = (0..10).map(|i| format!("60000{i}")).collect();
+        let codes: Vec<String> = (0..8)
+            .map(|i| format!("60000{i}"))
+            .chain(std::iter::once("999999".into()))
+            .collect();
+        let (en, out, active) = normalize_status_bar(true, &codes, "600003", &watch);
+        assert!(en);
+        assert_eq!(out.len(), STATUS_BAR_MAX_CODES);
+        assert_eq!(active, "600003");
+        assert!(!out.iter().any(|c| c == "999999"));
+    }
+
+    #[test]
+    fn resets_active_when_missing() {
+        let watch = vec!["600519".into(), "000001".into()];
+        let codes = vec!["600519".into()];
+        let (_, out, active) = normalize_status_bar(true, &codes, "000001", &watch);
+        assert_eq!(out, vec!["600519".to_string()]);
+        assert_eq!(active, "600519");
     }
 }
 
@@ -222,6 +416,10 @@ pub fn config_path() -> PathBuf {
 
 pub fn treasure_cache_path() -> PathBuf {
     app_data_dir().join("treasure_cache.json")
+}
+
+pub fn portfolio_path() -> PathBuf {
+    app_data_dir().join("portfolio.json")
 }
 
 pub fn load_config() -> AppConfig {
@@ -258,6 +456,25 @@ pub fn save_treasure_cache(cache: &TreasureCache) -> Result<()> {
             .with_context(|| format!("create {}", parent.display()))?;
     }
     let s = serde_json::to_string_pretty(cache)?;
+    fs::write(&path, s).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+pub fn load_portfolio() -> Portfolio {
+    let path = portfolio_path();
+    match fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => Portfolio::default(),
+    }
+}
+
+pub fn save_portfolio(portfolio: &Portfolio) -> Result<()> {
+    let path = portfolio_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create {}", parent.display()))?;
+    }
+    let s = serde_json::to_string_pretty(portfolio)?;
     fs::write(&path, s).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
