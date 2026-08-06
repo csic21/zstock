@@ -162,6 +162,7 @@ impl StockApp {
             return;
         }
         self.work_mode = on;
+        self.market_analysis_open = false;
         self.clear_work_identity(cx);
         self.cancel_work_alias_edit(cx);
         self.palette_query.update(cx, |input, cx| {
@@ -920,6 +921,7 @@ impl StockApp {
         self.settings_open = !self.settings_open;
         if self.settings_open {
             self.palette_open = false;
+            self.market_analysis_open = false;
             // Re-enter on General so the page feels fresh each open.
             self.settings_section = SettingsSection::General;
         }

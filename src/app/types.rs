@@ -118,6 +118,25 @@ impl LeftTab {
     }
 }
 
+/// Market region shown by the market-analysis page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum MarketRegion {
+    #[default]
+    AShare,
+    Hk,
+    Us,
+}
+
+impl MarketRegion {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::AShare => "A股",
+            Self::Hk => "港股",
+            Self::Us => "美股",
+        }
+    }
+}
+
 /// Full-page settings navigation (replaces the old modal dialog).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u32)]
@@ -282,4 +301,3 @@ pub(crate) struct AiCacheEntry {
     pub(crate) text: String,
     pub(crate) source: AiSource,
 }
-

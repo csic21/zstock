@@ -11,6 +11,8 @@ use crate::model::{
 };
 
 use super::eastmoney::{self, QuoteTick};
+
+pub use super::eastmoney::SectorTick;
 use super::tencent;
 
 /// Successful fetch tagged with which backend served it.

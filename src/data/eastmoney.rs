@@ -29,6 +29,21 @@ pub struct QuoteTick {
     pub prev_close: f64,
 }
 
+/// A 股行业板块的实时快照。
+///
+/// Eastmoney 的板块列表接口同时返回涨跌幅、成交额和涨跌家数，足够支撑
+/// 市场分析页的热度榜与市场宽度概览。
+#[derive(Debug, Clone)]
+pub struct SectorTick {
+    pub code: String,
+    pub name: String,
+    pub change_pct: f64,
+    pub amount: f64,
+    pub advances: u64,
+    pub declines: u64,
+    pub unchanged: u64,
+}
+
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(8))
@@ -152,6 +167,62 @@ pub fn fetch_major_indices() -> Result<Vec<QuoteTick>> {
         "0.399006".into(), // 创业板指
     ];
     fetch_quotes_by_secids(&secids)
+}
+
+/// A 股行业板块涨跌榜（东财行业口径）。
+pub fn fetch_a_share_industry_sectors() -> Result<Vec<SectorTick>> {
+    // Eastmoney's industry-board universe. Keep the request deliberately
+    // small: the analysis page only needs the first 100 rows.
+    let path = "/api/qt/clist/get?\
+        pn=1&pz=100&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281\
+        &fltt=2&invt=2&fid=f3&fs=m:90%2Bt:2\
+        &fields=f12,f14,f2,f3,f4,f5,f6,f104,f105,f106";
+    let mut last_err = anyhow!("板块接口未返回数据");
+    for host in PUSH2_HOSTS {
+        let url = format!("https://{host}{path}");
+        match get_json(&url).and_then(parse_sector_diff) {
+            Ok(data) if !data.is_empty() => return Ok(data),
+            Ok(_) => last_err = anyhow!("板块数据为空"),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(anyhow!("板块行情不可用: {last_err}"))
+}
+
+fn parse_sector_diff(v: Value) -> Result<Vec<SectorTick>> {
+    let diff = v
+        .pointer("/data/diff")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| anyhow!("板块数据为空或格式异常"))?;
+
+    let mut out = Vec::with_capacity(diff.len());
+    for item in diff {
+        let code = item
+            .get("f12")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let name = item
+            .get("f14")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if code.is_empty() || name.is_empty() {
+            continue;
+        }
+        out.push(SectorTick {
+            code,
+            name,
+            change_pct: num_f64(item.get("f3")),
+            amount: num_f64(item.get("f6")),
+            advances: num_f64(item.get("f104")).max(0.0) as u64,
+            declines: num_f64(item.get("f105")).max(0.0) as u64,
+            unchanged: num_f64(item.get("f106")).max(0.0) as u64,
+        });
+    }
+    Ok(out)
 }
 
 fn parse_quote_diff(v: Value) -> Result<Vec<QuoteTick>> {

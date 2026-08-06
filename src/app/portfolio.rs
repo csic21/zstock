@@ -186,6 +186,10 @@ impl StockApp {
             self.close_settings(cx);
             return;
         }
+        if self.market_analysis_open {
+            self.close_market_analysis(cx);
+            return;
+        }
         if self.drawing_mode {
             self.drawing_mode = false;
             self.drawing_anchor = None;

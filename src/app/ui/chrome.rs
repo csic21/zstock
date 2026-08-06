@@ -211,6 +211,17 @@ impl StockApp {
                         )
                         .when(!work, |row| {
                             row.child(
+                                Button::new("market-analysis-btn")
+                                    .xsmall()
+                                    .when(self.market_analysis_open, |b| b.primary())
+                                    .when(!self.market_analysis_open, |b| b.ghost())
+                                    .label("市场分析")
+                                    .tooltip("区域市场 · 大盘指数 · 板块热度")
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.open_market_analysis(cx);
+                                    })),
+                            )
+                            .child(
                                 Button::new("treasure-btn")
                                     .ghost()
                                     .xsmall()

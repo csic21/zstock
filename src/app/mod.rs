@@ -10,6 +10,7 @@ mod chart_ctrl;
 mod helpers;
 mod labels;
 mod market;
+mod market_analysis;
 mod portfolio;
 mod prefs;
 mod series_cache;
@@ -51,7 +52,8 @@ use crate::storage::{
 use crate::update::UpdateState;
 
 use types::{
-    AiCacheEntry, AiPanelState, AiSource, ChartKind, ChartRange, DetailTab, LeftTab, SettingsSection,
+    AiCacheEntry, AiPanelState, AiSource, ChartKind, ChartRange, DetailTab, LeftTab, MarketRegion,
+    SettingsSection,
 };
 
 actions!(
@@ -149,6 +151,17 @@ pub struct StockApp {
     palette_index: usize,
     /// Full-page settings (not a modal).
     settings_open: bool,
+    /// Full-page market analysis view.
+    market_analysis_open: bool,
+    /// Region selected in the market analysis view.
+    market_analysis_region: MarketRegion,
+    /// Real-time A-share industry sectors.
+    market_analysis_sectors: Vec<market_data::SectorTick>,
+    market_analysis_loading: bool,
+    market_analysis_error: Option<SharedString>,
+    market_analysis_source: SharedString,
+    market_analysis_updated: Option<SharedString>,
+    market_analysis_gen: u64,
     /// Active section inside the settings page.
     settings_section: SettingsSection,
     /// Auto-update state (GitHub Releases).
@@ -498,6 +511,14 @@ impl StockApp {
             palette_open: false,
             palette_index: 0,
             settings_open: false,
+            market_analysis_open: false,
+            market_analysis_region: MarketRegion::AShare,
+            market_analysis_sectors: Vec::new(),
+            market_analysis_loading: false,
+            market_analysis_error: None,
+            market_analysis_source: shared(market_data::SRC_EASTMONEY),
+            market_analysis_updated: None,
+            market_analysis_gen: 0,
             settings_section: SettingsSection::General,
             update_state: UpdateState::Idle,
             quote_interval_secs: clamp_quote_interval_secs(cfg.quote_interval_secs),
@@ -706,6 +727,14 @@ impl Render for StockApp {
                     .overflow_hidden()
                     .child(self.render_settings(window, cx))
                     .into_any_element()
+            } else if self.market_analysis_open {
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_hidden()
+                    .child(self.render_market_analysis(window, cx))
+                    .into_any_element()
             } else if work {
                 div()
                     .flex_1()
@@ -777,9 +806,10 @@ impl Render for StockApp {
                     )
                     .into_any_element()
             })
-            .when(self.palette_open && !self.settings_open, |this| {
-                this.child(self.render_palette(cx))
-            })
+            .when(
+                self.palette_open && !self.settings_open && !self.market_analysis_open,
+                |this| this.child(self.render_palette(cx)),
+            )
             .children(Root::render_dialog_layer(window, cx))
     }
 }
@@ -1103,4 +1133,3 @@ mod layout_regression_tests {
         );
     }
 }
-
