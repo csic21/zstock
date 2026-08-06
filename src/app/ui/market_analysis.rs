@@ -6,17 +6,18 @@ use gpui::{
     StatefulInteractiveElement, Styled, canvas, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
-    ActiveTheme, Sizable, StyledExt,
+    ActiveTheme, Disableable, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex, v_flex,
 };
 
 use crate::chart::paint_sparkline;
 use crate::data::market::SectorTick;
+use crate::data::market_analysis::{self as analysis, FearGreedIndex, MarketPick};
 use crate::data::session::MarketId;
 use crate::model::IndexSnap;
 
-use super::super::{MarketRegion, StockApp};
+use super::super::{AiPanelState, MarketRegion, StockApp};
 
 impl StockApp {
     pub(crate) fn render_market_analysis(
@@ -26,6 +27,9 @@ impl StockApp {
     ) -> impl IntoElement {
         let region = self.market_analysis_region;
         let sectors = self.market_analysis_sectors.clone();
+        let sentiment_context =
+            analysis::build_context("", &sectors, self.market_index_points(), Vec::new());
+        let fear_greed = sentiment_context.fear_greed;
         let sector_total = sectors.len();
         let sector_advances = sectors.iter().filter(|s| s.change_pct > 0.0).count();
         let sector_declines = sectors.iter().filter(|s| s.change_pct < 0.0).count();
@@ -61,6 +65,11 @@ impl StockApp {
         let up_w = (stock_advances as f32 / total_for_meter * meter_w).clamp(0.0, meter_w);
         let flat_w = (stock_unchanged as f32 / total_for_meter * meter_w).clamp(0.0, meter_w);
         let down_w = (stock_declines as f32 / total_for_meter * meter_w).clamp(0.0, meter_w);
+        let fear_greed_color = if fear_greed.is_greed() {
+            cx.theme().red
+        } else {
+            cx.theme().green
+        };
 
         v_flex()
             .id("market-analysis-page")
@@ -220,6 +229,13 @@ impl StockApp {
                                         cx,
                                     ),
                                     self.render_analysis_stat(
+                                        "贪婪恐惧",
+                                        &format!("{:.0} · {}", fear_greed.score, fear_greed.label),
+                                        "0 恐惧 · 50 中性 · 100 贪婪",
+                                        fear_greed_color,
+                                        cx,
+                                    ),
+                                    self.render_analysis_stat(
                                         "行业涨跌",
                                         &format!("↑ {} · ↓ {}", sector_advances, sector_declines),
                                         &format!(
@@ -260,6 +276,7 @@ impl StockApp {
                                     ),
                                 ]),
                             )
+                            .child(self.render_fear_greed_panel(fear_greed, cx))
                             .child(
                                 v_flex()
                                     .gap_3()
@@ -532,9 +549,306 @@ impl StockApp {
                                         .text_color(cx.theme().muted_foreground)
                                         .child("正在读取 A 股行业板块数据…"),
                                 )
-                            }),
+                            })
+                            .child(self.render_market_ai_panel(cx)),
                     ),
             )
+    }
+
+    fn render_fear_greed_panel(&self, index: FearGreedIndex, cx: &mut Context<Self>) -> AnyElement {
+        let color = if index.is_greed() {
+            cx.theme().red
+        } else {
+            cx.theme().green
+        };
+        let meter_w = (index.score as f32 / 100.0 * 420.0).clamp(0.0, 420.0);
+        v_flex()
+            .gap_3()
+            .p_4()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().sidebar)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(self.render_analysis_section_title(
+                        "市场贪婪恐惧指数",
+                        "本地可解释模型 · 非官方指标",
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .text_color(color)
+                            .child(format!("{:.0} · {}", index.score, index.label)),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(10.))
+                    .w_full()
+                    .rounded_full()
+                    .overflow_hidden()
+                    .bg(cx.theme().muted)
+                    .child(div().h_full().w(px(meter_w)).bg(color)),
+            )
+            .child(
+                h_flex()
+                    .gap_3()
+                    .flex_wrap()
+                    .children([
+                        self.render_analysis_metric_row(
+                            "个股扩散",
+                            &format!("{:.0}", index.stock_breadth),
+                            "上涨/平盘/下跌".to_string(),
+                            color,
+                            cx,
+                        ),
+                        self.render_analysis_metric_row(
+                            "行业扩散",
+                            &format!("{:.0}", index.sector_breadth),
+                            "行业指数涨跌".to_string(),
+                            color,
+                            cx,
+                        ),
+                        self.render_analysis_metric_row(
+                            "指数动量",
+                            &format!("{:.0}", index.index_momentum),
+                            "三大指数".to_string(),
+                            color,
+                            cx,
+                        ),
+                        self.render_analysis_metric_row(
+                            "行业动量",
+                            &format!("{:.0}", index.sector_momentum),
+                            "行业平均涨跌".to_string(),
+                            color,
+                            cx,
+                        ),
+                    ])
+                    .into_any_element(),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("指数 20% · 个股扩散 45% · 行业扩散 25% · 行业动量 10%"),
+            )
+            .into_any_element()
+    }
+
+    fn render_market_ai_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let loading = matches!(&self.market_ai_panel, AiPanelState::Loading { .. });
+        let has_data = !self.market_analysis_sectors.is_empty();
+        let mut panel = v_flex()
+            .gap_3()
+            .w_full()
+            .p_4()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().sidebar)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(self.render_analysis_section_title(
+                        "AI 大盘分析",
+                        "按钮触发 · 自动筛选当日候选观察股",
+                        cx,
+                    ))
+                    .child(
+                        Button::new("market-ai-analyze")
+                            .xsmall()
+                            .when(!loading && has_data, |b| b.primary())
+                            .when(loading || !has_data, |b| b.ghost())
+                            .label(if loading {
+                                "分析中…"
+                            } else if self.market_ai_picks.is_empty() {
+                                "AI 分析大盘"
+                            } else {
+                                "重新分析"
+                            })
+                            .disabled(loading || !has_data)
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.request_market_ai_analysis(cx);
+                            })),
+                    ),
+            );
+
+        match &self.market_ai_panel {
+            AiPanelState::Loading { text } => {
+                panel = panel
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().foreground)
+                            .child(text.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("本地候选扫描完成后，已配置的 LLM 会继续生成大盘简报…"),
+                    );
+            }
+            AiPanelState::Ready { text, source, note } => {
+                let source_color = if source.is_llm() {
+                    cx.theme().accent
+                } else {
+                    cx.theme().muted_foreground
+                };
+                panel = panel
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("来源"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_semibold()
+                                    .text_color(source_color)
+                                    .child(source.label(false)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().foreground)
+                            .child(text.clone()),
+                    );
+                if let Some(note) = note {
+                    panel = panel.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(note.clone()),
+                    );
+                }
+            }
+            AiPanelState::Idle => {
+                panel = panel.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if has_data {
+                            "点击按钮读取候选股并生成当日市场分析。"
+                        } else {
+                            "等待行业数据加载完成后可开始分析。"
+                        }),
+                );
+            }
+        }
+
+        if !self.market_ai_picks.is_empty() {
+            panel = panel
+                .child(self.render_analysis_section_title(
+                    "今日候选观察",
+                    "实时上涨 + 技术快照综合排序，不代表明日必涨",
+                    cx,
+                ))
+                .child(
+                    v_flex().gap_0().children(
+                        self.market_ai_picks
+                            .iter()
+                            .enumerate()
+                            .map(|(ix, pick)| self.render_market_pick_row(ix, pick, cx)),
+                    ),
+                );
+        }
+        panel.into_any_element()
+    }
+
+    fn render_market_pick_row(
+        &self,
+        ix: usize,
+        pick: &MarketPick,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let score_color = if pick.score >= 65.0 {
+            cx.theme().red
+        } else {
+            cx.theme().foreground
+        };
+        let detail = format!(
+            "{:+.2}% · {:.0}分 · {}{}",
+            pick.change_pct,
+            pick.score,
+            pick.regime,
+            pick.rsi14
+                .map(|rsi| format!(" · RSI {:.0}", rsi))
+                .unwrap_or_default()
+        );
+        let reason = pick
+            .reasons
+            .first()
+            .map(String::as_str)
+            .unwrap_or("实时行情与技术快照");
+        let risk = pick
+            .risks
+            .first()
+            .map(|risk| format!(" · 风险：{risk}"))
+            .unwrap_or_default();
+        h_flex()
+            .h(px(44.))
+            .w_full()
+            .items_center()
+            .gap_2()
+            .border_b_1()
+            .border_color(cx.theme().border.opacity(0.35))
+            .child(
+                div()
+                    .w(px(24.))
+                    .text_xs()
+                    .font_family("Menlo")
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("{:02}", ix + 1)),
+            )
+            .child(
+                div()
+                    .w(px(110.))
+                    .text_sm()
+                    .font_semibold()
+                    .text_color(cx.theme().foreground)
+                    .truncate()
+                    .child(format!("{} {}", pick.name, pick.code)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .truncate()
+                    .child(format!("现价 {:.2} · {}{}", pick.last, reason, risk)),
+            )
+            .child(
+                div()
+                    .w(px(190.))
+                    .text_xs()
+                    .text_color(score_color)
+                    .text_right()
+                    .child(detail),
+            )
+            .child(
+                div()
+                    .w(px(66.))
+                    .text_sm()
+                    .font_semibold()
+                    .text_color(self.chg_color(pick.change_pct >= 0.0, cx))
+                    .text_right()
+                    .child(format!("{:+.2}%", pick.change_pct)),
+            )
+            .into_any_element()
     }
 
     fn render_analysis_stat(

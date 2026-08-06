@@ -5,6 +5,7 @@ pub mod eastmoney;
 pub mod indicators;
 pub mod levels;
 pub mod market;
+pub mod market_analysis;
 pub mod portfolio;
 pub mod scout;
 pub mod session;

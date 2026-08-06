@@ -37,6 +37,7 @@ use crate::data::ai::AiConfig;
 use crate::data::indicators::{BollSeries, MaSeries, MacdSeries};
 use crate::data::levels;
 use crate::data::market as market_data;
+use crate::data::market_analysis as market_analysis_data;
 use crate::data::portfolio::{Portfolio, TradeSide};
 use crate::data::scout::ScoutPick;
 use crate::data::signals;
@@ -162,6 +163,10 @@ pub struct StockApp {
     market_analysis_source: SharedString,
     market_analysis_updated: Option<SharedString>,
     market_analysis_gen: u64,
+    /// Button-triggered market AI/local analysis.
+    market_ai_panel: AiPanelState,
+    market_ai_picks: Vec<market_analysis_data::MarketPick>,
+    market_ai_gen: u64,
     /// Active section inside the settings page.
     settings_section: SettingsSection,
     /// Auto-update state (GitHub Releases).
@@ -519,6 +524,9 @@ impl StockApp {
             market_analysis_source: shared(market_data::SRC_EASTMONEY),
             market_analysis_updated: None,
             market_analysis_gen: 0,
+            market_ai_panel: AiPanelState::Idle,
+            market_ai_picks: Vec::new(),
+            market_ai_gen: 0,
             settings_section: SettingsSection::General,
             update_state: UpdateState::Idle,
             quote_interval_secs: clamp_quote_interval_secs(cfg.quote_interval_secs),

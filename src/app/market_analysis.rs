@@ -2,10 +2,13 @@
 
 use gpui::Context;
 
-use crate::data::{eastmoney, market};
+use crate::data::{
+    eastmoney, market,
+    market_analysis::{self as analysis, MarketAnalysisContext, MarketIndexPoint},
+};
 use crate::model::shared;
 
-use super::{MarketRegion, StockApp};
+use super::{AiPanelState, AiSource, MarketRegion, StockApp};
 
 impl StockApp {
     pub(crate) fn open_market_analysis(&mut self, cx: &mut Context<Self>) {
@@ -99,6 +102,126 @@ impl StockApp {
                         cx.notify();
                     }
                 }
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn market_index_points(&self) -> Vec<MarketIndexPoint> {
+        [
+            ("上证综指", self.index_sh),
+            ("沪深300", self.index_hs300),
+            ("创业板指", self.index_cyb),
+        ]
+        .into_iter()
+        .filter_map(|(name, snap)| {
+            snap.map(|snap| MarketIndexPoint {
+                name: name.to_string(),
+                last: snap.last,
+                change_pct: snap.change_pct,
+            })
+        })
+        .collect()
+    }
+
+    /// Generate a local-first market brief and optionally upgrade it with the
+    /// configured LLM. The candidate list is fetched only after the user
+    /// presses the button, so opening the page stays fast and predictable.
+    pub(crate) fn request_market_ai_analysis(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.market_ai_panel, AiPanelState::Loading { .. }) {
+            return;
+        }
+
+        self.market_ai_gen = self.market_ai_gen.wrapping_add(1);
+        let run_id = self.market_ai_gen;
+        let sectors = self.market_analysis_sectors.clone();
+        let indices = self.market_index_points();
+        let cfg = self.ai_config.clone();
+        let cfg_enabled = cfg.enabled;
+        self.market_ai_picks.clear();
+        self.market_ai_panel = AiPanelState::Loading {
+            text: shared("正在读取候选股、计算技术快照…"),
+        };
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = smol::unblock(|| analysis::fetch_market_picks(6)).await;
+            let (picks, fetch_note) = match result {
+                Ok(picks) => (picks, None),
+                Err(error) => (Vec::new(), Some(format!("候选扫描失败：{error}"))),
+            };
+            let context: MarketAnalysisContext = analysis::build_context(
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                &sectors,
+                indices,
+                picks.clone(),
+            );
+            let local = analysis::local_market_summary(&context);
+            let want_llm = fetch_note.is_none() && cfg.is_configured();
+            let source_label = cfg.source_label();
+            let llm_context = context.clone();
+            let local_note = fetch_note.map(shared);
+
+            let _ = this.update(cx, |app, cx| {
+                if app.market_ai_gen != run_id {
+                    return;
+                }
+                app.market_ai_picks = picks.clone();
+                if want_llm {
+                    app.market_ai_panel = AiPanelState::Loading {
+                        text: local.clone().into(),
+                    };
+                } else {
+                    app.market_ai_panel = AiPanelState::Ready {
+                        text: local.clone().into(),
+                        source: AiSource::Local,
+                        note: local_note.clone().or_else(|| {
+                            Some(shared(if cfg_enabled {
+                                "LLM 尚未完整配置，已使用本地规则分析"
+                            } else {
+                                "未开启 LLM，已使用本地规则分析"
+                            }))
+                        }),
+                    };
+                }
+                cx.notify();
+            });
+
+            if !want_llm {
+                return;
+            }
+
+            let res = smol::unblock(move || analysis::llm_market_summary(&cfg, &llm_context)).await;
+            let _ = this.update(cx, |app, cx| {
+                if app.market_ai_gen != run_id {
+                    return;
+                }
+                match res {
+                    Ok(text) if !text.trim().is_empty() => {
+                        app.market_ai_panel = AiPanelState::Ready {
+                            text: text.into(),
+                            source: AiSource::Llm {
+                                label: source_label.clone(),
+                            },
+                            note: None,
+                        };
+                    }
+                    Ok(_) => {
+                        app.market_ai_panel = AiPanelState::Ready {
+                            text: local.clone().into(),
+                            source: AiSource::Local,
+                            note: Some(shared("LLM 返回空内容，已保留本地规则分析")),
+                        };
+                    }
+                    Err(error) => {
+                        app.market_ai_panel = AiPanelState::Ready {
+                            text: local.clone().into(),
+                            source: AiSource::Local,
+                            note: Some(shared(format!("LLM 请求失败，已回退本地规则：{error}"))),
+                        };
+                    }
+                }
+                cx.notify();
             });
         })
         .detach();
