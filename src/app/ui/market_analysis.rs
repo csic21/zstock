@@ -3,7 +3,7 @@
 use chrono::Local;
 use gpui::{
     AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, canvas, div, prelude::FluentBuilder, px,
+    StatefulInteractiveElement, Styled, canvas, div, prelude::FluentBuilder, px, relative,
 };
 use gpui_component::{
     ActiveTheme, Disableable, Sizable, StyledExt,
@@ -67,8 +67,10 @@ impl StockApp {
         let down_w = (stock_declines as f32 / total_for_meter * meter_w).clamp(0.0, meter_w);
         let fear_greed_color = if fear_greed.is_greed() {
             cx.theme().red
-        } else {
+        } else if fear_greed.is_fear() {
             cx.theme().green
+        } else {
+            cx.theme().muted_foreground
         };
 
         v_flex()
@@ -558,10 +560,12 @@ impl StockApp {
     fn render_fear_greed_panel(&self, index: FearGreedIndex, cx: &mut Context<Self>) -> AnyElement {
         let color = if index.is_greed() {
             cx.theme().red
-        } else {
+        } else if index.is_fear() {
             cx.theme().green
+        } else {
+            cx.theme().muted_foreground
         };
-        let meter_w = (index.score as f32 / 100.0 * 420.0).clamp(0.0, 420.0);
+        let meter_fraction = (index.score as f32 / 100.0).clamp(0.0, 1.0);
         v_flex()
             .gap_3()
             .p_4()
@@ -593,7 +597,7 @@ impl StockApp {
                     .rounded_full()
                     .overflow_hidden()
                     .bg(cx.theme().muted)
-                    .child(div().h_full().w(px(meter_w)).bg(color)),
+                    .child(div().h_full().w(relative(meter_fraction)).bg(color)),
             )
             .child(
                 h_flex()
@@ -814,13 +818,30 @@ impl StockApp {
                     .child(format!("{:02}", ix + 1)),
             )
             .child(
-                div()
-                    .w(px(110.))
-                    .text_sm()
-                    .font_semibold()
-                    .text_color(cx.theme().foreground)
-                    .truncate()
-                    .child(format!("{} {}", pick.name, pick.code)),
+                h_flex()
+                    .w(px(190.))
+                    .flex_shrink_0()
+                    .min_w_0()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .font_semibold()
+                            .text_color(cx.theme().foreground)
+                            .truncate()
+                            .child(pick.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .font_family("Menlo")
+                            .text_color(cx.theme().foreground)
+                            .child(pick.code.clone()),
+                    ),
             )
             .child(
                 div()
@@ -1064,24 +1085,31 @@ impl StockApp {
             .bg(cx.theme().sidebar)
             .child(self.render_analysis_section_title(title, &subtitle, cx))
             .child(
-                div().id(list_id).max_h(px(520.)).overflow_y_scroll().child(
-                    v_flex()
-                        .gap_0()
-                        .when(!has_rows, |col| {
-                            col.child(
-                                div()
-                                    .py_4()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(if self.market_analysis_loading {
-                                        "板块数据加载中…"
-                                    } else {
-                                        "暂无板块快照，点击右上角刷新"
-                                    }),
-                            )
-                        })
-                        .children(row_elements),
-                ),
+                div()
+                    .id(list_id)
+                    .max_h(px(520.))
+                    .overflow_y_scroll()
+                    // GPUI bubbles wheel events through nested scroll containers. Keep the
+                    // page from scrolling when the pointer is over one of these lists.
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    .child(
+                        v_flex()
+                            .gap_0()
+                            .when(!has_rows, |col| {
+                                col.child(
+                                    div()
+                                        .py_4()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(if self.market_analysis_loading {
+                                            "板块数据加载中…"
+                                        } else {
+                                            "暂无板块快照，点击右上角刷新"
+                                        }),
+                                )
+                            })
+                            .children(row_elements),
+                    ),
             )
             .into_any_element()
     }

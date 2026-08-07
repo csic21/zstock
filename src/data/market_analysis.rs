@@ -41,7 +41,11 @@ impl FearGreedIndex {
     }
 
     pub fn is_greed(self) -> bool {
-        self.score >= 50.0
+        self.score >= 60.0
+    }
+
+    pub fn is_fear(self) -> bool {
+        self.score <= 40.0
     }
 }
 
@@ -374,6 +378,35 @@ mod tests {
         let index = fear_greed_index(0, 0, 0, 0, 0, 0, None, &[]);
         assert_eq!(index.score, 50.0);
         assert_eq!(index.label, "中性");
+        assert!(!index.is_greed());
+        assert!(!index.is_fear());
+    }
+
+    #[test]
+    fn sentiment_thresholds_match_labels() {
+        assert!(!fear_greed_index(0, 0, 0, 0, 0, 0, None, &[]).is_greed());
+
+        let greed = FearGreedIndex {
+            score: 60.0,
+            label: FearGreedIndex::label_for_score(60.0),
+            stock_breadth: 0.0,
+            sector_breadth: 0.0,
+            index_momentum: 0.0,
+            sector_momentum: 0.0,
+        };
+        assert!(greed.is_greed());
+        assert_eq!(greed.label, "贪婪");
+
+        let fear = FearGreedIndex {
+            score: 40.0,
+            label: FearGreedIndex::label_for_score(40.0),
+            stock_breadth: 0.0,
+            sector_breadth: 0.0,
+            index_momentum: 0.0,
+            sector_momentum: 0.0,
+        };
+        assert!(fear.is_fear());
+        assert_eq!(fear.label, "恐惧");
     }
 
     #[test]
