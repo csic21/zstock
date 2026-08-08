@@ -458,15 +458,174 @@ impl StockApp {
                     ),
             )
             .child(self.render_buy_alert_detail(cx))
+            .child(self.render_journal_detail(cx))
     }
 
-    /// Deterministic buy-price reminder for the selected watchlist symbol.
-    /// The target is fixed when saved; the technical reference button simply
-    /// copies the current local buy-band upper edge into that target.
+    /// 决策日记：到价自动记 + 手写观察。
+    pub(crate) fn render_journal_detail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let work = self.work_mode;
+        let selected = self.selected.as_ref();
+        let entries: Vec<_> = if self.journal_filter_selected {
+            self.journal
+                .entries
+                .iter()
+                .filter(|e| e.code == selected)
+                .take(6)
+                .collect()
+        } else {
+            self.journal.entries.iter().take(8).collect()
+        };
+
+        let mut root = v_flex()
+            .w_full()
+            .gap_1()
+            .mt_1()
+            .p_2()
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().muted.opacity(0.28))
+            .border_1()
+            .border_color(cx.theme().border)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(cx.theme().foreground)
+                            .child(if work { "Journal" } else { "决策日记" }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if work {
+                                format!("{} notes", self.journal.entries.len())
+                            } else {
+                                format!("共 {} 条 · 到价自动记", self.journal.entries.len())
+                            }),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("journal-filter")
+                            .xsmall()
+                            .when(self.journal_filter_selected, |b| b.primary())
+                            .when(!self.journal_filter_selected, |b| b.ghost())
+                            .label(if work {
+                                if self.journal_filter_selected {
+                                    "This"
+                                } else {
+                                    "All"
+                                }
+                            } else if self.journal_filter_selected {
+                                "本标的"
+                            } else {
+                                "全部"
+                            })
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.toggle_journal_filter_selected(cx);
+                            })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(160.))
+                            .child(Input::new(&self.journal_note_input).small()),
+                    )
+                    .child(
+                        Button::new("journal-add")
+                            .xsmall()
+                            .primary()
+                            .label(if work { "Save" } else { "记下" })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.add_manual_journal_note(window, cx);
+                            })),
+                    ),
+            );
+
+        if entries.is_empty() {
+            root = root.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if work {
+                        "No notes yet · alerts auto-log here"
+                    } else {
+                        "暂无记录 · 价位提醒触发会自动记一笔，也可手写观察"
+                    }),
+            );
+        } else {
+            root = root.child(
+                v_flex().gap_1().children(entries.into_iter().enumerate().map(|(ix, e)| {
+                    let id = e.id.clone();
+                    h_flex()
+                        .gap_2()
+                        .items_start()
+                        .px_1()
+                        .py_0p5()
+                        .rounded(cx.theme().radius)
+                        .bg(cx.theme().background.opacity(0.35))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_semibold()
+                                .text_color(cx.theme().accent)
+                                .child(e.kind.badge()),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().foreground)
+                                        .child(e.headline(work)),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!("{} · {}", e.created_at, e.note)),
+                                ),
+                        )
+                        .child(
+                            Button::new(("journal-rm", ix as u32))
+                                .xsmall()
+                                .ghost()
+                                .label("×")
+                                .on_click(cx.listener(move |this, _, _w, cx| {
+                                    this.remove_journal_entry(&id, cx);
+                                })),
+                        )
+                })),
+            );
+        }
+
+        root.child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground.opacity(0.75))
+                .child(if work {
+                    "Local journal only · not a trade blotter."
+                } else {
+                    "仅本地复盘素材，不构成任何投资建议。"
+                }),
+        )
+    }
+
+    /// Multi-leg local alerts: buy zone / take-profit / stop.
     pub(crate) fn render_buy_alert_detail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let work = self.work_mode;
         let alert = self.selected_buy_alert();
         let recommended = self.selected_recommended_buy_price();
+        let rec_sell = self.selected_recommended_sell_price();
         let target_text = |price: f64| {
             if work {
                 self.format_value(price)
@@ -494,143 +653,211 @@ impl StockApp {
                             .font_semibold()
                             .text_color(cx.theme().foreground)
                             .child(if work {
-                                "Threshold alert"
+                                "Price alerts"
                             } else {
-                                "自选买入提醒"
+                                "价位提醒 · 买/卖/止损"
                             }),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new("alert-rearm")
+                                    .xsmall()
+                                    .ghost()
+                                    .label(if work { "Re-arm" } else { "重置" })
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.reset_selected_buy_alert(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("alert-clear")
+                                    .xsmall()
+                                    .ghost()
+                                    .label(if work { "Clear" } else { "关闭全部" })
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.clear_selected_buy_alert(cx);
+                                    })),
+                            ),
                     ),
             );
 
-        if let Some(alert) = alert {
-            let state = if alert.triggered {
-                if work {
-                    "Reached · rearm above target"
-                } else {
-                    "已触发 · 价格重新站上目标后自动重置"
-                }
-            } else if work {
-                "Armed · downward crossing"
-            } else {
-                "等待价格从上方跌入目标区"
-            };
-            let mut actions = h_flex().gap_1().items_center();
-            if alert.triggered {
-                actions = actions.child(
-                    Button::new("alert-rearm")
-                        .xsmall()
-                        .ghost()
-                        .label(if work { "Re-arm" } else { "重置" })
-                        .on_click(cx.listener(|this, _, _w, cx| {
-                            this.reset_selected_buy_alert(cx);
-                        })),
-                );
-            }
-            actions = actions.child(
-                Button::new("alert-clear")
-                    .xsmall()
-                    .ghost()
-                    .label(if work { "Clear" } else { "关闭" })
-                    .on_click(cx.listener(|this, _, _w, cx| {
-                        this.clear_selected_buy_alert(cx);
-                    })),
-            );
-            root = root
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(metric_chip(
-                            if work { "Target" } else { "目标价" },
-                            &target_text(alert.target_price),
-                            cx,
-                        ))
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(format!("{} · {}", alert.basis.label(), state)),
-                        )
-                        .child(actions),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(if alert.triggered {
-                            cx.theme().yellow
+        // Active legs summary
+        if let Some(ref alert) = alert {
+            let mut legs = h_flex().gap_2().flex_wrap();
+            if alert.is_valid() {
+                legs = legs.child(metric_chip(
+                    if work { "Buy" } else { "买入" },
+                    &format!(
+                        "{}{}",
+                        target_text(alert.target_price),
+                        if alert.triggered {
+                            if work {
+                                " ✓"
+                            } else {
+                                " 已触发"
+                            }
                         } else {
-                            cx.theme().muted_foreground
-                        })
-                        .child(state),
-                );
-        } else {
-            let mut controls = h_flex()
-                .gap_1()
-                .items_center()
-                .child(
-                    div()
-                        .w(px(42.))
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(if work { "Target" } else { "目标价" }),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(120.))
-                        .child(Input::new(&self.alert_price_input).small()),
-                )
-                .child(
-                    Button::new("alert-set-manual")
-                        .xsmall()
-                        .primary()
-                        .label(if work { "Arm" } else { "开启" })
-                        .on_click(cx.listener(|this, _, _w, cx| {
-                            this.set_manual_buy_alert(cx);
-                        })),
-                );
-            if recommended.is_some() {
-                controls = controls.child(
-                    Button::new("alert-set-recommended")
-                        .xsmall()
-                        .ghost()
-                        .label(if work { "Use ref" } else { "用建议价" })
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.set_recommended_buy_alert(window, cx);
-                        })),
-                );
+                            ""
+                        }
+                    ),
+                    cx,
+                ));
             }
-            root = root.child(controls).child(
+            if let Some(sell) = alert.sell_price.filter(|p| *p > 0.0) {
+                legs = legs.child(metric_chip(
+                    if work { "TP" } else { "止盈" },
+                    &format!(
+                        "{}{}",
+                        target_text(sell),
+                        if alert.sell_triggered {
+                            if work {
+                                " ✓"
+                            } else {
+                                " 已触发"
+                            }
+                        } else {
+                            ""
+                        }
+                    ),
+                    cx,
+                ));
+            }
+            if let Some(stop) = alert.stop_price.filter(|p| *p > 0.0) {
+                legs = legs.child(metric_chip(
+                    if work { "SL" } else { "止损" },
+                    &format!(
+                        "{}{}",
+                        target_text(stop),
+                        if alert.stop_triggered {
+                            if work {
+                                " ✓"
+                            } else {
+                                " 已触发"
+                            }
+                        } else {
+                            ""
+                        }
+                    ),
+                    cx,
+                ));
+            }
+            root = root.child(legs);
+        }
+
+        // Shared price input + arm buttons
+        let mut controls = h_flex()
+            .gap_1()
+            .items_center()
+            .flex_wrap()
+            .child(
                 div()
+                    .w(px(36.))
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(if let Some(price) = recommended {
-                        format!(
-                            "{} {} · {}",
-                            if work { "Reference" } else { "技术参考价" },
-                            target_text(price),
-                            if work {
-                                "local levels; AI optional"
-                            } else {
-                                "现有本地建仓带上沿；AI 只做解释"
-                            }
-                        )
-                    } else if work {
-                        "Load daily bars to calculate a reference target".into()
+                    .child(if work { "Px" } else { "价格" }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(100.))
+                    .child(Input::new(&self.alert_price_input).small()),
+            )
+            .child(
+                Button::new("alert-set-buy")
+                    .xsmall()
+                    .primary()
+                    .label(if work { "Buy" } else { "买观察" })
+                    .tooltip(if work {
+                        "Arm buy zone (cross down)"
                     } else {
-                        "加载日 K 后可自动填入技术参考价；也可以手动输入".into()
-                    }),
+                        "设为买入观察：价格从上跌入时提醒"
+                    })
+                    .on_click(cx.listener(|this, _, _w, cx| {
+                        this.set_manual_buy_alert(cx);
+                    })),
+            )
+            .child(
+                Button::new("alert-set-sell")
+                    .xsmall()
+                    .ghost()
+                    .label(if work { "TP" } else { "止盈" })
+                    .tooltip(if work {
+                        "Arm take-profit (cross up)"
+                    } else {
+                        "设为止盈：价格从下涨破时提醒"
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.set_sell_alert_manual(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("alert-set-stop")
+                    .xsmall()
+                    .ghost()
+                    .label(if work { "SL" } else { "止损" })
+                    .tooltip(if work {
+                        "Arm stop (cross down)"
+                    } else {
+                        "设为止损观察：跌破时提醒"
+                    })
+                    .on_click(cx.listener(|this, _, _w, cx| {
+                        this.set_stop_alert_manual(cx);
+                    })),
+            );
+
+        if recommended.is_some() {
+            controls = controls.child(
+                Button::new("alert-set-recommended")
+                    .xsmall()
+                    .ghost()
+                    .label(if work { "Ref buy" } else { "建议买" })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.set_recommended_buy_alert(window, cx);
+                    })),
             );
         }
+        if rec_sell.is_some() {
+            controls = controls.child(
+                Button::new("alert-set-rec-sell")
+                    .xsmall()
+                    .ghost()
+                    .label(if work { "Ref TP" } else { "建议卖" })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.set_sell_alert_from_levels(window, cx);
+                    })),
+            );
+        }
+
+        root = root.child(controls).child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(if let Some(price) = recommended {
+                    format!(
+                        "{} {} · {} {}",
+                        if work { "Buy ref" } else { "建议买" },
+                        target_text(price),
+                        if work { "TP ref" } else { "建议卖" },
+                        rec_sell
+                            .map(|p| target_text(p))
+                            .unwrap_or_else(|| "—".into())
+                    )
+                } else if work {
+                    "Load daily bars for technical reference levels".into()
+                } else {
+                    "加载日 K 后可用建议买/卖价；输入框价格对三个按钮共用".into()
+                }),
+        );
 
         root.child(
             div()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground.opacity(0.75))
                 .child(if work {
-                    "Local rule: notify once on a downward crossing; no order is placed."
+                    "Local rules · one shot per leg · no orders."
                 } else {
-                    "本地规则：价格从上方跌入目标价时提醒一次，不会自动下单；仅供学习研究。"
+                    "本地规则：各腿触发一次后自动再武装；不会下单；仅供学习研究。"
                 }),
         )
     }
@@ -1023,6 +1250,75 @@ impl StockApp {
                     }),
             );
         }
+
+        // 轻量回测：当前标的上跑「站上 MA20」规则
+        root = root.child(
+            v_flex()
+                .gap_1()
+                .min_w(px(200.))
+                .p_2()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().muted.opacity(0.28))
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_semibold()
+                                .text_color(cx.theme().foreground)
+                                .child(if work {
+                                    "Light backtest"
+                                } else {
+                                    "轻量回测"
+                                }),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            Button::new("bt-run")
+                                .xsmall()
+                                .primary()
+                                .label(if work { "Run MA20" } else { "跑 MA20" })
+                                .tooltip(if work {
+                                    "Cross above MA20 · hold 10 sessions"
+                                } else {
+                                    "规则：站上 MA20，持有 10 个交易日"
+                                })
+                                .on_click(cx.listener(|this, _, _w, cx| {
+                                    this.run_selected_backtest(cx);
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(
+                            self.backtest_report
+                                .as_ref()
+                                .map(|r| r.summary_line(work))
+                                .unwrap_or_else(|| {
+                                    if work {
+                                        "Run on current daily series".into()
+                                    } else {
+                                        "对当前日 K 样本做可解释统计，非预测".into()
+                                    }
+                                }),
+                        ),
+                )
+                .when_some(self.backtest_report.as_ref(), |col, r| {
+                    col.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground.opacity(0.85))
+                            .child(r.notes.first().cloned().unwrap_or_default()),
+                    )
+                }),
+        );
+
         root
     }
 

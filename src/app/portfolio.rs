@@ -98,6 +98,14 @@ impl StockApp {
             status_bar_active: self.status_bar_active.clone(),
             detail_tab: self.detail_tab.to_label().into(),
             left_tab: self.left_tab.to_label().into(),
+            find_mode: self.find_mode.id().into(),
+            watch_tags: self
+                .watch_tags
+                .iter()
+                .filter(|(_, t)| **t != crate::data::groups::WatchTag::None)
+                .map(|(k, t)| (k.clone(), t.id().into()))
+                .collect(),
+            watch_filter: self.watch_filter.id().into(),
         };
         let _ = storage::save_config(&cfg);
     }

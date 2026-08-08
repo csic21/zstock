@@ -334,18 +334,21 @@ impl StockApp {
                                             .gap_3()
                                             .child(self.render_sector_panel(
                                                 "板块热度",
-                                                "行业涨跌幅排名 · 盘中实时",
+                                                "点击板块查看成分股 · 盘中实时",
                                                 sectors.clone(),
                                                 true,
                                                 cx,
                                             ))
                                             .child(self.render_sector_panel(
                                                 "弱势板块",
-                                                "需要留意的回撤方向",
+                                                "需要留意的回撤方向 · 可点击下钻",
                                                 sectors.clone(),
                                                 false,
                                                 cx,
-                                            )),
+                                            ))
+                                            .when(self.sector_drill_code.is_some(), |col| {
+                                                col.child(self.render_sector_drill_panel(cx))
+                                            }),
                                     )
                                     .child(
                                         v_flex()
@@ -1133,14 +1136,27 @@ impl StockApp {
         } else {
             format_sector_amount(sector.amount)
         };
+        let code = sector.code.clone();
+        let name = sector.name.clone();
+        let selected = self
+            .sector_drill_code
+            .as_ref()
+            .is_some_and(|c| c == &sector.code);
         div()
+            .id(("sector-row", ix as u32))
             .h(px(38.))
             .w_full()
             .flex()
             .items_center()
             .gap_2()
+            .cursor_pointer()
             .border_b_1()
             .border_color(cx.theme().border.opacity(0.35))
+            .when(selected, |r| r.bg(cx.theme().accent.opacity(0.14)))
+            .hover(|r| r.bg(cx.theme().accent.opacity(0.08)))
+            .on_click(cx.listener(move |this, _, _w, cx| {
+                this.open_sector_drill(code.clone(), name.clone(), cx);
+            }))
             .child(
                 div()
                     .w(px(22.))
@@ -1173,6 +1189,142 @@ impl StockApp {
                     .text_color(color)
                     .text_right()
                     .child(format!("{:+.2}%", sector.change_pct)),
+            )
+            .into_any_element()
+    }
+
+    fn render_sector_drill_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let title = self
+            .sector_drill_name
+            .as_ref()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "板块成分".into());
+        let code = self
+            .sector_drill_code
+            .clone()
+            .unwrap_or_default();
+
+        v_flex()
+            .gap_2()
+            .p_4()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().sidebar)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .text_color(cx.theme().foreground)
+                            .child(format!("成分 · {title}")),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(code),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("sector-drill-close")
+                            .xsmall()
+                            .ghost()
+                            .label("关闭")
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.clear_sector_drill(cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("点击成分股打开图表并加入短线池 · 点左侧板块切换"),
+            )
+            .when(self.sector_drill_loading, |col| {
+                col.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("加载成分中…"),
+                )
+            })
+            .when_some(self.sector_drill_error.clone(), |col, err| {
+                col.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().red)
+                        .child(err),
+                )
+            })
+            .child(
+                v_flex()
+                    .id("sector-drill-list")
+                    .max_h(px(360.))
+                    .overflow_y_scroll()
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    .children(self.sector_drill_quotes.iter().enumerate().map(|(ix, q)| {
+                        let code = q.code.clone();
+                        let name = q.name.clone();
+                        let last = q.last;
+                        let chg = q.change_pct;
+                        let color = self.chg_color(chg >= 0.0, cx);
+                        div()
+                            .id(("sec-const", ix as u32))
+                            .h(px(36.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .cursor_pointer()
+                            .border_b_1()
+                            .border_color(cx.theme().border.opacity(0.3))
+                            .hover(|r| r.bg(cx.theme().accent.opacity(0.1)))
+                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                this.select_sector_constituent(
+                                    code.clone(),
+                                    name.clone(),
+                                    last,
+                                    cx,
+                                );
+                            }))
+                            .child(
+                                div()
+                                    .w(px(64.))
+                                    .text_xs()
+                                    .font_semibold()
+                                    .text_color(cx.theme().foreground)
+                                    .child(q.code.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .truncate()
+                                    .child(q.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().foreground)
+                                    .child(format!("{:.2}", q.last)),
+                            )
+                            .child(
+                                div()
+                                    .w(px(64.))
+                                    .text_xs()
+                                    .font_semibold()
+                                    .text_color(color)
+                                    .text_right()
+                                    .child(format!("{:+.2}%", chg)),
+                            )
+                    })),
             )
             .into_any_element()
     }

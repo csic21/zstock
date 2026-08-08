@@ -36,11 +36,15 @@ use gpui_component::{
 
 use crate::data::ai::AiConfig;
 use crate::data::alerts::BuyAlert;
+use crate::data::backtest::BacktestReport;
+use crate::data::groups::{FindMode, WatchTag};
+use crate::data::journal::Journal;
 use crate::data::indicators::{BollSeries, MaSeries, MacdSeries};
 use crate::data::levels;
 use crate::data::market as market_data;
 use crate::data::market_analysis as market_analysis_data;
 use crate::data::portfolio::{Portfolio, TradeSide};
+use crate::data::radar::{RadarHit, RadarStrategy};
 use crate::data::scout::ScoutPick;
 use crate::data::signals;
 use crate::data::treasure::TreasureHit;
@@ -224,6 +228,8 @@ pub struct StockApp {
     /// 财务分位过滤。
     treasure_fin: FinFilter,
     treasure_scanning: bool,
+    /// 静默预扫：不切 Tab、不抢状态栏、保留旧榜直至完成。
+    treasure_scan_silent: bool,
     treasure_done: usize,
     treasure_total: usize,
     treasure_status: SharedString,
@@ -234,6 +240,8 @@ pub struct StockApp {
     /// 整榜摘要（本地规则或 LLM）。
     scout_summary: SharedString,
     scout_running: bool,
+    /// 静默筛可买：完成后不自动打开第一只。
+    scout_silent: bool,
     scout_done: usize,
     scout_total: usize,
     /// 取消过期筛分。
@@ -244,6 +252,40 @@ pub struct StockApp {
     scout_only_buy_watch: bool,
     /// 有可买清单时，完整寻宝榜默认折叠，减少干扰。
     treasure_list_expanded: bool,
+    /// 「现在找」：长线寻宝 / 短线雷达。
+    find_mode: FindMode,
+    /// 长线缓存时间戳（用于新鲜度横幅）。
+    treasure_updated_at: String,
+    /// 短线雷达结果。
+    radar_hits: Vec<RadarHit>,
+    radar_updated_at: String,
+    radar_scanning: bool,
+    radar_done: usize,
+    radar_total: usize,
+    radar_status: SharedString,
+    radar_summary: SharedString,
+    radar_gen: u64,
+    /// 策略过滤；`None` = 全部策略。
+    radar_filter: Option<RadarStrategy>,
+    /// 自选分组 code → tag。
+    watch_tags: HashMap<String, WatchTag>,
+    /// 自选列表筛选（None = 全部）。
+    watch_filter: WatchTag,
+    /// 市场分析：选中的行业板块代码 / 名称。
+    sector_drill_code: Option<String>,
+    sector_drill_name: Option<SharedString>,
+    sector_drill_quotes: Vec<crate::data::eastmoney::QuoteTick>,
+    sector_drill_loading: bool,
+    sector_drill_error: Option<SharedString>,
+    sector_drill_gen: u64,
+    /// 当前标的轻量回测报告（策略 Tab）。
+    backtest_report: Option<BacktestReport>,
+    /// 决策日记（本地 journal.json）。
+    journal: Journal,
+    /// 日记手写输入。
+    journal_note_input: Entity<InputState>,
+    /// 概览只看当前标的日记。
+    journal_filter_selected: bool,
     /// 上证综指（work 模式 cpu）。
     index_sh: Option<IndexSnap>,
     /// 沪深300（work 模式 mem）。
@@ -365,6 +407,7 @@ impl StockApp {
         });
 
         let portfolio = storage::load_portfolio();
+        let journal = storage::load_journal();
         let trade_shares_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("股数，如 100"));
         let trade_price_input =
@@ -377,6 +420,9 @@ impl StockApp {
             cx.new(|cx| InputState::new(window, cx).placeholder("现金余额"));
         let alert_price_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("目标价，如 12.30")
+        });
+        let journal_note_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("写一句观察 / 计划，如：回踩 MA20 再看…")
         });
         portfolio_cash_input.update(cx, |state, cx| {
             state.set_value(format!("{:.2}", portfolio.cash), window, cx);
@@ -451,19 +497,41 @@ impl StockApp {
 
         let treasure_cache = storage::load_treasure_cache();
         let treasure_hits = treasure_cache.hits;
+        let treasure_updated_at = treasure_cache.updated_at.clone();
         let treasure_status = if treasure_hits.is_empty() {
-            shared("点「开始搜罗」扫描历史低位，再用「AI 筛可买」批量出观察清单")
+            shared("选「长线」→ 开始搜罗历史低位；或切「短线」跑策略雷达")
         } else {
             shared(format!(
-                "缓存 {} 只 · {} · 可点「AI 筛可买」",
+                "长线缓存 {} 只 · {} · 可点「筛可买」或重扫",
                 treasure_hits.len(),
-                if treasure_cache.updated_at.is_empty() {
+                if treasure_updated_at.is_empty() {
                     "—".into()
                 } else {
-                    treasure_cache.updated_at
+                    treasure_updated_at.clone()
                 }
             ))
         };
+        let radar_cache = storage::load_radar_cache();
+        let radar_hits = radar_cache.hits;
+        let radar_updated_at = radar_cache.updated_at.clone();
+        let radar_status = if radar_hits.is_empty() {
+            shared("选「短线」→ 一键扫描回踩/突破/超跌")
+        } else {
+            shared(format!(
+                "短线缓存 {} 只 · {}",
+                radar_hits.len(),
+                if radar_updated_at.is_empty() {
+                    "—".into()
+                } else {
+                    radar_updated_at.clone()
+                }
+            ))
+        };
+        let watch_tags: HashMap<String, WatchTag> = cfg
+            .watch_tags
+            .iter()
+            .map(|(k, v)| (k.clone(), WatchTag::from_id(v)))
+            .collect();
 
         let mut dock = cfg.dock.clone();
         // 旧配置回退：只有宽/高向量为空时才用 legacy 字段。
@@ -567,6 +635,7 @@ impl StockApp {
             treasure_pool: TreasurePool::from_id(&cfg.treasure_pool),
             treasure_fin: FinFilter::from_id(&cfg.treasure_fin),
             treasure_scanning: false,
+            treasure_scan_silent: false,
             treasure_done: 0,
             treasure_total: 0,
             treasure_status,
@@ -574,6 +643,7 @@ impl StockApp {
             scout_picks: Vec::new(),
             scout_summary: shared(""),
             scout_running: false,
+            scout_silent: false,
             scout_done: 0,
             scout_total: 0,
             scout_gen: 0,
@@ -581,6 +651,29 @@ impl StockApp {
             // 默认只看「可关注」；若本轮为零会自动回退到「全部」。
             scout_only_buy_watch: true,
             treasure_list_expanded: false,
+            find_mode: FindMode::from_id(&cfg.find_mode),
+            treasure_updated_at,
+            radar_hits,
+            radar_updated_at,
+            radar_scanning: false,
+            radar_done: 0,
+            radar_total: 0,
+            radar_status,
+            radar_summary: shared(""),
+            radar_gen: 0,
+            radar_filter: None,
+            watch_tags,
+            watch_filter: WatchTag::from_id(&cfg.watch_filter),
+            sector_drill_code: None,
+            sector_drill_name: None,
+            sector_drill_quotes: Vec::new(),
+            sector_drill_loading: false,
+            sector_drill_error: None,
+            sector_drill_gen: 0,
+            backtest_report: None,
+            journal,
+            journal_note_input,
+            journal_filter_selected: true,
             index_sh: None,
             index_hs300: None,
             index_cyb: None,
@@ -630,6 +723,8 @@ impl StockApp {
 
         window.set_window_title(app.window_title());
         app.bootstrap(cx);
+        // 盘后 / 缓存过期：静默预扫长线，打开就能用。
+        app.maybe_background_rescan(cx);
         app
     }
 }

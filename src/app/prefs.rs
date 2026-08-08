@@ -77,9 +77,17 @@ impl StockApp {
         self.select_symbol(code, cx);
     }
 
-    /// Indices into `symbols` in the current sidebar order.
+    /// Indices into `symbols` in the current sidebar order (respects group filter).
     pub(crate) fn watchlist_display_order(&self) -> Vec<usize> {
-        let mut order: Vec<usize> = (0..self.symbols.len()).collect();
+        let mut order: Vec<usize> = (0..self.symbols.len())
+            .filter(|&ix| {
+                if self.watch_filter == crate::data::groups::WatchTag::None {
+                    true
+                } else {
+                    self.tag_for(&self.symbols[ix].code) == self.watch_filter
+                }
+            })
+            .collect();
         match self.watchlist_sort {
             WatchlistSort::Manual => {}
             WatchlistSort::ChangeDesc => {

@@ -125,6 +125,20 @@ impl StockApp {
                             .border_color(cx.theme().border)
                             .child(div().flex_1().child(Input::new(&self.palette_query))),
                     )
+                    .child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .border_b_1()
+                            .border_color(cx.theme().border.opacity(0.45))
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if work {
+                                "Tips · long / short / market · or a code"
+                            } else {
+                                "快捷：输入「长线」「短线」「市场」回车 · 或搜代码"
+                            }),
+                    )
                     .child({
                         let mut list = v_flex()
                             .id("palette-results")

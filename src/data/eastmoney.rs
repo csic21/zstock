@@ -10,7 +10,7 @@
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{bail, Context, Result, anyhow};
 use serde_json::Value;
 
 use crate::model::{
@@ -195,6 +195,36 @@ pub fn fetch_a_share_industry_sectors() -> Result<Vec<SectorTick>> {
         }
     }
     Err(anyhow!("板块行情不可用: {last_err}"))
+}
+
+/// 行业板块成分股（按涨跌幅降序，东财 `fs=b:BKxxxx`）。
+///
+/// 用于市场分析页「点板块 → 看成分」下钻。
+pub fn fetch_sector_constituents(sector_code: &str, limit: usize) -> Result<Vec<QuoteTick>> {
+    let code = sector_code.trim();
+    if code.is_empty() {
+        bail!("板块代码为空");
+    }
+    let limit = limit.clamp(5, 80);
+    let path = format!(
+        "/api/qt/clist/get?pn=1&pz={limit}&po=1&np=1\
+         &ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2\
+         &fid=f3&fs=b:{code}&fields=f12,f14,f2,f3,f5,f6,f15,f16,f17,f18"
+    );
+    let mut last_err = anyhow!("板块成分接口未返回");
+    for host in PUSH2_HOSTS {
+        let url = format!("https://{host}{path}");
+        match get_json(&url).and_then(parse_quote_diff) {
+            Ok(data) if !data.is_empty() => {
+                let mut data = data;
+                data.truncate(limit);
+                return Ok(data);
+            }
+            Ok(_) => last_err = anyhow!("板块成分为空"),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(anyhow!("板块成分不可用: {last_err}"))
 }
 
 fn parse_sector_diff(v: Value) -> Result<Vec<SectorTick>> {

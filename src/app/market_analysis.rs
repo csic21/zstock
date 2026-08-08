@@ -226,4 +226,72 @@ impl StockApp {
         })
         .detach();
     }
+
+    /// 点击行业板块 → 拉取成分股列表（下钻）。
+    pub(crate) fn open_sector_drill(
+        &mut self,
+        code: String,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.sector_drill_gen = self.sector_drill_gen.wrapping_add(1);
+        let drill_id = self.sector_drill_gen;
+        self.sector_drill_code = Some(code.clone());
+        self.sector_drill_name = Some(shared(name.clone()));
+        self.sector_drill_quotes.clear();
+        self.sector_drill_loading = true;
+        self.sector_drill_error = None;
+        self.status = shared(format!("加载板块成分 · {name}"));
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let code_fetch = code.clone();
+            let result =
+                smol::unblock(move || market::fetch_sector_constituents(&code_fetch, 40)).await;
+            let _ = this.update(cx, |app, cx| {
+                if app.sector_drill_gen != drill_id {
+                    return;
+                }
+                app.sector_drill_loading = false;
+                match result {
+                    Ok(sourced) => {
+                        app.sector_drill_quotes = sourced.data;
+                        app.status = shared(format!(
+                            "板块 {name} · {} 只成分",
+                            app.sector_drill_quotes.len()
+                        ));
+                    }
+                    Err(e) => {
+                        app.sector_drill_error = Some(shared(format!("{e}")));
+                        app.status = shared(format!("板块成分加载失败 · {name}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn clear_sector_drill(&mut self, cx: &mut Context<Self>) {
+        self.sector_drill_gen = self.sector_drill_gen.wrapping_add(1);
+        self.sector_drill_code = None;
+        self.sector_drill_name = None;
+        self.sector_drill_quotes.clear();
+        self.sector_drill_loading = false;
+        self.sector_drill_error = None;
+        cx.notify();
+    }
+
+    pub(crate) fn select_sector_constituent(
+        &mut self,
+        code: String,
+        name: String,
+        last: f64,
+        cx: &mut Context<Self>,
+    ) {
+        self.ensure_in_watchlist(&code, &name, last);
+        self.set_watch_tag(&code, crate::data::groups::WatchTag::Short, cx);
+        self.market_analysis_open = false;
+        self.select_symbol(shared(code), cx);
+    }
 }

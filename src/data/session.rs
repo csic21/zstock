@@ -134,6 +134,22 @@ pub fn should_poll_quotes(present: MarketSet) -> bool {
     open.a || open.hk
 }
 
+/// A 股当前是否不在连续交易时段（含周末）——适合静默更新长线榜。
+///
+/// 盘中不抢带宽；盘后 / 午休边缘 / 周末可以预扫。
+pub fn is_a_share_quiet_now() -> bool {
+    is_a_share_quiet_at(Local::now())
+}
+
+pub fn is_a_share_quiet_at(now: chrono::DateTime<Local>) -> bool {
+    !MarketId::CnA.is_open_at(now)
+}
+
+/// 是否适合启动后台长线预扫（A 股休市窗口）。
+pub fn should_background_long_rescan() -> bool {
+    is_a_share_quiet_now()
+}
+
 /// Sleep while closed so we wake near the next open without hammering the network.
 ///
 /// Caps at `max_secs` so clock skew / DST edge cases still recover.

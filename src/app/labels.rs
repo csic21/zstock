@@ -26,9 +26,25 @@ impl L {
 
     pub(crate) fn left_treasure(work: bool) -> &'static str {
         if work {
-            "Scan"
+            "Find"
         } else {
-            "🐭 寻宝"
+            "🔍 找"
+        }
+    }
+
+    pub(crate) fn find_long(work: bool) -> &'static str {
+        if work {
+            "Long"
+        } else {
+            "长线"
+        }
+    }
+
+    pub(crate) fn find_short(work: bool) -> &'static str {
+        if work {
+            "Short"
+        } else {
+            "短线"
         }
     }
 

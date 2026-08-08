@@ -1,8 +1,8 @@
-//! Selected-symbol buy alert actions and quote-crossing evaluation.
+//! Selected-symbol multi-leg alerts and quote-crossing evaluation.
 
 use gpui::{Context, Window};
 
-use crate::data::alerts::{self, BuyAlert, BuyAlertBasis};
+use crate::data::alerts::{self, AlertLeg, BuyAlert, BuyAlertBasis};
 use crate::model::{format_price, shared};
 use crate::notifications;
 
@@ -16,6 +16,7 @@ pub(crate) struct BuyAlertHit {
     pub name: String,
     pub target_price: f64,
     pub current_price: f64,
+    pub leg: AlertLeg,
 }
 
 impl StockApp {
@@ -29,6 +30,15 @@ impl StockApp {
         }
         self.current_levels()
             .map(|levels| levels.buy_high)
+            .filter(|price| price.is_finite() && *price > 0.0)
+    }
+
+    pub(crate) fn selected_recommended_sell_price(&self) -> Option<f64> {
+        if !matches!(self.chart_kind, super::ChartKind::DayK) {
+            return None;
+        }
+        self.current_levels()
+            .map(|levels| levels.sell_low)
             .filter(|price| price.is_finite() && *price > 0.0)
     }
 
@@ -68,13 +78,106 @@ impl StockApp {
 
     fn install_buy_alert(&mut self, price: f64, basis: BuyAlertBasis, cx: &mut Context<Self>) {
         let code = self.selected.to_string();
-        self.buy_alerts
-            .insert(code.clone(), BuyAlert::new(price, basis));
+        let mut alert = self
+            .buy_alerts
+            .get(&code)
+            .cloned()
+            .unwrap_or_else(|| BuyAlert::new(price, basis));
+        alert.target_price = price;
+        alert.basis = basis;
+        alert.triggered = false;
+        self.buy_alerts.insert(code, alert);
         self.schedule_persist(cx);
         self.status = shared(if self.work_mode {
-            format!("Threshold armed · {}", format_price(price))
+            format!("Buy zone · {}", format_price(price))
         } else {
-            format!("已开启 {} · 目标 {} 元", basis.label(), format_price(price))
+            format!("已开启买入观察 · {} 元 · {}", format_price(price), basis.label())
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn set_sell_alert_from_levels(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(price) = self.selected_recommended_sell_price() else {
+            self.status = shared(if self.work_mode {
+                "Need daily bars for take-profit"
+            } else {
+                "加载日 K 后才能生成参考减仓价"
+            });
+            cx.notify();
+            return;
+        };
+        self.set_sell_alert(price, window, cx);
+    }
+
+    pub(crate) fn set_sell_alert_manual(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let raw = self.alert_price_input.read(cx).value().to_string();
+        let Some(price) = parse_f64(&raw).filter(|v| *v > 0.0) else {
+            self.status = shared(if self.work_mode {
+                "Enter a sell target first"
+            } else {
+                "请先在输入框填写止盈价"
+            });
+            cx.notify();
+            return;
+        };
+        self.set_sell_alert(price, window, cx);
+    }
+
+    fn set_sell_alert(&mut self, price: f64, window: &mut Window, cx: &mut Context<Self>) {
+        let code = self.selected.to_string();
+        let mut alert = self.buy_alerts.get(&code).cloned().unwrap_or_else(|| {
+            // 若尚无买入腿，用现价占位一个极低买价（不触发），只启用卖出腿
+            let last = self
+                .symbols
+                .iter()
+                .find(|s| s.code == code)
+                .map(|s| s.last)
+                .filter(|v| *v > 0.0)
+                .unwrap_or(price * 0.5);
+            BuyAlert::new(last.min(price * 0.5).max(0.01), BuyAlertBasis::Manual)
+        });
+        alert.sell_price = Some(price);
+        alert.sell_triggered = false;
+        self.buy_alerts.insert(code, alert);
+        self.alert_price_input.update(cx, |input, cx| {
+            input.set_value(format_price(price), window, cx);
+        });
+        self.schedule_persist(cx);
+        self.status = shared(if self.work_mode {
+            format!("Take-profit · {}", format_price(price))
+        } else {
+            format!("已设置止盈/减仓观察 · {} 元", format_price(price))
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn set_stop_alert_manual(&mut self, cx: &mut Context<Self>) {
+        let raw = self.alert_price_input.read(cx).value().to_string();
+        let Some(price) = parse_f64(&raw).filter(|v| *v > 0.0) else {
+            self.status = shared(if self.work_mode {
+                "Enter a stop price first"
+            } else {
+                "请先在输入框填写止损价"
+            });
+            cx.notify();
+            return;
+        };
+        let code = self.selected.to_string();
+        let mut alert = self.buy_alerts.get(&code).cloned().unwrap_or_else(|| {
+            BuyAlert::new(price * 1.05, BuyAlertBasis::Manual)
+        });
+        alert.stop_price = Some(price);
+        alert.stop_triggered = false;
+        self.buy_alerts.insert(code, alert);
+        self.schedule_persist(cx);
+        self.status = shared(if self.work_mode {
+            format!("Stop armed · {}", format_price(price))
+        } else {
+            format!("已设置止损观察 · {} 元", format_price(price))
         });
         cx.notify();
     }
@@ -84,9 +187,9 @@ impl StockApp {
         if self.buy_alerts.remove(&code).is_some() {
             self.schedule_persist(cx);
             self.status = shared(if self.work_mode {
-                "Threshold cleared"
+                "Alerts cleared"
             } else {
-                "已关闭买入提醒"
+                "已关闭该标的全部价位提醒"
             });
             cx.notify();
         }
@@ -97,20 +200,31 @@ impl StockApp {
         let Some(alert) = self.buy_alerts.get_mut(&code) else {
             return;
         };
+        let mut changed = false;
         if alert.triggered {
             alert.triggered = false;
+            changed = true;
+        }
+        if alert.sell_triggered {
+            alert.sell_triggered = false;
+            changed = true;
+        }
+        if alert.stop_triggered {
+            alert.stop_triggered = false;
+            changed = true;
+        }
+        if changed {
             self.schedule_persist(cx);
             self.status = shared(if self.work_mode {
-                "Threshold re-armed"
+                "All legs re-armed"
             } else {
-                "已重新武装买入提醒"
+                "已重新武装全部提醒腿"
             });
             cx.notify();
         }
     }
 
-    /// Apply quote transitions to all active alerts. A target fires once when
-    /// price enters from above; it rearms after a 0.3% move back above target.
+    /// Apply quote transitions to all active multi-leg alerts.
     pub(crate) fn evaluate_buy_alerts(
         &mut self,
         transitions: &[(String, f64, f64)],
@@ -129,24 +243,65 @@ impl StockApp {
             let Some(alert) = self.buy_alerts.get_mut(code) else {
                 continue;
             };
-            if !alert.is_valid() {
-                continue;
+
+            // —— 买入腿 ——
+            if alert.is_valid() {
+                if alert.triggered {
+                    if alerts::should_rearm(*current, alert.target_price) {
+                        alert.triggered = false;
+                        dirty = true;
+                    }
+                } else if alerts::crossed_down(*previous, *current, alert.target_price) {
+                    alert.triggered = true;
+                    dirty = true;
+                    hits.push(BuyAlertHit {
+                        code: code.clone(),
+                        name: name.clone(),
+                        target_price: alert.target_price,
+                        current_price: *current,
+                        leg: AlertLeg::Buy,
+                    });
+                }
             }
 
-            if alert.triggered {
-                if alerts::should_rearm(*current, alert.target_price) {
-                    alert.triggered = false;
+            // —— 止盈腿 ——
+            if let Some(sell) = alert.sell_price.filter(|p| p.is_finite() && *p > 0.0) {
+                if alert.sell_triggered {
+                    if alerts::should_rearm_sell(*current, sell) {
+                        alert.sell_triggered = false;
+                        dirty = true;
+                    }
+                } else if alerts::crossed_up(*previous, *current, sell) {
+                    alert.sell_triggered = true;
                     dirty = true;
+                    hits.push(BuyAlertHit {
+                        code: code.clone(),
+                        name: name.clone(),
+                        target_price: sell,
+                        current_price: *current,
+                        leg: AlertLeg::Sell,
+                    });
                 }
-            } else if alerts::crossed_down(*previous, *current, alert.target_price) {
-                alert.triggered = true;
-                dirty = true;
-                hits.push(BuyAlertHit {
-                    code: code.clone(),
-                    name,
-                    target_price: alert.target_price,
-                    current_price: *current,
-                });
+            }
+
+            // —— 止损腿 ——
+            if let Some(stop) = alert.stop_price.filter(|p| p.is_finite() && *p > 0.0) {
+                if alert.stop_triggered {
+                    if alerts::should_rearm_stop(*current, stop) {
+                        alert.stop_triggered = false;
+                        dirty = true;
+                    }
+                } else if alerts::crossed_down(*previous, *current, stop) {
+                    alert.stop_triggered = true;
+                    dirty = true;
+                    hits.push(BuyAlertHit {
+                        code: code.clone(),
+                        name: name.clone(),
+                        target_price: stop,
+                        current_price: *current,
+                        leg: AlertLeg::Stop,
+                    });
+                }
             }
         }
 
@@ -156,23 +311,20 @@ impl StockApp {
         hits
     }
 
-    /// Best-effort OS notifications for fired alerts. Work mode intentionally
-    /// suppresses the stock identity to avoid leaking it through a toast.
-    pub(crate) fn notify_buy_alert_hits(&self, hits: &[BuyAlertHit]) {
-        if self.work_mode {
-            return;
-        }
+    pub(crate) fn notify_buy_alert_hits(&mut self, hits: &[BuyAlertHit]) {
+        // 到价自动记日记，便于复盘（先于通知，确保落盘）
+        self.record_alert_journal_hits(hits);
         for hit in hits {
-            notifications::send(
-                "ZStock · 买入提醒".into(),
-                format!(
-                    "{} ({}) 已到目标价 {} 元，当前 {} 元",
-                    hit.name,
-                    hit.code,
-                    format_price(hit.target_price),
-                    format_price(hit.current_price)
-                ),
+            let leg = hit.leg.label(false);
+            let title = format!("ZStock · {leg}");
+            let body = format!(
+                "{} {} · 目标 {} · 现价 {}",
+                hit.code,
+                hit.name,
+                format_price(hit.target_price),
+                format_price(hit.current_price)
             );
+            notifications::send(title, body);
         }
     }
 
@@ -180,18 +332,21 @@ impl StockApp {
         if hits.is_empty() {
             return String::new();
         }
+        let parts: Vec<String> = hits
+            .iter()
+            .map(|h| {
+                format!(
+                    "{} {}@{}",
+                    h.leg.label(self.work_mode),
+                    h.code,
+                    format_price(h.target_price)
+                )
+            })
+            .collect();
         if self.work_mode {
-            format!("🔔 {} threshold(s) reached", hits.len())
-        } else if hits.len() == 1 {
-            let hit = &hits[0];
-            format!(
-                "🔔 {} 到达目标价 {} 元（现价 {}）",
-                hit.name,
-                format_price(hit.target_price),
-                format_price(hit.current_price)
-            )
+            format!("Alert · {}", parts.join(" · "))
         } else {
-            format!("🔔 {} 只自选已到买入目标价", hits.len())
+            format!("🔔 {}", parts.join(" · "))
         }
     }
 }

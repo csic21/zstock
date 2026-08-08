@@ -32,11 +32,15 @@ use crate::data::levels;
 use crate::data::portfolio::{
     self, format_money, format_shares, Portfolio, PortfolioSummary, TradeSide,
 };
+use crate::data::groups::{FindMode, WatchTag};
+use crate::data::radar::{
+    self, RadarHit, RadarStrategy, RADAR_KLINE_LIMIT, RADAR_PROBE_N, RADAR_RESULT_N,
+};
 use crate::data::scout::{self, ScoutPick, ScoutVerdict, SCOUT_CANDIDATE_N};
 use crate::data::treasure::{self, fmt_dd, fmt_pos, TreasureHit, TREASURE_KLINE_LIMIT};
 use crate::data::universe::{self, FinFilter, TreasurePool, TREASURE_SCAN_CAP, TREASURE_TOP_N};
 use crate::data::{
-    indicators::{BollSeries, MaSeries, MacdSeries},
+    eastmoney, indicators::{BollSeries, MaSeries, MacdSeries},
     market, session, signals,
 };
 use crate::data::market::Sourced;
@@ -222,11 +226,38 @@ impl StockApp {
         self.set_left_tab(next, cx);
     }
 
-    /// 后台扫描：自选 ∪ 东财扩大池（市值前列）→ 深评 → Top100。
+    /// 盘后 / 缓存过期：静默预扫长线（不抢焦点）。可反复调用。
+    pub(crate) fn maybe_background_rescan(&mut self, cx: &mut Context<Self>) {
+        if self.treasure_scanning || self.scout_running || self.radar_scanning {
+            return;
+        }
+        if !session::should_background_long_rescan() {
+            return;
+        }
+        let need = self.treasure_hits.is_empty()
+            || matches!(
+                crate::data::freshness::classify(&self.treasure_updated_at),
+                crate::data::freshness::Freshness::Stale
+                    | crate::data::freshness::Freshness::Unknown
+            );
+        if !need {
+            return;
+        }
+        self.start_treasure_scan_with(true, cx);
+    }
+
+    /// 前台扫描：自选 ∪ 扩大池 → 深评 → Top100。
     pub(crate) fn start_treasure_scan(&mut self, cx: &mut Context<Self>) {
+        self.start_treasure_scan_with(false, cx);
+    }
+
+    /// `silent`：保留旧榜、不切 Tab、状态更轻；完成后仍自动筛可买（静默 UX）。
+    pub(crate) fn start_treasure_scan_with(&mut self, silent: bool, cx: &mut Context<Self>) {
         if self.treasure_scanning {
-            self.status = shared("寻宝扫描进行中…");
-            cx.notify();
+            if !silent {
+                self.status = shared("寻宝扫描进行中…");
+                cx.notify();
+            }
             return;
         }
         let watchlist: Vec<String> = self.symbols.iter().map(|s| s.code.clone()).collect();
@@ -236,29 +267,50 @@ impl StockApp {
         self.treasure_gen = self.treasure_gen.wrapping_add(1);
         let scan_id = self.treasure_gen;
         self.treasure_scanning = true;
+        self.treasure_scan_silent = silent;
         self.treasure_done = 0;
         self.treasure_total = 0;
-        self.treasure_hits.clear();
-        // 新扫描作废旧的可买清单
-        self.scout_gen = self.scout_gen.wrapping_add(1);
-        self.scout_picks.clear();
-        self.scout_summary = shared("");
-        self.scout_source = shared("");
-        self.scout_running = false;
-        self.scout_done = 0;
-        self.scout_total = 0;
-        self.treasure_list_expanded = false;
-        self.treasure_status = shared(format!(
-            "① 拉取 {} 池（{}）· 入榜 Top {TREASURE_TOP_N}…",
-            pool.label(),
-            fin.label()
-        ));
-        self.status = shared(format!(
-            "🐭 寻宝 · {}池 · {} · 入榜{TREASURE_TOP_N}",
-            pool.label(),
-            fin.label()
-        ));
-        self.left_tab = LeftTab::Treasure;
+        if !silent {
+            self.treasure_hits.clear();
+            // 新扫描作废旧的可买清单
+            self.scout_gen = self.scout_gen.wrapping_add(1);
+            self.scout_picks.clear();
+            self.scout_summary = shared("");
+            self.scout_source = shared("");
+            self.scout_running = false;
+            self.scout_done = 0;
+            self.scout_total = 0;
+            self.treasure_list_expanded = false;
+            self.left_tab = LeftTab::Treasure;
+        }
+        self.treasure_status = shared(if silent {
+            format!(
+                "后台更新 · {}池 · {} · Top {TREASURE_TOP_N}…",
+                pool.label(),
+                fin.label()
+            )
+        } else {
+            format!(
+                "① 拉取 {} 池（{}）· 入榜 Top {TREASURE_TOP_N}…",
+                pool.label(),
+                fin.label()
+            )
+        });
+        if silent {
+            // 不覆盖用户正在看的状态栏主文案（仅轻提示）
+            if self.status.as_ref().contains("连接")
+                || self.status.as_ref().is_empty()
+                || self.status.as_ref().contains("就绪")
+            {
+                self.status = shared("长线榜后台更新中…");
+            }
+        } else {
+            self.status = shared(format!(
+                "🐭 寻宝 · {}池 · {} · 入榜{TREASURE_TOP_N}",
+                pool.label(),
+                fin.label()
+            ));
+        }
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -395,6 +447,7 @@ impl StockApp {
                 }
                 app.treasure_scanning = false;
                 app.treasure_hits = hits;
+                app.treasure_updated_at = updated_at.clone();
                 app.treasure_done = total;
                 // 同步名称到已在自选里的同代码
                 for hit in &app.treasure_hits {
@@ -407,19 +460,28 @@ impl StockApp {
                         }
                     }
                 }
+                let silent = app.treasure_scan_silent;
+                app.treasure_scan_silent = false;
                 app.treasure_status = shared(format!(
                     "完成 · 深评 {total} · 入榜 {} · {pool_src} · {filter_note} · {updated_at}",
                     app.treasure_hits.len(),
                 ));
-                app.status = shared(format!(
-                    "🐭 寻宝完成 · Top {} / 扫描 {total} · 正在筛可买…",
-                    app.treasure_hits.len(),
-                ));
+                if silent {
+                    app.status = shared(format!(
+                        "长线榜已更新 · Top {} · 正在静默筛可买…",
+                        app.treasure_hits.len(),
+                    ));
+                } else {
+                    app.status = shared(format!(
+                        "🐭 寻宝完成 · Top {} / 扫描 {total} · 正在筛可买…",
+                        app.treasure_hits.len(),
+                    ));
+                }
                 app.persist();
                 cx.notify();
                 // 扫完自动批量筛「可买观察」，避免用户一只只点
                 if !app.treasure_hits.is_empty() {
-                    app.start_scout_picks(cx);
+                    app.start_scout_picks_with(silent, cx);
                 }
             });
         })
@@ -428,20 +490,30 @@ impl StockApp {
 
     /// 从当前寻宝榜批量深评，筛出「可关注 / 观察」清单（本地规则；可选 LLM 整榜摘要）。
     pub(crate) fn start_scout_picks(&mut self, cx: &mut Context<Self>) {
+        self.start_scout_picks_with(false, cx);
+    }
+
+    pub(crate) fn start_scout_picks_with(&mut self, silent: bool, cx: &mut Context<Self>) {
         if self.scout_running {
-            self.status = shared("可买筛分进行中…");
-            cx.notify();
+            if !silent {
+                self.status = shared("可买筛分进行中…");
+                cx.notify();
+            }
             return;
         }
         if self.treasure_scanning {
-            self.status = shared("请等寻宝扫描结束后再筛可买");
-            cx.notify();
+            if !silent {
+                self.status = shared("请等寻宝扫描结束后再筛可买");
+                cx.notify();
+            }
             return;
         }
         if self.treasure_hits.is_empty() {
-            self.scout_summary = shared("请先「开始搜罗」生成寻宝榜，再筛可买。");
-            self.status = shared("无可筛标的 · 先搜罗");
-            cx.notify();
+            if !silent {
+                self.scout_summary = shared("请先「开始搜罗」生成寻宝榜，再筛可买。");
+                self.status = shared("无可筛标的 · 先搜罗");
+                cx.notify();
+            }
             return;
         }
 
@@ -459,6 +531,7 @@ impl StockApp {
         let run_id = self.scout_gen;
         let total = candidates.len();
         self.scout_running = true;
+        self.scout_silent = silent;
         self.scout_done = 0;
         self.scout_total = total;
         self.scout_picks.clear();
@@ -470,8 +543,10 @@ impl StockApp {
         } else {
             "本地规则筛分中"
         });
-        self.left_tab = LeftTab::Treasure;
-        self.status = shared(format!("🎯 筛可买 0/{total}"));
+        if !silent {
+            self.left_tab = LeftTab::Treasure;
+            self.status = shared(format!("🎯 筛可买 0/{total}"));
+        }
         cx.notify();
 
         let ai_cfg = self.ai_config.clone();
@@ -640,6 +715,10 @@ impl StockApp {
     }
 
     pub(crate) fn select_scout_pick(&mut self, pick: &ScoutPick, cx: &mut Context<Self>) {
+        // 长线可买观察默认标入长线池
+        self.watch_tags
+            .entry(pick.code.clone())
+            .or_insert(WatchTag::Long);
         // 若在寻宝榜中，走完整寻宝选中（含 3Y 视图）；否则直接选代码
         if let Some(hit) = self
             .treasure_hits
@@ -688,7 +767,10 @@ impl StockApp {
     }
 
     /// 筛分结束后的 UX：过滤回退、默认打开第一只、切到底栏寻宝。
+    /// 静默模式只更新缓存清单，不抢焦点。
     pub(crate) fn finish_scout_ux(&mut self, cx: &mut Context<Self>) {
+        let silent = self.scout_silent;
+        self.scout_silent = false;
         let buy_n = self
             .scout_picks
             .iter()
@@ -701,6 +783,14 @@ impl StockApp {
             self.scout_only_buy_watch = true;
         }
         self.treasure_list_expanded = false;
+        if silent {
+            self.status = shared(format!(
+                "长线就绪 · 可关注 {buy_n} / 共 {} · 打开「找」查看",
+                self.scout_picks.len()
+            ));
+            cx.notify();
+            return;
+        }
         self.detail_tab = DetailTab::Treasure;
         self.left_tab = LeftTab::Treasure;
         self.schedule_persist(cx);
@@ -716,6 +806,530 @@ impl StockApp {
         } else {
             cx.notify();
         }
+    }
+
+    // —— 决策日记 ——
+
+    pub(crate) fn persist_journal(&self) {
+        let _ = storage::save_journal(&self.journal);
+    }
+
+    pub(crate) fn record_journal_entry(
+        &mut self,
+        code: String,
+        name: String,
+        kind: crate::data::journal::JournalKind,
+        price: Option<f64>,
+        target: Option<f64>,
+        note: String,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::data::journal::{self, JournalEntry};
+        let entry = JournalEntry {
+            id: journal::new_id(),
+            code,
+            name,
+            kind,
+            price,
+            target,
+            note,
+            created_at: journal::now_stamp(),
+        };
+        self.journal.push(entry);
+        self.persist_journal();
+        cx.notify();
+    }
+
+    pub(crate) fn add_manual_journal_note(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::data::journal::JournalKind;
+        let note = self.journal_note_input.read(cx).value().to_string();
+        let note = note.trim().to_string();
+        if note.is_empty() {
+            self.status = shared(if self.work_mode {
+                "Empty note"
+            } else {
+                "请先写一句观察或计划"
+            });
+            cx.notify();
+            return;
+        }
+        let code = self.selected.to_string();
+        let name = self
+            .symbols
+            .iter()
+            .find(|s| s.code == code)
+            .map(|s| s.name.to_string())
+            .unwrap_or_else(|| code.clone());
+        let price = self
+            .symbols
+            .iter()
+            .find(|s| s.code == code)
+            .map(|s| s.last)
+            .filter(|p| *p > 0.0)
+            .or_else(|| self.candles.last().map(|c| c.close));
+        self.record_journal_entry(code, name, JournalKind::Manual, price, None, note, cx);
+        self.journal_note_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        self.status = shared(if self.work_mode {
+            "Journal saved"
+        } else {
+            "已写入决策日记"
+        });
+    }
+
+    pub(crate) fn remove_journal_entry(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.journal.remove(id) {
+            self.persist_journal();
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn toggle_journal_filter_selected(&mut self, cx: &mut Context<Self>) {
+        self.journal_filter_selected = !self.journal_filter_selected;
+        cx.notify();
+    }
+
+    /// 提醒触发时自动记日记（不打扰，不弹窗）。
+    pub(crate) fn record_alert_journal_hits(&mut self, hits: &[super::alerts::BuyAlertHit]) {
+        use crate::data::alerts::AlertLeg;
+        use crate::data::journal::{self, JournalKind};
+        if hits.is_empty() {
+            return;
+        }
+        for hit in hits {
+            let kind = match hit.leg {
+                AlertLeg::Buy => JournalKind::AlertBuy,
+                AlertLeg::Sell => JournalKind::AlertSell,
+                AlertLeg::Stop => JournalKind::AlertStop,
+            };
+            let note = journal::note_for_alert(
+                kind,
+                &hit.code,
+                &hit.name,
+                hit.target_price,
+                hit.current_price,
+            );
+            self.journal.push(journal::JournalEntry {
+                id: journal::new_id(),
+                code: hit.code.clone(),
+                name: hit.name.clone(),
+                kind,
+                price: Some(hit.current_price),
+                target: Some(hit.target_price),
+                note,
+                created_at: journal::now_stamp(),
+            });
+        }
+        self.persist_journal();
+    }
+
+    pub(crate) fn set_find_mode(&mut self, mode: FindMode, cx: &mut Context<Self>) {
+        if self.find_mode == mode {
+            self.left_tab = LeftTab::Treasure;
+            cx.notify();
+            return;
+        }
+        self.find_mode = mode;
+        self.left_tab = LeftTab::Treasure;
+        self.schedule_persist(cx);
+        self.status = shared(if self.work_mode {
+            format!("Find · {}", mode.label(true))
+        } else {
+            format!("现在找 · {}", mode.label(false))
+        });
+        cx.notify();
+    }
+
+    /// 标题栏 / 命令面板：打开「现在找」并按模式开扫。
+    pub(crate) fn open_find_and_scan(&mut self, mode: FindMode, cx: &mut Context<Self>) {
+        self.find_mode = mode;
+        self.left_tab = LeftTab::Treasure;
+        self.schedule_persist(cx);
+        match mode {
+            FindMode::Long => {
+                if self.treasure_hits.is_empty() || self.treasure_scanning {
+                    self.start_treasure_scan(cx);
+                } else {
+                    self.status = shared(if self.work_mode {
+                        "Long cache ready · rescan or pick"
+                    } else {
+                        "长线缓存已就绪 · 可重扫或点清单"
+                    });
+                    cx.notify();
+                }
+            }
+            FindMode::Short => {
+                if self.radar_hits.is_empty() || self.radar_scanning {
+                    self.start_radar_scan(cx);
+                } else {
+                    self.status = shared(if self.work_mode {
+                        "Short radar ready · rescan or pick"
+                    } else {
+                        "短线雷达已就绪 · 可重扫或点清单"
+                    });
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    pub(crate) fn start_radar_scan(&mut self, cx: &mut Context<Self>) {
+        if self.radar_scanning {
+            self.status = shared(if self.work_mode {
+                "Radar running…"
+            } else {
+                "短线雷达扫描中…"
+            });
+            cx.notify();
+            return;
+        }
+        if self.treasure_scanning {
+            self.status = shared("请等长线搜罗结束后再扫短线");
+            cx.notify();
+            return;
+        }
+
+        self.radar_gen = self.radar_gen.wrapping_add(1);
+        let scan_id = self.radar_gen;
+        self.radar_scanning = true;
+        self.radar_done = 0;
+        self.radar_total = 0;
+        self.radar_hits.clear();
+        self.radar_summary = shared("");
+        self.find_mode = FindMode::Short;
+        self.left_tab = LeftTab::Treasure;
+        self.radar_status = shared("拉取流动性候选池…");
+        self.status = shared(if self.work_mode {
+            "Short radar · probing"
+        } else {
+            "📡 短线雷达 · 拉取候选"
+        });
+        cx.notify();
+
+        let strategy_filter = self.radar_filter;
+
+        cx.spawn(async move |this, cx| {
+            let universe = smol::unblock(|| eastmoney::fetch_liquid_a_shares(220)).await;
+            let universe = match universe {
+                Ok(u) if !u.is_empty() => u,
+                Ok(_) => {
+                    let _ = this.update(cx, |app, cx| {
+                        if app.radar_gen != scan_id {
+                            return;
+                        }
+                        app.radar_scanning = false;
+                        app.radar_status = shared("候选池为空");
+                        app.status = shared("短线雷达失败：无候选");
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(e) => {
+                    let _ = this.update(cx, |app, cx| {
+                        if app.radar_gen != scan_id {
+                            return;
+                        }
+                        app.radar_scanning = false;
+                        app.radar_status = shared(format!("候选池失败：{e}"));
+                        app.status = shared("短线雷达失败");
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+
+            let codes: Vec<String> = universe.iter().map(|r| r.code.clone()).collect();
+            let names: HashMap<String, String> = universe
+                .into_iter()
+                .map(|r| (r.code, r.name))
+                .collect();
+
+            let quotes = smol::unblock(move || market::fetch_quotes(&codes)).await;
+            let mut ticks = match quotes {
+                Ok(s) => s.data,
+                Err(e) => {
+                    let _ = this.update(cx, |app, cx| {
+                        if app.radar_gen != scan_id {
+                            return;
+                        }
+                        app.radar_scanning = false;
+                        app.radar_status = shared(format!("行情失败：{e}"));
+                        app.status = shared("短线雷达失败");
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+
+            // 优先有波动的流动性标的；涨跌都保留以便回踩/超跌策略。
+            ticks.retain(|q| {
+                q.last > 0.0
+                    && q.change_pct.is_finite()
+                    && !q.name.to_ascii_uppercase().contains("ST")
+            });
+            ticks.sort_by(|a, b| {
+                b.change_pct
+                    .abs()
+                    .partial_cmp(&a.change_pct.abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            if ticks.len() > RADAR_PROBE_N {
+                ticks.truncate(RADAR_PROBE_N);
+            }
+            let total = ticks.len();
+            let _ = this.update(cx, |app, cx| {
+                if app.radar_gen != scan_id {
+                    return;
+                }
+                app.radar_total = total;
+                app.radar_status = shared(format!("深评 0/{total} · 回踩/突破/超跌"));
+                app.status = shared(format!("📡 短线深评 0/{total}"));
+                cx.notify();
+            });
+
+            let mut hits: Vec<RadarHit> = Vec::new();
+            for (i, tick) in ticks.into_iter().enumerate() {
+                let cancelled = this
+                    .read_with(cx, |app, _| app.radar_gen != scan_id)
+                    .unwrap_or(true);
+                if cancelled {
+                    return;
+                }
+
+                let code = tick.code.clone();
+                let day_chg = tick.change_pct;
+                let name_hint = names
+                    .get(&code)
+                    .cloned()
+                    .unwrap_or_else(|| tick.name.clone());
+                let code_fetch = code.clone();
+                let result = smol::unblock(move || {
+                    market::fetch_klines_adjusted(&code_fetch, RADAR_KLINE_LIMIT)
+                })
+                .await;
+
+                if let Ok(sourced) = result {
+                    let (_c, returned_name, candles) = sourced.data;
+                    let name = if is_real_name(&returned_name, &code) {
+                        returned_name
+                    } else {
+                        name_hint
+                    };
+                    let hit = match strategy_filter {
+                        Some(st) => {
+                            radar::evaluate_strategy(&code, &name, &candles, day_chg, st)
+                        }
+                        None => radar::evaluate(&code, &name, &candles, day_chg),
+                    };
+                    if let Some(h) = hit {
+                        hits.push(h);
+                    }
+                }
+
+                let done = i + 1;
+                let _ = this.update(cx, |app, cx| {
+                    if app.radar_gen != scan_id {
+                        return;
+                    }
+                    app.radar_done = done;
+                    let mut partial = hits.clone();
+                    radar::sort_hits(&mut partial);
+                    if partial.len() > RADAR_RESULT_N {
+                        partial.truncate(RADAR_RESULT_N);
+                    }
+                    app.radar_hits = partial;
+                    app.radar_status = shared(format!(
+                        "深评 {done}/{total} · 命中 {}",
+                        app.radar_hits.len()
+                    ));
+                    if done == total || done % 5 == 0 {
+                        app.status = shared(format!("📡 短线深评 {done}/{total}"));
+                    }
+                    cx.notify();
+                });
+
+                if done < total {
+                    Timer::after(TREASURE_SCAN_GAP).await;
+                }
+            }
+
+            radar::sort_hits(&mut hits);
+            if hits.len() > RADAR_RESULT_N {
+                hits.truncate(RADAR_RESULT_N);
+            }
+            let summary = radar::local_summary(&hits);
+            let updated_at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+            let cache = radar::RadarCache {
+                updated_at: updated_at.clone(),
+                universe: format!("liquid/probe{total}/top{RADAR_RESULT_N}"),
+                hits: hits.clone(),
+            };
+            let _ = storage::save_radar_cache(&cache);
+
+            let _ = this.update(cx, |app, cx| {
+                if app.radar_gen != scan_id {
+                    return;
+                }
+                app.radar_scanning = false;
+                app.radar_hits = hits;
+                app.radar_updated_at = updated_at.clone();
+                app.radar_done = total;
+                app.radar_summary = shared(summary);
+                app.radar_status = shared(format!(
+                    "完成 · {} 只 · {updated_at}",
+                    app.radar_hits.len()
+                ));
+                app.status = shared(format!(
+                    "📡 短线雷达完成 · {} 只",
+                    app.radar_hits.len()
+                ));
+                if let Some(first) = app.radar_hits.first().cloned() {
+                    app.select_radar_hit(&first, cx);
+                } else {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn cancel_radar_scan(&mut self, cx: &mut Context<Self>) {
+        if !self.radar_scanning {
+            return;
+        }
+        self.radar_gen = self.radar_gen.wrapping_add(1);
+        self.radar_scanning = false;
+        self.radar_status = shared(format!(
+            "已取消 · 保留 {} 条",
+            self.radar_hits.len()
+        ));
+        self.status = shared("已取消短线雷达");
+        cx.notify();
+    }
+
+    pub(crate) fn set_radar_filter(
+        &mut self,
+        filter: Option<RadarStrategy>,
+        cx: &mut Context<Self>,
+    ) {
+        self.radar_filter = filter;
+        cx.notify();
+    }
+
+    pub(crate) fn select_radar_hit(&mut self, hit: &RadarHit, cx: &mut Context<Self>) {
+        let code = hit.code.clone();
+        let display = display_name_str(&hit.name, &code);
+        if !self.symbols.iter().any(|s| s.code == code) {
+            self.symbols.push(Symbol {
+                code: code.clone(),
+                name: shared(display),
+                last: hit.close,
+                change_pct: hit.change_pct,
+                volume: 0,
+                board: board_for_code(&code),
+            });
+            self.filtered_local = (0..self.symbols.len()).collect();
+        }
+        // 默认标为短线池，方便后续盯盘
+        self.watch_tags
+            .entry(code.clone())
+            .or_insert(WatchTag::Short);
+        self.left_tab = LeftTab::Treasure;
+        self.find_mode = FindMode::Short;
+        self.detail_tab = DetailTab::Strategy;
+        self.schedule_persist(cx);
+        if !matches!(self.range, ChartRange::M1 | ChartRange::M3) {
+            self.range = ChartRange::M3;
+        }
+        self.select_symbol(shared(code), cx);
+    }
+
+    pub(crate) fn visible_radar_hits(&self) -> Vec<&RadarHit> {
+        self.radar_hits
+            .iter()
+            .filter(|h| match self.radar_filter {
+                None => true,
+                Some(st) => h.strategy == st,
+            })
+            .collect()
+    }
+
+    pub(crate) fn tag_for(&self, code: &str) -> WatchTag {
+        self.watch_tags.get(code).copied().unwrap_or(WatchTag::None)
+    }
+
+    pub(crate) fn set_watch_tag(&mut self, code: &str, tag: WatchTag, cx: &mut Context<Self>) {
+        if tag == WatchTag::None {
+            self.watch_tags.remove(code);
+        } else {
+            self.watch_tags.insert(code.to_string(), tag);
+        }
+        self.schedule_persist(cx);
+        self.status = shared(if self.work_mode {
+            format!("Tag · {} · {}", code, tag.label(true))
+        } else {
+            format!("已标记 {} → {}", code, tag.label(false))
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn cycle_selected_watch_tag(&mut self, cx: &mut Context<Self>) {
+        let code = self.selected.to_string();
+        let cur = self.tag_for(&code);
+        let next = match cur {
+            WatchTag::None => WatchTag::Long,
+            WatchTag::Long => WatchTag::Short,
+            WatchTag::Short => WatchTag::Watch,
+            WatchTag::Watch => WatchTag::None,
+        };
+        self.set_watch_tag(&code, next, cx);
+    }
+
+    pub(crate) fn set_watch_filter(&mut self, filter: WatchTag, cx: &mut Context<Self>) {
+        if self.watch_filter == filter {
+            return;
+        }
+        self.watch_filter = filter;
+        self.schedule_persist(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn add_pick_to_group(
+        &mut self,
+        code: &str,
+        name: &str,
+        last: f64,
+        tag: WatchTag,
+        cx: &mut Context<Self>,
+    ) {
+        self.ensure_in_watchlist(code, name, last);
+        self.set_watch_tag(code, tag, cx);
+    }
+
+    pub(crate) fn run_selected_backtest(&mut self, cx: &mut Context<Self>) {
+        use crate::data::backtest::{self, BacktestRule};
+        if self.candles.len() < 60 {
+            self.backtest_report = None;
+            self.status = shared(if self.work_mode {
+                "Need more daily bars"
+            } else {
+                "日 K 不足 60 根，无法回测"
+            });
+            cx.notify();
+            return;
+        }
+        // 默认跑「站上 MA20」；策略 Tab 可再扩
+        let report = backtest::run(&self.candles, BacktestRule::Ma20CrossUp, 10);
+        self.backtest_report = report;
+        if let Some(ref r) = self.backtest_report {
+            self.status = shared(r.summary_line(self.work_mode));
+        }
+        cx.notify();
     }
 
     pub(crate) fn cancel_treasure_scan(&mut self, cx: &mut Context<Self>) {
@@ -772,6 +1386,7 @@ impl StockApp {
         self.buy_alerts.remove(code);
         self.work_aliases.remove(code);
         self.chart_lines.remove(code);
+        self.watch_tags.remove(code);
         self.filtered_local = (0..self.symbols.len()).collect();
         if was_selected {
             self.selected = shared(
@@ -910,12 +1525,45 @@ impl StockApp {
         if !self.palette_open {
             return;
         }
+        // 意图快捷：即使有本地匹配也优先识别纯意图词
+        let q_raw = self.palette_query.read(cx).value().to_string();
+        let q_intent = q_raw.trim().to_lowercase();
+        if matches!(
+            q_intent.as_str(),
+            "长线"
+                | "找长线"
+                | "long"
+                | "寻宝"
+                | "低位"
+                | "短线"
+                | "找短线"
+                | "short"
+                | "雷达"
+                | "市场"
+                | "板块"
+                | "情绪"
+                | "market"
+        ) {
+            self.palette_open = false;
+            match q_intent.as_str() {
+                "短线" | "找短线" | "short" | "雷达" => {
+                    self.open_find_and_scan(FindMode::Short, cx);
+                }
+                "市场" | "板块" | "情绪" | "market" => {
+                    self.open_market_analysis(cx);
+                }
+                _ => {
+                    self.open_find_and_scan(FindMode::Long, cx);
+                }
+            }
+            return;
+        }
+
         let n_local = self.filtered_local.len();
         let n_remote = self.palette_hits.len();
         let total = n_local + n_remote;
         if total == 0 {
-            let q = self.palette_query.read(cx).value().to_string();
-            let q = q.trim();
+            let q = q_raw.trim();
             if q.is_empty() {
                 return;
             }

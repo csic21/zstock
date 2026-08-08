@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::ai::AiConfig;
 use crate::data::alerts::BuyAlert;
+use crate::data::journal::Journal;
 use crate::data::portfolio::Portfolio;
+use crate::data::radar::RadarCache;
 use crate::data::treasure::TreasureCache;
 use crate::model::{TrendLine, default_watchlist_codes};
 
@@ -275,6 +277,15 @@ pub struct AppConfig {
     /// Left sidebar tab: `watchlist` | `portfolio` | `treasure`.
     #[serde(default = "default_left_tab")]
     pub left_tab: String,
+    /// 「现在找」主模式：`long` | `short`。
+    #[serde(default = "default_find_mode")]
+    pub find_mode: String,
+    /// 自选分组标签：code → `long` / `short` / `watch` / `none`。
+    #[serde(default)]
+    pub watch_tags: std::collections::HashMap<String, String>,
+    /// 自选列表筛选：`none` 表示全部。
+    #[serde(default = "default_watch_filter")]
+    pub watch_filter: String,
 }
 
 fn default_true() -> bool {
@@ -304,6 +315,14 @@ fn default_detail_tab() -> String {
 
 fn default_left_tab() -> String {
     "watchlist".into()
+}
+
+fn default_find_mode() -> String {
+    "long".into()
+}
+
+fn default_watch_filter() -> String {
+    "none".into()
 }
 
 /// Clamp user-facing quote interval.
@@ -348,6 +367,9 @@ impl Default for AppConfig {
             status_bar_active: String::new(),
             detail_tab: default_detail_tab(),
             left_tab: default_left_tab(),
+            find_mode: default_find_mode(),
+            watch_tags: std::collections::HashMap::new(),
+            watch_filter: default_watch_filter(),
         }
     }
 }
@@ -423,8 +445,16 @@ pub fn treasure_cache_path() -> PathBuf {
     app_data_dir().join("treasure_cache.json")
 }
 
+pub fn radar_cache_path() -> PathBuf {
+    app_data_dir().join("radar_cache.json")
+}
+
 pub fn portfolio_path() -> PathBuf {
     app_data_dir().join("portfolio.json")
+}
+
+pub fn journal_path() -> PathBuf {
+    app_data_dir().join("journal.json")
 }
 
 pub fn load_config() -> AppConfig {
@@ -465,6 +495,25 @@ pub fn save_treasure_cache(cache: &TreasureCache) -> Result<()> {
     Ok(())
 }
 
+pub fn load_radar_cache() -> RadarCache {
+    let path = radar_cache_path();
+    match fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => RadarCache::default(),
+    }
+}
+
+pub fn save_radar_cache(cache: &RadarCache) -> Result<()> {
+    let path = radar_cache_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create {}", parent.display()))?;
+    }
+    let s = serde_json::to_string_pretty(cache)?;
+    fs::write(&path, s).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
 pub fn load_portfolio() -> Portfolio {
     let path = portfolio_path();
     match fs::read_to_string(&path) {
@@ -480,6 +529,25 @@ pub fn save_portfolio(portfolio: &Portfolio) -> Result<()> {
             .with_context(|| format!("create {}", parent.display()))?;
     }
     let s = serde_json::to_string_pretty(portfolio)?;
+    fs::write(&path, s).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+pub fn load_journal() -> Journal {
+    let path = journal_path();
+    match fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => Journal::default(),
+    }
+}
+
+pub fn save_journal(journal: &Journal) -> Result<()> {
+    let path = journal_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create {}", parent.display()))?;
+    }
+    let s = serde_json::to_string_pretty(journal)?;
     fs::write(&path, s).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }

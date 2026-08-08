@@ -32,6 +32,9 @@ use crate::data::levels;
 use crate::data::portfolio::{
     self, format_money, format_shares, Portfolio, PortfolioSummary, TradeSide,
 };
+use crate::data::freshness::{self, Freshness};
+use crate::data::groups::{FindMode, WatchTag};
+use crate::data::radar::{self, RadarHit, RadarStrategy};
 use crate::data::scout::{self, ScoutPick, ScoutVerdict, SCOUT_CANDIDATE_N};
 use crate::data::treasure::{self, fmt_dd, fmt_pos, TreasureHit, TREASURE_KLINE_LIMIT};
 use crate::data::universe::{self, FinFilter, TreasurePool, TREASURE_SCAN_CAP, TREASURE_TOP_N};
@@ -116,9 +119,9 @@ impl StockApp {
                             .when(self.left_tab != LeftTab::Treasure, |b| b.ghost())
                             .label(L::left_treasure(work))
                             .tooltip(if work {
-                                "Multi-window scan · ⌘T"
+                                "Find longs / shorts · ⌘T"
                             } else {
-                                "多窗口历史低位扫描（1Y/3Y/全样本）"
+                                "现在找：长线低位 · 短线雷达 · ⌘T"
                             })
                             .on_click(cx.listener(|this, _, _w, cx| {
                                 this.set_left_tab(LeftTab::Treasure, cx);
@@ -130,17 +133,35 @@ impl StockApp {
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(match self.left_tab {
-                                LeftTab::Watchlist => format!("{} 只", self.symbols.len()),
+                                LeftTab::Watchlist => {
+                                    let n = self.watchlist_display_order().len();
+                                    if self.watch_filter == WatchTag::None {
+                                        format!("{} 只", self.symbols.len())
+                                    } else {
+                                        format!("{n}/{}", self.symbols.len())
+                                    }
+                                }
                                 LeftTab::Portfolio => {
                                     format!("{} 只", self.portfolio_summary().open_count)
                                 }
-                                LeftTab::Treasure => {
-                                    if self.treasure_scanning {
-                                        format!("{}/{}", self.treasure_done, self.treasure_total)
-                                    } else {
-                                        format!("{} 只", self.treasure_hits.len())
+                                LeftTab::Treasure => match self.find_mode {
+                                    FindMode::Long => {
+                                        if self.treasure_scanning {
+                                            format!("{}/{}", self.treasure_done, self.treasure_total)
+                                        } else if !self.scout_picks.is_empty() {
+                                            format!("{} 可买", self.scout_picks.len())
+                                        } else {
+                                            format!("{} 只", self.treasure_hits.len())
+                                        }
                                     }
-                                }
+                                    FindMode::Short => {
+                                        if self.radar_scanning {
+                                            format!("{}/{}", self.radar_done, self.radar_total)
+                                        } else {
+                                            format!("{} 只", self.radar_hits.len())
+                                        }
+                                    }
+                                },
                             }),
                     ),
             )
@@ -204,10 +225,51 @@ impl StockApp {
                     })),
             )
             .child(
+                h_flex()
+                    .h(px(26.))
+                    .px_1()
+                    .items_center()
+                    .gap_0p5()
+                    .border_b_1()
+                    .border_color(cx.theme().border.opacity(0.45))
+                    .children(WatchTag::all_filters().into_iter().enumerate().map(|(ix, tag)| {
+                        let active = self.watch_filter == tag;
+                        Button::new(("wl-tag-filter", ix as u32))
+                            .ghost()
+                            .xsmall()
+                            .when(active, |b| b.primary())
+                            .label(tag.label(work))
+                            .tooltip(if work {
+                                "Filter by pool tag"
+                            } else {
+                                "按长线/短线/观察池筛选"
+                            })
+                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                this.set_watch_filter(tag, cx);
+                            }))
+                    })),
+            )
+            .child(
                 v_flex()
                     .id("watchlist-scroll")
                     .flex_1()
                     .overflow_y_scroll()
+                    .when(display_order.is_empty(), |col| {
+                        col.child(
+                            div()
+                                .px_3()
+                                .py_4()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if work {
+                                    "No symbols in this filter"
+                                } else if self.watch_filter == WatchTag::None {
+                                    "自选为空 · 点下方添加，或去「找」扫票"
+                                } else {
+                                    "该分组暂无标的 · 在列表点标签或从「找」一键入池"
+                                }),
+                        )
+                    })
                     .children(display_order.into_iter().map(|ix| {
                         let sym = &self.symbols[ix];
                         let is_selected = sym.code == selected.as_ref();
@@ -218,6 +280,7 @@ impl StockApp {
                         } else {
                             sym.name.clone()
                         };
+                        let code_for_tag = code.clone();
                         let code_rm = code.clone();
                         let name_rm = name_show.clone();
                         let code_tip = code_show.clone();
@@ -229,6 +292,9 @@ impl StockApp {
                         } else {
                             sym.board.clone()
                         };
+                        let tag = self.tag_for(&sym.code);
+                        let tag_badge = tag.short_badge();
+                        let has_alert = self.buy_alerts.contains_key(&sym.code);
 
                         div()
                             .id(("watch-row", ix))
@@ -262,6 +328,17 @@ impl StockApp {
                                                     .text_color(cx.theme().foreground)
                                                     .child(code_show),
                                             )
+                                            .when(!tag_badge.is_empty(), |row| {
+                                                row.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .px_1()
+                                                        .rounded(cx.theme().radius)
+                                                        .bg(cx.theme().accent.opacity(0.2))
+                                                        .text_color(cx.theme().accent)
+                                                        .child(tag_badge),
+                                                )
+                                            })
                                             .child(
                                                 div()
                                                     .text_xs()
@@ -291,7 +368,7 @@ impl StockApp {
                                         div().text_xs().text_color(chg_color).child(chg),
                                     ),
                             )
-                            .when(self.buy_alerts.contains_key(&sym.code), |row| {
+                            .when(has_alert, |row| {
                                 row.child(
                                     div()
                                         .text_xs()
@@ -299,6 +376,25 @@ impl StockApp {
                                         .child(if work { "T" } else { "🔔" }),
                                 )
                             })
+                            .child(
+                                Button::new(("wl-tag", ix))
+                                    .ghost()
+                                    .xsmall()
+                                    .label(if tag_badge.is_empty() {
+                                        if work { "+" } else { "标" }
+                                    } else {
+                                        tag_badge
+                                    })
+                                    .tooltip(if work {
+                                        "Cycle pool tag · Long/Short/Watch"
+                                    } else {
+                                        "循环标记：长线 → 短线 → 观察 → 清除"
+                                    })
+                                    .on_click(cx.listener(move |this, _, _w, cx| {
+                                        this.select_symbol(code_for_tag.clone(), cx);
+                                        this.cycle_selected_watch_tag(cx);
+                                    })),
+                            )
                             .child(
                                 Button::new(("wl-rm", ix))
                                     .icon(IconName::Delete)
@@ -342,11 +438,20 @@ impl StockApp {
                             })),
                     )
                     .child(
+                        Button::new("wl-find")
+                            .ghost()
+                            .xsmall()
+                            .label(if work { "Find" } else { "去找票" })
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.set_left_tab(LeftTab::Treasure, cx);
+                            })),
+                    )
+                    .child(
                         div()
                             .flex_1()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground.opacity(0.75))
-                            .child(if work { "↑↓ navigate" } else { "↑↓ 切换" }),
+                            .child(if work { "↑↓ · tag" } else { "↑↓ · 标分组" }),
                     ),
             )
     }
@@ -740,6 +845,400 @@ impl StockApp {
     }
 
     pub(crate) fn render_treasure_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let work = self.work_mode;
+        let long_active = self.find_mode == FindMode::Long;
+        let short_active = self.find_mode == FindMode::Short;
+
+        // 顶部统一入口：长线 / 短线
+        let header = v_flex()
+            .px_2()
+            .py_2()
+            .gap_1()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(cx.theme().foreground)
+                            .child(if work { "Find now" } else { "现在找" }),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("find-mode-long")
+                            .xsmall()
+                            .when(long_active, |b| b.primary())
+                            .when(!long_active, |b| b.ghost())
+                            .label(L::find_long(work))
+                            .tooltip(FindMode::Long.headline(work))
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.set_find_mode(FindMode::Long, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("find-mode-short")
+                            .xsmall()
+                            .when(short_active, |b| b.primary())
+                            .when(!short_active, |b| b.ghost())
+                            .label(L::find_short(work))
+                            .tooltip(FindMode::Short.headline(work))
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.set_find_mode(FindMode::Short, cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(self.find_mode.headline(work)),
+            )
+            .child(self.render_find_freshness_banner(cx));
+
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(header)
+            .child(if self.find_mode == FindMode::Short {
+                self.render_radar_body(cx).into_any_element()
+            } else {
+                self.render_long_find_body(cx).into_any_element()
+            })
+    }
+
+    fn render_find_freshness_banner(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let work = self.work_mode;
+        let (stamp, scanning) = match self.find_mode {
+            FindMode::Long => (
+                self.treasure_updated_at.as_str(),
+                self.treasure_scanning || self.scout_running,
+            ),
+            FindMode::Short => (self.radar_updated_at.as_str(), self.radar_scanning),
+        };
+        let fresh = if scanning {
+            Freshness::Fresh
+        } else {
+            freshness::classify(stamp)
+        };
+        let color = match fresh {
+            Freshness::Fresh => cx.theme().green,
+            Freshness::Aging => cx.theme().yellow,
+            Freshness::Stale => cx.theme().red,
+            Freshness::Unknown => cx.theme().muted_foreground,
+        };
+        let silent = scanning && self.treasure_scan_silent && self.find_mode == FindMode::Long;
+        let text = if scanning {
+            if silent {
+                if work {
+                    "Background refresh…".into()
+                } else {
+                    "后台静默更新中（可继续看盘）…".into()
+                }
+            } else if work {
+                "Scanning…".into()
+            } else {
+                "扫描进行中…".into()
+            }
+        } else {
+            freshness::banner_text(stamp, work)
+        };
+        h_flex()
+            .px_1()
+            .py_1()
+            .gap_2()
+            .items_center()
+            .rounded(cx.theme().radius)
+            .bg(color.opacity(0.10))
+            .child(
+                div()
+                    .text_xs()
+                    .font_semibold()
+                    .text_color(color)
+                    .child(if work { "Cache" } else { "时效" }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(text),
+            )
+    }
+
+    fn render_radar_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let work = self.work_mode;
+        let selected = self.selected.clone();
+        let busy = self.radar_scanning;
+        let has_hits = !self.radar_hits.is_empty();
+        let visible = self.visible_radar_hits();
+
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(
+                v_flex()
+                    .px_2()
+                    .py_2()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .flex_wrap()
+                            .child(
+                                Button::new("radar-scan")
+                                    .xsmall()
+                                    .when(!busy && !has_hits, |b| b.primary())
+                                    .when(busy || has_hits, |b| b.ghost())
+                                    .label(if busy {
+                                        if work {
+                                            "Scanning…"
+                                        } else {
+                                            "扫描中…"
+                                        }
+                                    } else if has_hits {
+                                        if work {
+                                            "Rescan"
+                                        } else {
+                                            "重新扫描"
+                                        }
+                                    } else if work {
+                                        "Run radar"
+                                    } else {
+                                        "开始短线扫描"
+                                    })
+                                    .disabled(busy)
+                                    .tooltip(if work {
+                                        "Pullback / breakout / oversold on liquid A-shares"
+                                    } else {
+                                        "扫描强势回踩、放量突破、超跌反弹"
+                                    })
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.start_radar_scan(cx);
+                                    })),
+                            )
+                            .when(busy, |row| {
+                                row.child(
+                                    Button::new("radar-cancel")
+                                        .xsmall()
+                                        .ghost()
+                                        .label(if work { "Cancel" } else { "取消" })
+                                        .on_click(cx.listener(|this, _, _w, cx| {
+                                            this.cancel_radar_scan(cx);
+                                        })),
+                                )
+                            })
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if busy {
+                                        format!("{}/{}", self.radar_done, self.radar_total)
+                                    } else {
+                                        format!("{} 只", visible.len())
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(self.radar_status.clone()),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .flex_wrap()
+                            .child(
+                                Button::new("radar-f-all")
+                                    .xsmall()
+                                    .when(self.radar_filter.is_none(), |b| b.primary())
+                                    .when(self.radar_filter.is_some(), |b| b.ghost())
+                                    .label(if work { "All" } else { "全部" })
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.set_radar_filter(None, cx);
+                                    })),
+                            )
+                            .children(RadarStrategy::all().into_iter().enumerate().map(
+                                |(ix, st)| {
+                                    let active = self.radar_filter == Some(st);
+                                    Button::new(("radar-f", ix as u32))
+                                        .xsmall()
+                                        .when(active, |b| b.primary())
+                                        .when(!active, |b| b.ghost())
+                                        .label(st.label(work))
+                                        .tooltip(st.hint())
+                                        .on_click(cx.listener(move |this, _, _w, cx| {
+                                            this.set_radar_filter(Some(st), cx);
+                                        }))
+                                },
+                            )),
+                    ),
+            )
+            .when(
+                !self.radar_summary.as_ref().is_empty() && !busy,
+                |col| {
+                    col.child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(cx.theme().border)
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(self.radar_summary.clone()),
+                    )
+                },
+            )
+            .child(
+                v_flex()
+                    .id("radar-scroll")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .when(visible.is_empty() && !busy, |col| {
+                        col.child(
+                            div()
+                                .px_3()
+                                .py_4()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if work {
+                                    "No short-term hits yet · run radar"
+                                } else {
+                                    "还没有短线命中 · 点上方「开始短线扫描」\n或先去「市场分析」看板块主线"
+                                }),
+                        )
+                    })
+                    .children(visible.into_iter().enumerate().map(|(ix, hit)| {
+                        let is_sel = hit.code == selected.as_ref();
+                        let hit_c = hit.clone();
+                        let code_l = hit.code.clone();
+                        let name_l = hit.name.clone();
+                        let last_l = hit.close;
+                        let code_s = hit.code.clone();
+                        let name_s = hit.name.clone();
+                        let last_s = hit.close;
+                        let chg_color = self.chg_color(hit.change_pct >= 0.0, cx);
+                        v_flex()
+                            .id(("radar-row", ix))
+                            .px_3()
+                            .py_2()
+                            .gap_1()
+                            .border_b_1()
+                            .border_color(cx.theme().border.opacity(0.35))
+                            .cursor_pointer()
+                            .when(is_sel, |r| r.bg(cx.theme().accent.opacity(0.16)))
+                            .hover(|r| r.bg(cx.theme().accent.opacity(0.08)))
+                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                this.select_radar_hit(&hit_c, cx);
+                            }))
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_semibold()
+                                            .text_color(cx.theme().foreground)
+                                            .child(if work {
+                                                hit.code.clone()
+                                            } else {
+                                                format!("{}  {}", hit.code, hit.name)
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .px_1()
+                                            .rounded(cx.theme().radius)
+                                            .bg(cx.theme().muted)
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(hit.strategy.label(work)),
+                                    )
+                                    .child(div().flex_1())
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_semibold()
+                                            .text_color(cx.theme().accent)
+                                            .child(format!("{:.0}", hit.score)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(chg_color)
+                                            .child(format!("{:+.1}%", hit.change_pct)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if work {
+                                        hit.headline.clone()
+                                    } else {
+                                        format!(
+                                            "{} · 观察带 {}",
+                                            hit.headline,
+                                            hit.watch_band_text()
+                                        )
+                                    }),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        Button::new(("radar-long", ix as u32))
+                                            .xsmall()
+                                            .ghost()
+                                            .label(if work { "+Long" } else { "+长线池" })
+                                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                                this.add_pick_to_group(
+                                                    &code_l, &name_l, last_l, WatchTag::Long, cx,
+                                                );
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new(("radar-short", ix as u32))
+                                            .xsmall()
+                                            .ghost()
+                                            .label(if work { "+Short" } else { "+短线池" })
+                                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                                this.add_pick_to_group(
+                                                    &code_s, &name_s, last_s, WatchTag::Short, cx,
+                                                );
+                                            })),
+                                    ),
+                            )
+                    })),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground.opacity(0.8))
+                    .child(if work {
+                        "Local rules · not advice"
+                    } else {
+                        "本地规则排序 · 仅供学习研究，不构成投资建议"
+                    }),
+            )
+    }
+
+    fn render_long_find_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.selected.clone();
         let work = self.work_mode;
         // 主按钮：空榜 → 搜罗；有榜无清单/重跑 → 筛可买；两边都不抢 primary。

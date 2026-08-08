@@ -91,7 +91,7 @@ impl ChartKind {
 
 }
 
-/// 左侧栏：自选 / 持仓 / 寻宝鼠。
+/// 左侧栏：自选 / 持仓 / 现在找（长线寻宝 + 短线雷达）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum LeftTab {
     #[default]
@@ -112,7 +112,7 @@ impl LeftTab {
     pub(crate) fn from_label(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "portfolio" | "持仓" | "book" => Self::Portfolio,
-            "treasure" | "寻宝" | "scan" => Self::Treasure,
+            "treasure" | "寻宝" | "scan" | "find" | "现在找" => Self::Treasure,
             _ => Self::Watchlist,
         }
     }

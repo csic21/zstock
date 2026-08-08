@@ -211,24 +211,62 @@ impl StockApp {
                         )
                         .when(!work, |row| {
                             row.child(
+                                Button::new("find-long-btn")
+                                    .xsmall()
+                                    .when(
+                                        self.left_tab == LeftTab::Treasure
+                                            && self.find_mode
+                                                == crate::data::groups::FindMode::Long,
+                                        |b| b.primary(),
+                                    )
+                                    .when(
+                                        !(self.left_tab == LeftTab::Treasure
+                                            && self.find_mode
+                                                == crate::data::groups::FindMode::Long),
+                                        |b| b.ghost(),
+                                    )
+                                    .label("找长线")
+                                    .tooltip("历史低位 + 筛可买 · 想找就找")
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.open_find_and_scan(
+                                            crate::data::groups::FindMode::Long,
+                                            cx,
+                                        );
+                                    })),
+                            )
+                            .child(
+                                Button::new("find-short-btn")
+                                    .xsmall()
+                                    .when(
+                                        self.left_tab == LeftTab::Treasure
+                                            && self.find_mode
+                                                == crate::data::groups::FindMode::Short,
+                                        |b| b.primary(),
+                                    )
+                                    .when(
+                                        !(self.left_tab == LeftTab::Treasure
+                                            && self.find_mode
+                                                == crate::data::groups::FindMode::Short),
+                                        |b| b.ghost(),
+                                    )
+                                    .label("找短线")
+                                    .tooltip("回踩 / 突破 / 超跌雷达")
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.open_find_and_scan(
+                                            crate::data::groups::FindMode::Short,
+                                            cx,
+                                        );
+                                    })),
+                            )
+                            .child(
                                 Button::new("market-analysis-btn")
                                     .xsmall()
                                     .when(self.market_analysis_open, |b| b.primary())
                                     .when(!self.market_analysis_open, |b| b.ghost())
-                                    .label("市场分析")
-                                    .tooltip("区域市场 · 大盘指数 · 板块热度")
+                                    .label("市场")
+                                    .tooltip("大盘情绪 · 板块热度 · 点板块下钻成分")
                                     .on_click(cx.listener(|this, _, _w, cx| {
                                         this.open_market_analysis(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("treasure-btn")
-                                    .ghost()
-                                    .xsmall()
-                                    .label("🐭 寻宝")
-                                    .tooltip("多窗口历史低位 · ⌘T")
-                                    .on_click(cx.listener(|this, _, _w, cx| {
-                                        this.set_left_tab(LeftTab::Treasure, cx);
                                     })),
                             )
                         })

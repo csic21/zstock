@@ -11,9 +11,23 @@ use crate::model::{
 };
 
 use super::eastmoney::{self, QuoteTick};
-
 pub use super::eastmoney::SectorTick;
 use super::tencent;
+
+/// 行业板块成分股（东财）。
+pub fn fetch_sector_constituents(
+    sector_code: &str,
+    limit: usize,
+) -> Result<Sourced<Vec<QuoteTick>>> {
+    match eastmoney::fetch_sector_constituents(sector_code, limit) {
+        Ok(data) if !data.is_empty() => Ok(Sourced {
+            data,
+            source: SRC_EASTMONEY,
+        }),
+        Ok(_) => Err(anyhow!("板块成分为空")),
+        Err(e) => Err(e),
+    }
+}
 
 /// Successful fetch tagged with which backend served it.
 #[derive(Debug, Clone)]

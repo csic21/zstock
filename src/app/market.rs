@@ -124,6 +124,21 @@ impl StockApp {
         self.refresh_all(cx);
         // 旧缓存可能只有代码没有中文名
         self.enrich_treasure_names_if_needed(cx);
+        // 每 3 小时检查是否需要盘后静默预扫（真正开扫条件在 maybe_background_rescan）
+        cx.spawn(async move |this, cx| {
+            loop {
+                Timer::after(Duration::from_secs(3 * 60 * 60)).await;
+                if this
+                    .update(cx, |app, cx| {
+                        app.maybe_background_rescan(cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
         // Auto-update: check shortly after startup, then periodically.
         self.check_for_updates(false, cx);
         cx.spawn(async move |this, cx| {
