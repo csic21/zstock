@@ -102,8 +102,8 @@ impl StockApp {
         }
     }
 
-    fn remember_klines(&mut self, code: &str, name: &str, candles: &[Candle], source: &str) {
-        if candles.is_empty() {
+    fn remember_klines(&mut self, code: &str, name: &str, source: &str) {
+        if self.candles.is_empty() {
             return;
         }
         self.series_cache.put_klines_smart(
@@ -111,7 +111,7 @@ impl StockApp {
             code,
             CachedKlines {
                 name: name.to_string(),
-                candles: candles.to_vec(),
+                candles: self.candles.clone(),
                 source: source.to_string(),
             },
         );
@@ -173,13 +173,14 @@ impl StockApp {
         })
         .detach();
 
-        // macOS trackpad pinch (NSEvent magnify) — GPUI does not forward this itself
+        // macOS trackpad pinch (NSEvent magnify) — GPUI does not forward this itself.
+        // Poll ~30 Hz (was 8 ms / 125 Hz): still smooth for gestures, far less idle wakeups.
         #[cfg(target_os = "macos")]
         {
             let pinch_rx = crate::mac_gesture::install_pinch_receiver();
             cx.spawn(async move |this, cx| {
                 loop {
-                    Timer::after(Duration::from_millis(8)).await;
+                    Timer::after(Duration::from_millis(32)).await;
                     let mut acc = 0.0f32;
                     let mut any = false;
                     while let Ok(m) = pinch_rx.try_recv() {
@@ -271,6 +272,9 @@ impl StockApp {
                                 .collect();
                             let mut quotes_changed = false;
                             let mut status_bar_dirty = false;
+                            // Only codes that need alert evaluation (price moved, or
+                            // already-triggered alert that may rearm at a stable price).
+                            let mut transitions = Vec::new();
                             for t in sourced.data {
                                 if let Some(&ix) = symbol_ix.get(&t.code) {
                                     let sym = &mut app.symbols[ix];
@@ -284,10 +288,12 @@ impl StockApp {
                                         }
                                     }
                                     if t.last > 0.0 {
+                                        let previous = sym.last;
                                         let price_dirty = (sym.last - t.last).abs() > 1e-9
                                             || (sym.change_pct - t.change_pct).abs() > 1e-6
                                             || sym.volume != t.volume;
                                         if price_dirty {
+                                            transitions.push((t.code.clone(), previous, t.last));
                                             sym.last = t.last;
                                             sym.change_pct = t.change_pct;
                                             sym.volume = t.volume;
@@ -296,6 +302,13 @@ impl StockApp {
                                             {
                                                 status_bar_dirty = true;
                                             }
+                                        } else if app
+                                            .buy_alerts
+                                            .get(&t.code)
+                                            .is_some_and(|a| a.triggered)
+                                        {
+                                            // Price flat but may still rearm above target.
+                                            transitions.push((t.code.clone(), previous, t.last));
                                         }
                                     }
                                 }
@@ -310,6 +323,7 @@ impl StockApp {
                                     }
                                 }
                             }
+                            let alert_hits = app.evaluate_buy_alerts(&transitions, cx);
                             let mut index_changed = false;
                             if let Some(Ok(idx)) = &idx_result {
                                 let rows: Vec<_> = idx
@@ -322,10 +336,12 @@ impl StockApp {
                                 index_changed = app.apply_index_ticks(&rows);
                             }
                             // Skip full UI rebuild when nothing visible changed.
-                            if quotes_changed || index_changed {
+                            if quotes_changed || index_changed || !alert_hits.is_empty() {
                                 // Don't clobber an in-flight kline status unless idle.
                                 // Omit wall-clock seconds so identical ticks don't thrash status.
-                                if !app.loading {
+                                if !alert_hits.is_empty() {
+                                    app.status = shared(app.format_buy_alert_status(&alert_hits));
+                                } else if !app.loading {
                                     let mkt = match (open.a, open.hk) {
                                         (true, true) => "A+港",
                                         (true, false) => "A股",
@@ -340,6 +356,7 @@ impl StockApp {
                                 if app.status_bar_enabled && status_bar_dirty {
                                     app.sync_status_bar();
                                 }
+                                app.notify_buy_alert_hits(&alert_hits);
                                 cx.notify();
                             }
                             Duration::from_secs(app.quote_interval_secs)
@@ -492,6 +509,7 @@ impl StockApp {
 
             this.update(cx, |app, cx| {
                 let mut quote_src = None;
+                let mut hydrate_transitions = Vec::new();
                 match quotes {
                     Ok(sourced) => {
                         quote_src = Some(sourced.source);
@@ -511,6 +529,13 @@ impl StockApp {
                                     s.last = keep_last;
                                     s.change_pct = keep_chg;
                                     s.volume = keep_vol;
+                                }
+                                if s.last > 0.0 {
+                                    hydrate_transitions.push((
+                                        s.code.clone(),
+                                        keep_last,
+                                        s.last,
+                                    ));
                                 }
                             }
                         }
@@ -558,12 +583,7 @@ impl StockApp {
                             let (_resp_code, name, candles) = sourced.data;
                             let src = sourced.source;
                             app.apply_klines(&req_code, name.clone(), candles);
-                            app.remember_klines(
-                                &req_code,
-                                &name,
-                                &app.candles.clone(),
-                                src,
-                            );
+                            app.remember_klines(&req_code, &name, src);
                             app.status = shared(format!(
                                 "已加载 {} · {} 根K线 · 行情{} · K线{} · {}",
                                 req_code,
@@ -580,6 +600,11 @@ impl StockApp {
                         }
                         None => {}
                     }
+                }
+                let alert_hits = app.evaluate_buy_alerts(&hydrate_transitions, cx);
+                if !alert_hits.is_empty() {
+                    app.status = shared(app.format_buy_alert_status(&alert_hits));
+                    app.notify_buy_alert_hits(&alert_hits);
                 }
                 app.loading = false;
                 app.refreshing = false;
@@ -933,7 +958,7 @@ impl StockApp {
                         let (_resp_code, name, candles) = sourced.data;
                         let src = sourced.source;
                         app.apply_klines(&req_code, name.clone(), candles);
-                        app.remember_klines(&req_code, &name, &app.candles.clone(), src);
+                        app.remember_klines(&req_code, &name, src);
                         app.status = shared(format!(
                             "{} · {} 根 {} · {}",
                             req_code,

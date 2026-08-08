@@ -301,3 +301,21 @@ pub(crate) struct AiCacheEntry {
     pub(crate) text: String,
     pub(crate) source: AiSource,
 }
+
+/// Soft cap for in-memory AI commentary caches (prevents unbounded growth when
+/// switching symbols / dates for hours).
+pub(crate) const AI_CACHE_MAX: usize = 48;
+
+/// Insert into an AI cache, evicting an arbitrary older entry when full.
+pub(crate) fn insert_ai_cache(
+    map: &mut std::collections::HashMap<String, AiCacheEntry>,
+    key: String,
+    entry: AiCacheEntry,
+) {
+    if map.len() >= AI_CACHE_MAX && !map.contains_key(&key) {
+        if let Some(old) = map.keys().next().cloned() {
+            map.remove(&old);
+        }
+    }
+    map.insert(key, entry);
+}

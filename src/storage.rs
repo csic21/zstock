@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::data::ai::AiConfig;
+use crate::data::alerts::BuyAlert;
 use crate::data::portfolio::Portfolio;
 use crate::data::treasure::TreasureCache;
 use crate::model::{TrendLine, default_watchlist_codes};
@@ -247,6 +248,9 @@ pub struct AppConfig {
     /// Optional LLM settings for the AI commentary feature.
     #[serde(default)]
     pub ai_api: AiConfig,
+    /// Local buy-price alerts keyed by symbol code.
+    #[serde(default)]
+    pub buy_alerts: std::collections::HashMap<String, BuyAlert>,
     /// User-drawn chart lines, keyed by symbol code.
     #[serde(default)]
     pub chart_lines: std::collections::HashMap<String, Vec<TrendLine>>,
@@ -335,6 +339,7 @@ impl Default for AppConfig {
             quote_interval_secs: default_quote_interval_secs(),
             watchlist_sort: WatchlistSort::Manual,
             ai_api: AiConfig::default(),
+            buy_alerts: std::collections::HashMap::new(),
             chart_lines: std::collections::HashMap::new(),
             treasure_pool: default_treasure_pool(),
             treasure_fin: default_treasure_fin(),

@@ -9,6 +9,7 @@
 mod chart_ctrl;
 mod helpers;
 mod labels;
+mod alerts;
 mod market;
 mod market_analysis;
 mod portfolio;
@@ -34,6 +35,7 @@ use gpui_component::{
 };
 
 use crate::data::ai::AiConfig;
+use crate::data::alerts::BuyAlert;
 use crate::data::indicators::{BollSeries, MaSeries, MacdSeries};
 use crate::data::levels;
 use crate::data::market as market_data;
@@ -263,6 +265,10 @@ pub struct StockApp {
     ai_api_key_input: Entity<InputState>,
     /// Optional override path/name for the local AI CLI binary.
     ai_cli_bin_input: Entity<InputState>,
+    /// Price field used by the selected-symbol buy alert panel.
+    alert_price_input: Entity<InputState>,
+    /// Persisted local buy-price alerts keyed by symbol code.
+    buy_alerts: HashMap<String, BuyAlert>,
     /// 本地持仓（交易流水 + 可选现金）。
     portfolio: Portfolio,
     /// 打开中的买卖表单方向；`None` = 关闭。
@@ -369,6 +375,9 @@ impl StockApp {
             cx.new(|cx| InputState::new(window, cx).placeholder("备注（可选）"));
         let portfolio_cash_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("现金余额"));
+        let alert_price_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("目标价，如 12.30")
+        });
         portfolio_cash_input.update(cx, |state, cx| {
             state.set_value(format!("{:.2}", portfolio.cash), window, cx);
         });
@@ -584,6 +593,8 @@ impl StockApp {
             ai_model_input,
             ai_api_key_input,
             ai_cli_bin_input,
+            alert_price_input,
+            buy_alerts: cfg.buy_alerts.clone(),
             portfolio,
             trade_form_side: None,
             trade_shares_input,

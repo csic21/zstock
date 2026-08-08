@@ -291,6 +291,14 @@ impl StockApp {
                                         div().text_xs().text_color(chg_color).child(chg),
                                     ),
                             )
+                            .when(self.buy_alerts.contains_key(&sym.code), |row| {
+                                row.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().yellow)
+                                        .child(if work { "T" } else { "🔔" }),
+                                )
+                            })
                             .child(
                                 Button::new(("wl-rm", ix))
                                     .icon(IconName::Delete)

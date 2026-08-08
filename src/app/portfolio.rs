@@ -89,6 +89,7 @@ impl StockApp {
             quote_interval_secs: self.quote_interval_secs,
             watchlist_sort: self.watchlist_sort,
             ai_api: self.ai_config.clone(),
+            buy_alerts: self.buy_alerts.clone(),
             chart_lines: self.chart_lines.clone(),
             treasure_pool: self.treasure_pool.id().into(),
             treasure_fin: self.treasure_fin.id().into(),
@@ -524,7 +525,8 @@ impl StockApp {
         };
 
         let local = ai::local_position_advice(&snap);
-        self.portfolio_ai_cache.insert(
+        super::types::insert_ai_cache(
+            &mut self.portfolio_ai_cache,
             cache_key.clone(),
             AiCacheEntry {
                 text: local.clone(),
@@ -561,7 +563,8 @@ impl StockApp {
                         let source = AiSource::Llm {
                             label: source_label.clone(),
                         };
-                        app.portfolio_ai_cache.insert(
+                        super::types::insert_ai_cache(
+                            &mut app.portfolio_ai_cache,
                             cache_key.clone(),
                             AiCacheEntry {
                                 text: text.clone(),

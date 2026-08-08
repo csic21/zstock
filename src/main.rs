@@ -2,6 +2,7 @@ mod app;
 mod chart;
 mod data;
 mod model;
+mod notifications;
 mod storage;
 mod update;
 

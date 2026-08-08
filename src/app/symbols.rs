@@ -769,7 +769,9 @@ impl StockApp {
         };
         let was_selected = self.selected.as_ref() == code;
         self.symbols.remove(pos);
+        self.buy_alerts.remove(code);
         self.work_aliases.remove(code);
+        self.chart_lines.remove(code);
         self.filtered_local = (0..self.symbols.len()).collect();
         if was_selected {
             self.selected = shared(

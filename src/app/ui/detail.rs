@@ -457,6 +457,182 @@ impl StockApp {
                             }),
                     ),
             )
+            .child(self.render_buy_alert_detail(cx))
+    }
+
+    /// Deterministic buy-price reminder for the selected watchlist symbol.
+    /// The target is fixed when saved; the technical reference button simply
+    /// copies the current local buy-band upper edge into that target.
+    pub(crate) fn render_buy_alert_detail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let work = self.work_mode;
+        let alert = self.selected_buy_alert();
+        let recommended = self.selected_recommended_buy_price();
+        let target_text = |price: f64| {
+            if work {
+                self.format_value(price)
+            } else {
+                format_price(price)
+            }
+        };
+
+        let mut root = v_flex()
+            .w_full()
+            .gap_1()
+            .mt_1()
+            .p_2()
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().muted.opacity(0.32))
+            .border_1()
+            .border_color(cx.theme().border)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(cx.theme().foreground)
+                            .child(if work {
+                                "Threshold alert"
+                            } else {
+                                "自选买入提醒"
+                            }),
+                    ),
+            );
+
+        if let Some(alert) = alert {
+            let state = if alert.triggered {
+                if work {
+                    "Reached · rearm above target"
+                } else {
+                    "已触发 · 价格重新站上目标后自动重置"
+                }
+            } else if work {
+                "Armed · downward crossing"
+            } else {
+                "等待价格从上方跌入目标区"
+            };
+            let mut actions = h_flex().gap_1().items_center();
+            if alert.triggered {
+                actions = actions.child(
+                    Button::new("alert-rearm")
+                        .xsmall()
+                        .ghost()
+                        .label(if work { "Re-arm" } else { "重置" })
+                        .on_click(cx.listener(|this, _, _w, cx| {
+                            this.reset_selected_buy_alert(cx);
+                        })),
+                );
+            }
+            actions = actions.child(
+                Button::new("alert-clear")
+                    .xsmall()
+                    .ghost()
+                    .label(if work { "Clear" } else { "关闭" })
+                    .on_click(cx.listener(|this, _, _w, cx| {
+                        this.clear_selected_buy_alert(cx);
+                    })),
+            );
+            root = root
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(metric_chip(
+                            if work { "Target" } else { "目标价" },
+                            &target_text(alert.target_price),
+                            cx,
+                        ))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("{} · {}", alert.basis.label(), state)),
+                        )
+                        .child(actions),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(if alert.triggered {
+                            cx.theme().yellow
+                        } else {
+                            cx.theme().muted_foreground
+                        })
+                        .child(state),
+                );
+        } else {
+            let mut controls = h_flex()
+                .gap_1()
+                .items_center()
+                .child(
+                    div()
+                        .w(px(42.))
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if work { "Target" } else { "目标价" }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(120.))
+                        .child(Input::new(&self.alert_price_input).small()),
+                )
+                .child(
+                    Button::new("alert-set-manual")
+                        .xsmall()
+                        .primary()
+                        .label(if work { "Arm" } else { "开启" })
+                        .on_click(cx.listener(|this, _, _w, cx| {
+                            this.set_manual_buy_alert(cx);
+                        })),
+                );
+            if recommended.is_some() {
+                controls = controls.child(
+                    Button::new("alert-set-recommended")
+                        .xsmall()
+                        .ghost()
+                        .label(if work { "Use ref" } else { "用建议价" })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.set_recommended_buy_alert(window, cx);
+                        })),
+                );
+            }
+            root = root.child(controls).child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if let Some(price) = recommended {
+                        format!(
+                            "{} {} · {}",
+                            if work { "Reference" } else { "技术参考价" },
+                            target_text(price),
+                            if work {
+                                "local levels; AI optional"
+                            } else {
+                                "现有本地建仓带上沿；AI 只做解释"
+                            }
+                        )
+                    } else if work {
+                        "Load daily bars to calculate a reference target".into()
+                    } else {
+                        "加载日 K 后可自动填入技术参考价；也可以手动输入".into()
+                    }),
+            );
+        }
+
+        root.child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground.opacity(0.75))
+                .child(if work {
+                    "Local rule: notify once on a downward crossing; no order is placed."
+                } else {
+                    "本地规则：价格从上方跌入目标价时提醒一次，不会自动下单；仅供学习研究。"
+                }),
+        )
     }
 
     pub(crate) fn render_score_badge(

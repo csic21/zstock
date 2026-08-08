@@ -454,8 +454,9 @@ impl StockApp {
             // chart canvas
             .child({
                 let entity = cx.entity().clone();
-                let paint = paint.clone();
-                let show_skeleton = self.loading && paint.candles.is_empty() && paint.minute.is_none();
+                // Move paint into the canvas (no second full series clone per frame).
+                let show_skeleton =
+                    self.loading && paint.candles.is_empty() && paint.minute.is_none();
                 div()
                     .id("chart-body")
                     .flex_1()
@@ -475,10 +476,22 @@ impl StockApp {
                                 canvas(
                                     move |bounds, _, _| bounds,
                                     move |bounds, _, window, cx| {
+                                        // Geometry only — never notify (update alone is silent).
+                                        // Skip writes when unchanged to avoid thrashing state.
                                         entity.update(cx, |this, _| {
-                                            this.chart_origin = bounds.origin;
-                                            this.chart_bounds = bounds;
-                                            this.chart_width = bounds.size.width.as_f32();
+                                            let w = bounds.size.width.as_f32();
+                                            let origin_changed = this.chart_origin.x != bounds.origin.x
+                                                || this.chart_origin.y != bounds.origin.y;
+                                            let size_changed = (this.chart_width - w).abs() > 0.5
+                                                || (this.chart_bounds.size.height.as_f32()
+                                                    - bounds.size.height.as_f32())
+                                                    .abs()
+                                                    > 0.5;
+                                            if origin_changed || size_changed {
+                                                this.chart_origin = bounds.origin;
+                                                this.chart_bounds = bounds;
+                                                this.chart_width = w;
+                                            }
                                         });
                                         paint_chart(bounds, &paint, window);
                                     },

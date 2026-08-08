@@ -3,6 +3,9 @@
 //! Used for **index constituents** (`Market_Center.getHQNodeData`), which also
 //! carry per-stock PE (`per`) and PB (`pb`) for financial-percentile filtering.
 
+use std::sync::LazyLock;
+use std::time::Duration;
+
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 
@@ -22,11 +25,15 @@ pub struct IndexMember {
     pub pb: Option<f64>,
 }
 
-fn agent() -> ureq::Agent {
+static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
     ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(8))
-        .timeout_read(std::time::Duration::from_secs(20))
+        .timeout_connect(Duration::from_secs(8))
+        .timeout_read(Duration::from_secs(20))
         .build()
+});
+
+fn agent() -> ureq::Agent {
+    AGENT.clone()
 }
 
 fn num(v: Option<&Value>) -> f64 {

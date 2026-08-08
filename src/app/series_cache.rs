@@ -2,7 +2,10 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::model::{Candle, MinutePeriod, MinuteSeries};
+use crate::model::{Candle, MinuteSeries};
+
+#[cfg(test)]
+use crate::model::MinutePeriod;
 
 use super::types::ChartKind;
 

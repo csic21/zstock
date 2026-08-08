@@ -7,6 +7,9 @@
 //! Used as failover when Eastmoney is unavailable. No SLA; rate-limit politely.
 //! K-line window is capped (~640 bars on this endpoint).
 
+use std::sync::LazyLock;
+use std::time::Duration;
+
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 
@@ -21,11 +24,16 @@ const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/53
 /// Practical max bars returned by Tencent day K endpoints.
 const KLINE_CAP: usize = 640;
 
-fn agent() -> ureq::Agent {
+/// Process-wide agent so connection reuse survives quote / kline polling.
+static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
     ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(8))
-        .timeout_read(std::time::Duration::from_secs(15))
+        .timeout_connect(Duration::from_secs(8))
+        .timeout_read(Duration::from_secs(15))
         .build()
+});
+
+fn agent() -> ureq::Agent {
+    AGENT.clone()
 }
 
 /// `sh600519` / `sz000001` / `bj830799` / `hk00700`

@@ -387,8 +387,7 @@ unsafe fn update_menu_in_place(item: id, entries: &[MenuEntry], work_mode: bool)
                     } else {
                         "未固定标的 · 在设置中选择"
                     };
-                    let ns = NSString::alloc(nil).init_str(title);
-                    let _: () = msg_send![row, setTitle: ns];
+                    set_item_title(row, title);
                 }
             }
             return;
@@ -402,8 +401,7 @@ unsafe fn update_menu_in_place(item: id, entries: &[MenuEntry], work_mode: bool)
             if row == nil {
                 continue;
             }
-            let ns = NSString::alloc(nil).init_str(&e.label);
-            let _: () = msg_send![row, setTitle: ns];
+            set_item_title(row, &e.label);
             let state: isize = if e.active { 1 } else { 0 };
             let _: () = msg_send![row, setState: state];
         }
@@ -438,6 +436,33 @@ pub fn uninstall() {
 
 // —— ObjC helpers ————————————————————————————————————————————————————————
 
+/// `alloc` + `init` returns a retained object; callers own it under MRC.
+unsafe fn nsstring(s: &str) -> id {
+    unsafe { NSString::alloc(nil).init_str(s) }
+}
+
+/// Balance a retained ObjC object created via `alloc` / `new` / `copy`.
+unsafe fn release_obj(obj: id) {
+    unsafe {
+        if obj != nil {
+            let _: () = msg_send![obj, release];
+        }
+    }
+}
+
+/// `setTitle:` copies/retains; release our temporary string so quote ticks
+/// (once per second for hours) do not leak NSString instances into the process.
+unsafe fn set_item_title(item: id, title: &str) {
+    unsafe {
+        if item == nil {
+            return;
+        }
+        let ns = nsstring(title);
+        let _: () = msg_send![item, setTitle: ns];
+        release_obj(ns);
+    }
+}
+
 unsafe fn load_logo_image() -> id {
     unsafe {
         let data = NSData::dataWithBytes_length_(
@@ -469,8 +494,7 @@ unsafe fn apply_logo(item: id, logo: id) {
             set_button_title(item, "ZStock");
             return;
         }
-        let empty = NSString::alloc(nil).init_str("");
-        let _: () = msg_send![button, setTitle: empty];
+        set_item_title(button, "");
         if logo != nil {
             let _: () = msg_send![button, setImage: logo];
             // NSImageOnly = 1
@@ -495,8 +519,7 @@ unsafe fn apply_title(item: id, title: &str, clear_image: bool) {
             // NSNoImage = 0
             let _: () = msg_send![button, setImagePosition: 0isize];
         }
-        let ns = NSString::alloc(nil).init_str(title);
-        let _: () = msg_send![button, setTitle: ns];
+        set_item_title(button, title);
         // Re-assert variable length so the bar remeasures after title changes
         // (esp. when switching logo ↔ multi-quote text of different widths).
         let _: () = msg_send![item, setLength: NSVariableStatusItemLength];
@@ -509,25 +532,27 @@ unsafe fn set_button_title(item: id, title: &str) {
         let button: id = item.button();
         if button == nil {
             // Older macOS fallback.
-            let ns = NSString::alloc(nil).init_str(title);
-            let _: () = msg_send![item, setTitle: ns];
+            set_item_title(item, title);
             return;
         }
-        let ns = NSString::alloc(nil).init_str(title);
-        let _: () = msg_send![button, setTitle: ns];
+        set_item_title(button, title);
     }
 }
 
 unsafe fn menu_item_label(title: &str, action: Sel, target: id, code: Option<&str>) -> id {
     unsafe {
-        let ns_title = NSString::alloc(nil).init_str(title);
-        let ns_key = NSString::alloc(nil).init_str("");
+        let ns_title = nsstring(title);
+        let ns_key = nsstring("");
+        // initWithTitle: copies title/key; release our temporaries.
         let item =
             NSMenuItem::alloc(nil).initWithTitle_action_keyEquivalent_(ns_title, action, ns_key);
+        release_obj(ns_title);
+        release_obj(ns_key);
         item.setTarget_(target);
         if let Some(c) = code {
-            let ns_code = NSString::alloc(nil).init_str(c);
+            let ns_code = nsstring(c);
             let _: () = msg_send![item, setRepresentedObject: ns_code];
+            release_obj(ns_code);
         }
         item
     }

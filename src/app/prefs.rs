@@ -481,9 +481,10 @@ impl StockApp {
         }
         let action_rx = mac_status_bar::install();
         self.sync_status_bar();
+        // Menu clicks are rare; 100 ms is still snappy and cuts idle wakeups in half.
         cx.spawn(async move |this, cx| {
             loop {
-                Timer::after(Duration::from_millis(50)).await;
+                Timer::after(Duration::from_millis(100)).await;
                 let mut actions = Vec::new();
                 while let Ok(a) = action_rx.try_recv() {
                     actions.push(a);
@@ -809,7 +810,8 @@ impl StockApp {
 
         // 先秒出本地规则点评，LLM 结果到达后再覆盖。
         let local = ai::local_commentary(&snap);
-        self.ai_cache.insert(
+        super::types::insert_ai_cache(
+            &mut self.ai_cache,
             cache_key.clone(),
             AiCacheEntry {
                 text: local.clone(),
@@ -846,7 +848,8 @@ impl StockApp {
                         let source = AiSource::Llm {
                             label: source_label.clone(),
                         };
-                        app.ai_cache.insert(
+                        super::types::insert_ai_cache(
+                            &mut app.ai_cache,
                             cache_key.clone(),
                             AiCacheEntry {
                                 text: text.clone(),

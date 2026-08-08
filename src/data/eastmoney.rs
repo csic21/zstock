@@ -7,6 +7,9 @@
 //!
 //! These are free for personal tooling but have no SLA; rate-limit politely.
 
+use std::sync::LazyLock;
+use std::time::Duration;
+
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 
@@ -44,11 +47,16 @@ pub struct SectorTick {
     pub unchanged: u64,
 }
 
-fn agent() -> ureq::Agent {
+/// Process-wide agent so keep-alive sockets are reused across quote polls.
+static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
     ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(8))
-        .timeout_read(std::time::Duration::from_secs(15))
+        .timeout_connect(Duration::from_secs(8))
+        .timeout_read(Duration::from_secs(15))
         .build()
+});
+
+fn agent() -> ureq::Agent {
+    AGENT.clone()
 }
 
 /// Eastmoney push2 nodes (round-robin / fallback).
