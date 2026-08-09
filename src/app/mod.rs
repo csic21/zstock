@@ -928,8 +928,61 @@ impl Render for StockApp {
     }
 }
 
+/// Open the one main application window.
+///
+/// macOS keeps the application process alive after the last window is closed.
+/// Keeping this in one function lets both the initial launch and the Dock
+/// "reopen" event create the same window instead of leaving the app with only
+/// a running Dock icon.
+fn open_main_window(cx: &mut App) {
+    let cfg = storage::load_config();
+    let window_bounds = match cfg.dock.window {
+        // Allow Mini focus footprint (~720×440) to restore across restarts.
+        Some((x, y, w, h)) if w >= 640.0 && h >= 400.0 => {
+            WindowBounds::Windowed(Bounds {
+                origin: point(px(x), px(y)),
+                size: size(px(w), px(h)),
+            })
+        }
+        _ => WindowBounds::centered(size(px(1320.), px(860.)), cx),
+    };
+    let window_options = WindowOptions {
+        titlebar: Some(TitleBar::title_bar_options()),
+        window_bounds: Some(window_bounds),
+        ..Default::default()
+    };
+
+    cx.open_window(window_options, |window, cx| {
+        window.activate_window();
+        Theme::change(ThemeMode::Dark, Some(window), cx);
+        // Title is set inside StockApp::new (respects persisted work_mode).
+        let view = cx.new(|cx| StockApp::new(window, cx));
+        cx.new(|cx| Root::new(view, window, cx))
+    })
+    .expect("Failed to open window");
+}
+
 pub fn run() {
     let app = gpui::Application::new();
+
+    // macOS calls this when the running app's Dock icon is clicked after
+    // its last window was closed. Without it, the process stays alive but
+    // Mission Control correctly reports that there are no windows.
+    app.on_reopen(|cx| {
+        cx.activate(true);
+        let windows = cx.windows();
+        if windows.is_empty() {
+            open_main_window(cx);
+        } else {
+            // Also recover gracefully if the only window is minimized or
+            // hidden rather than creating a duplicate window.
+            for handle in windows {
+                let _ = handle.update(cx, |_root, window, _cx| {
+                    window.activate_window();
+                });
+            }
+        }
+    });
 
     app.run(move |cx| {
         gpui_component::init(cx);
@@ -980,35 +1033,7 @@ pub fn run() {
             cx.quit();
         });
 
-        // 完整 Dock 布局序列化：上次窗口位置/大小直接恢复（无记录则居中默认）。
-        let cfg = storage::load_config();
-        let window_bounds = match cfg.dock.window {
-            // Allow Mini focus footprint (~720×440) to restore across restarts.
-            Some((x, y, w, h)) if w >= 640.0 && h >= 400.0 => {
-                WindowBounds::Windowed(Bounds {
-                    origin: point(px(x), px(y)),
-                    size: size(px(w), px(h)),
-                })
-            }
-            _ => WindowBounds::centered(size(px(1320.), px(860.)), cx),
-        };
-        let window_options = WindowOptions {
-            titlebar: Some(TitleBar::title_bar_options()),
-            window_bounds: Some(window_bounds),
-            ..Default::default()
-        };
-
-        cx.spawn(async move |cx| {
-            cx.open_window(window_options, |window, cx| {
-                window.activate_window();
-                Theme::change(ThemeMode::Dark, Some(window), cx);
-                // Title is set inside StockApp::new (respects persisted work_mode).
-                let view = cx.new(|cx| StockApp::new(window, cx));
-                cx.new(|cx| Root::new(view, window, cx))
-            })
-            .expect("Failed to open window");
-        })
-        .detach();
+        open_main_window(cx);
     });
 }
 

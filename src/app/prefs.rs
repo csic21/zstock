@@ -749,7 +749,15 @@ impl StockApp {
     #[cfg(target_os = "macos")]
     pub(crate) fn activate_main_window(&self, cx: &mut Context<Self>) {
         cx.activate(true);
-        for handle in cx.windows() {
+        let windows = cx.windows();
+        if windows.is_empty() {
+            // The status-bar menu can be the only remaining entry point after
+            // the user closed the last window. Recreate it instead of merely
+            // activating an empty window list.
+            super::open_main_window(cx);
+            return;
+        }
+        for handle in windows {
             let _ = handle.update(cx, |_root, window, _cx| {
                 window.activate_window();
             });
