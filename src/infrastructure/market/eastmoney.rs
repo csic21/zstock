@@ -12,7 +12,10 @@ use crate::services::market_data::{
 pub struct EastmoneyProvider;
 
 const PROVIDER: &str = "东方财富";
-const FUNDAMENTALS_SOURCE: &str = "东方财富财务数据中心";
+const FUNDAMENTALS_SOURCE: &str = "东方财富财务/公告/分红；百度股市通估值历史";
+const FINANCIAL_SOURCE: &str = "东方财富财务数据中心";
+const DIVIDEND_SOURCE: &str = "东方财富分红派息";
+const VALUATION_SOURCE: &str = "百度股市通估值历史（近三年）";
 
 impl QuoteProvider for EastmoneyProvider {
     fn name(&self) -> &'static str {
@@ -122,21 +125,29 @@ impl FundamentalsProvider for EastmoneyProvider {
                 "unknown market code",
             )
         })?;
-        if market != Market::AShare {
-            return Err(ProviderError::new(
-                FUNDAMENTALS_SOURCE,
-                ProviderErrorKind::Unavailable,
-                "point-in-time financial provider currently supports A shares only",
-            ));
+        let reports = match market {
+            Market::AShare => data::eastmoney::fetch_fundamental_reports(code, report_limit),
+            Market::HongKong => data::eastmoney::fetch_hk_fundamental_reports(code, report_limit),
         }
-        let reports = data::eastmoney::fetch_fundamental_reports(code, report_limit)
+        .map_err(|error| provider_error(FUNDAMENTALS_SOURCE, error))?;
+        let dividend_continuity = data::eastmoney::fetch_dividend_continuity(code, &reports)
+            .map_err(|error| provider_error(FUNDAMENTALS_SOURCE, error))?;
+        let pe_percentiles = data::baidu::fetch_valuation_percentiles(code, "市盈率(TTM)")
+            .map_err(|error| provider_error(FUNDAMENTALS_SOURCE, error))?;
+        let pb_percentiles = data::baidu::fetch_valuation_percentiles(code, "市净率")
             .map_err(|error| provider_error(FUNDAMENTALS_SOURCE, error))?;
         let currency = reports
             .first()
             .map(|report| report.currency)
             .unwrap_or_else(|| market.currency());
-        let mut metrics = Vec::with_capacity(reports.len() * 8);
+        let mut metrics = Vec::with_capacity(
+            reports.len() * 8
+                + dividend_continuity.len()
+                + pe_percentiles.len()
+                + pb_percentiles.len(),
+        );
         for report in reports {
+            let is_annual = report.is_annual;
             let period = report.reporting_period;
             let announced = report.announced_on;
             append_metric(
@@ -146,6 +157,7 @@ impl FundamentalsProvider for EastmoneyProvider {
                 "%",
                 &period,
                 &announced,
+                FINANCIAL_SOURCE,
             );
             append_metric(
                 &mut metrics,
@@ -154,6 +166,7 @@ impl FundamentalsProvider for EastmoneyProvider {
                 "%",
                 &period,
                 &announced,
+                FINANCIAL_SOURCE,
             );
             append_metric(
                 &mut metrics,
@@ -162,6 +175,7 @@ impl FundamentalsProvider for EastmoneyProvider {
                 "ratio",
                 &period,
                 &announced,
+                FINANCIAL_SOURCE,
             );
             append_metric(
                 &mut metrics,
@@ -170,6 +184,7 @@ impl FundamentalsProvider for EastmoneyProvider {
                 "%",
                 &period,
                 &announced,
+                FINANCIAL_SOURCE,
             );
             append_metric(
                 &mut metrics,
@@ -178,6 +193,7 @@ impl FundamentalsProvider for EastmoneyProvider {
                 "%",
                 &period,
                 &announced,
+                FINANCIAL_SOURCE,
             );
             append_metric(
                 &mut metrics,
@@ -186,6 +202,7 @@ impl FundamentalsProvider for EastmoneyProvider {
                 "%",
                 &period,
                 &announced,
+                FINANCIAL_SOURCE,
             );
             append_metric(
                 &mut metrics,
@@ -194,16 +211,33 @@ impl FundamentalsProvider for EastmoneyProvider {
                 "%",
                 &period,
                 &announced,
+                FINANCIAL_SOURCE,
             );
+            if is_annual || report.audit_risk_flag.is_some() {
+                append_metric(
+                    &mut metrics,
+                    "audit_risk_flag",
+                    report.audit_risk_flag,
+                    "bool",
+                    &period,
+                    &announced,
+                    FINANCIAL_SOURCE,
+                );
+            }
+        }
+        for point in dividend_continuity {
             append_metric(
                 &mut metrics,
-                "audit_risk_flag",
-                report.audit_risk_flag,
-                "bool",
-                &period,
-                &announced,
+                "dividend_continuity_years",
+                point.consecutive_years.map(f64::from),
+                "年",
+                &format!("{}-12-31", point.fiscal_year),
+                &point.announced_on,
+                DIVIDEND_SOURCE,
             );
         }
+        append_valuation_metrics(&mut metrics, "pe_ttm_percentile_pct", pe_percentiles);
+        append_valuation_metrics(&mut metrics, "pb_percentile_pct", pb_percentiles);
         Ok(FundamentalSnapshot {
             code: code.into(),
             market,
@@ -222,6 +256,7 @@ fn append_metric(
     unit: &str,
     reporting_period: &str,
     announced_on: &str,
+    source: &str,
 ) {
     metrics.push(ReportedMetric {
         name: name.into(),
@@ -229,8 +264,32 @@ fn append_metric(
         unit: unit.into(),
         reporting_period: reporting_period.into(),
         announced_on: announced_on.into(),
-        source: FUNDAMENTALS_SOURCE.into(),
+        source: source.into(),
     });
+}
+
+fn append_valuation_metrics(
+    metrics: &mut Vec<ReportedMetric>,
+    name: &str,
+    points: Vec<data::baidu::ValuationPercentilePoint>,
+) {
+    for point in points.into_iter().filter(|point| {
+        let start = chrono::NaiveDate::parse_from_str(&point.window_start, "%Y-%m-%d");
+        let end = chrono::NaiveDate::parse_from_str(&point.observed_on, "%Y-%m-%d");
+        match (start, end) {
+            (Ok(start), Ok(end)) => (end - start).num_days() >= 1_080,
+            _ => false,
+        }
+    }) {
+        metrics.push(ReportedMetric {
+            name: name.into(),
+            value: Some(point.percentile_pct),
+            unit: "%".into(),
+            reporting_period: format!("{}..{}", point.window_start, point.observed_on),
+            announced_on: point.observed_on,
+            source: format!("{VALUATION_SOURCE}，{} 个日点", point.sample_size),
+        });
+    }
 }
 
 fn provider_error(provider: &str, error: anyhow::Error) -> ProviderError {
@@ -257,5 +316,95 @@ impl From<crate::model::Candle> for CandleRecord {
             close: value.close,
             volume: value.volume,
         }
+    }
+}
+
+#[cfg(test)]
+mod fundamental_provider_tests {
+    use super::*;
+    use crate::domain::fundamentals::quality_gate;
+
+    #[test]
+    fn valuation_metrics_require_an_almost_three_year_window() {
+        let mut metrics = Vec::new();
+        append_valuation_metrics(
+            &mut metrics,
+            "pe_ttm_percentile_pct",
+            vec![
+                data::baidu::ValuationPercentilePoint {
+                    observed_on: "2024-01-01".into(),
+                    window_start: "2023-01-01".into(),
+                    percentile_pct: 50.0,
+                    sample_size: 366,
+                },
+                data::baidu::ValuationPercentilePoint {
+                    observed_on: "2026-01-01".into(),
+                    window_start: "2023-01-01".into(),
+                    percentile_pct: 60.0,
+                    sample_size: 1_097,
+                },
+            ],
+        );
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].announced_on, "2026-01-01");
+    }
+
+    #[test]
+    #[ignore = "requires public financial-data network"]
+    fn a_share_enriched_fundamentals_smoke() {
+        let snapshot = EastmoneyProvider
+            .fetch_fundamentals("600519", 8)
+            .expect("A-share enriched fundamentals");
+        assert_eq!(snapshot.market, Market::AShare);
+        assert!(snapshot.metrics.iter().any(|metric| {
+            metric.name == "dividend_continuity_years" && metric.value.is_some()
+        }));
+        assert!(
+            snapshot
+                .metrics
+                .iter()
+                .any(|metric| metric.name == "pe_ttm_percentile_pct")
+        );
+        assert!(
+            snapshot
+                .metrics
+                .iter()
+                .any(|metric| metric.name == "pb_percentile_pct")
+        );
+        let today = chrono::Utc::now().date_naive().to_string();
+        let gate = quality_gate(&snapshot.metrics, &today);
+        assert!(
+            gate.unknown.iter().all(|item| !item.contains("连续分红")
+                && !item.contains("PE(TTM)")
+                && !item.contains("PB 三年")),
+            "gate={gate:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires public financial-data network"]
+    fn hong_kong_enriched_fundamentals_smoke() {
+        let snapshot = EastmoneyProvider
+            .fetch_fundamentals("00700", 8)
+            .expect("Hong Kong enriched fundamentals");
+        assert_eq!(snapshot.market, Market::HongKong);
+        assert!(snapshot.metrics.iter().any(|metric| {
+            metric.name == "dividend_continuity_years" && metric.value.is_some()
+        }));
+        assert!(
+            snapshot
+                .metrics
+                .iter()
+                .any(|metric| metric.name == "pe_ttm_percentile_pct")
+        );
+        assert!(
+            snapshot
+                .metrics
+                .iter()
+                .any(|metric| metric.name == "pb_percentile_pct")
+        );
+        let today = chrono::Utc::now().date_naive().to_string();
+        let gate = quality_gate(&snapshot.metrics, &today);
+        assert!(gate.unknown.iter().any(|item| item.contains("审计")));
     }
 }

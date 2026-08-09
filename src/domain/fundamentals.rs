@@ -12,6 +12,9 @@ pub const REQUIRED_QUALITY_METRICS: &[&str] = &[
     "profit_growth_pct",
     "goodwill_ratio_pct",
     "audit_risk_flag",
+    "dividend_continuity_years",
+    "pe_ttm_percentile_pct",
+    "pb_percentile_pct",
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -53,7 +56,7 @@ pub fn quality_gate(metrics: &[ReportedMetric], signal_date: &str) -> QualityGat
     for name in REQUIRED_QUALITY_METRICS {
         let metric = metrics
             .iter()
-            .filter(|metric| metric.name == *name && metric.available_on(signal_date))
+            .filter(|metric| metric.name == *name && metric.announced_on.as_str() <= signal_date)
             .max_by(|left, right| {
                 (&left.reporting_period, &left.announced_on)
                     .cmp(&(&right.reporting_period, &right.announced_on))
@@ -62,7 +65,10 @@ pub fn quality_gate(metrics: &[ReportedMetric], signal_date: &str) -> QualityGat
             unknown.push(format!("{}未知", metric_label(name)));
             continue;
         };
-        let value = metric.value.unwrap_or_default();
+        let Some(value) = metric.value else {
+            unknown.push(format!("{}未知", metric_label(name)));
+            continue;
+        };
         match *name {
             "roe_pct" if value < 0.0 => blockers.push("ROE 为负".into()),
             "roic_pct" if value < 0.0 => blockers.push("ROIC 为负".into()),
@@ -94,6 +100,9 @@ pub fn metric_label(name: &str) -> &str {
         "profit_growth_pct" => "利润同比",
         "goodwill_ratio_pct" => "商誉/总资产",
         "audit_risk_flag" => "审计意见",
+        "dividend_continuity_years" => "连续分红年数",
+        "pe_ttm_percentile_pct" => "PE(TTM) 三年历史分位",
+        "pb_percentile_pct" => "PB 三年历史分位",
         _ => "基本面指标",
     }
 }
@@ -147,6 +156,22 @@ mod tests {
         assert!(gate.unknown.iter().any(|item| item.contains("审计")));
     }
 
+    #[test]
+    fn latest_missing_value_does_not_fall_back_to_stale_evidence() {
+        let mut metrics = complete_metrics("2026-03-20");
+        metrics.push(ReportedMetric {
+            name: "goodwill_ratio_pct".into(),
+            value: None,
+            unit: "%".into(),
+            reporting_period: "2026-03-31".into(),
+            announced_on: "2026-05-01".into(),
+            source: "fixture".into(),
+        });
+        let gate = quality_gate(&metrics, "2026-05-02");
+        assert!(!gate.passed);
+        assert!(gate.unknown.iter().any(|item| item.contains("商誉")));
+    }
+
     fn complete_metrics(announced_on: &str) -> Vec<ReportedMetric> {
         REQUIRED_QUALITY_METRICS
             .iter()
@@ -161,6 +186,9 @@ mod tests {
                     "profit_growth_pct" => 6.0,
                     "goodwill_ratio_pct" => 3.0,
                     "audit_risk_flag" => 0.0,
+                    "dividend_continuity_years" => 5.0,
+                    "pe_ttm_percentile_pct" => 35.0,
+                    "pb_percentile_pct" => 40.0,
                     _ => unreachable!(),
                 }),
                 unit: if name.ends_with("_pct") { "%" } else { "ratio" }.into(),

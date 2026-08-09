@@ -19,7 +19,7 @@ impl StockApp {
             .last()
             .map(|candle| candle.date.to_string())
             .unwrap_or_else(|| chrono::Local::now().date_naive().to_string());
-        let (fundamental_gate, fundamental_source, latest_financial_notice, quality_evidence) =
+        let (fundamental_gate, fundamental_source, latest_evidence_date, quality_evidence) =
             match &self.analysis_state.fundamentals.state {
                 crate::controller::state::RequestState::Ready(snapshot)
                     if snapshot.code == self.selected.as_ref() =>
@@ -38,7 +38,8 @@ impl StockApp {
                                 .metrics
                                 .iter()
                                 .filter(|metric| {
-                                    metric.name == *name && metric.available_on(&data_as_of)
+                                    metric.name == *name
+                                        && metric.announced_on.as_str() <= data_as_of.as_str()
                                 })
                                 .max_by(|left, right| {
                                     (&left.reporting_period, &left.announced_on)
@@ -47,14 +48,11 @@ impl StockApp {
                             let value = metric.value?;
                             Some(QualityEvidence {
                                 label: metric_label(name).into(),
-                                value: if *name == "audit_risk_flag" {
-                                    if value < 1.0 {
-                                        "标准无保留".into()
-                                    } else {
-                                        "存在风险".into()
-                                    }
-                                } else {
-                                    format!("{value:.2}")
+                                value: match *name {
+                                    "audit_risk_flag" if value < 1.0 => "标准无保留".into(),
+                                    "audit_risk_flag" => "存在风险".into(),
+                                    "dividend_continuity_years" => format!("{value:.0}"),
+                                    _ => format!("{value:.2}"),
                                 },
                                 unit: metric.unit.clone(),
                                 reporting_period: metric.reporting_period.clone(),
@@ -144,8 +142,8 @@ impl StockApp {
             .unwrap_or_default();
         if fundamental_gate.passed {
             supports.push(format!(
-                "基本面质量门槛通过（公告截至 {}）",
-                latest_financial_notice.as_deref().unwrap_or("—")
+                "基本面质量门槛通过（证据截至 {}）",
+                latest_evidence_date.as_deref().unwrap_or("—")
             ));
         }
         let mut risks = Vec::new();
@@ -194,7 +192,7 @@ impl StockApp {
             source: format!("行情 {}；基本面 {fundamental_source}", self.data_source),
             adjustment: "前复权".into(),
             sample_size: self.candles.len(),
-            strategy_version: "technical-quality-gate-v2".into(),
+            strategy_version: "technical-quality-gate-v3".into(),
             evidence_grade: if self.candles.len() >= 120 {
                 "样本内探索".into()
             } else {

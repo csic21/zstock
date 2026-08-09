@@ -41,6 +41,7 @@ pub struct QuoteTick {
 pub struct FundamentalReportRow {
     pub reporting_period: String,
     pub announced_on: String,
+    pub is_annual: bool,
     pub currency: Currency,
     pub roe_pct: Option<f64>,
     pub roic_pct: Option<f64>,
@@ -50,6 +51,13 @@ pub struct FundamentalReportRow {
     pub profit_growth_pct: Option<f64>,
     pub goodwill_ratio_pct: Option<f64>,
     pub audit_risk_flag: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DividendContinuityPoint {
+    pub fiscal_year: i32,
+    pub announced_on: String,
+    pub consecutive_years: Option<u32>,
 }
 
 /// A 股行业板块的实时快照。
@@ -201,9 +209,11 @@ fn parse_fundamental_reports(main: &Value, balance: &Value) -> Result<Vec<Fundam
             Some("CNY") | None => Currency::Cny,
             Some(other) => bail!("unsupported financial currency {other}"),
         };
+        let is_annual = reporting_period.ends_with("-12-31");
         reports.push(FundamentalReportRow {
             reporting_period,
             announced_on,
+            is_annual,
             currency,
             roe_pct: optional_f64(row.get("ROEJQ")),
             roic_pct: optional_f64(row.get("ROIC")),
@@ -219,6 +229,419 @@ fn parse_fundamental_reports(main: &Value, balance: &Value) -> Result<Vec<Fundam
         bail!("financial endpoint returned no reports");
     }
     Ok(reports)
+}
+
+/// Point-in-time financial quality reports for Hong Kong shares.
+///
+/// Eastmoney's Hong Kong indicator table has reporting periods but no release
+/// date. We therefore match every period to the first HK announcement carrying
+/// the corresponding final/interim/quarterly-results category. Rows without a
+/// trustworthy match are omitted instead of borrowing the reporting date.
+pub fn fetch_hk_fundamental_reports(
+    code: &str,
+    report_limit: usize,
+) -> Result<Vec<FundamentalReportRow>> {
+    let normalized = normalize_code(code)
+        .filter(|code| is_hk_code(code))
+        .ok_or_else(|| anyhow!("Hong Kong financial provider requires a 5-digit code"))?;
+    let secu_code = format!("{normalized}.HK");
+    let limit = report_limit.clamp(1, 20);
+    let filter = format!("(SECUCODE=\"{secu_code}\")");
+    let main = fetch_hk_finance_table(
+        "RPT_HKF10_FN_MAININDICATOR",
+        "HKF10_FN_MAININDICATOR",
+        &filter,
+        limit,
+        "-1",
+        "REPORT_DATE",
+    )?;
+    let periods = response_rows(&main)?
+        .iter()
+        .filter_map(|row| {
+            row.get("REPORT_DATE")
+                .and_then(Value::as_str)
+                .and_then(|date| date.get(..10))
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    let Some(earliest_period) = periods.iter().min().cloned() else {
+        bail!("Hong Kong financial endpoint returned no reports");
+    };
+    let quoted_periods = periods
+        .iter()
+        .map(|period| format!("'{period}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let balance_filter = format!("(SECUCODE=\"{secu_code}\")(REPORT_DATE in ({quoted_periods}))");
+    let balance = fetch_hk_finance_table(
+        "RPT_HKF10_FN_BALANCE_PC",
+        "SECUCODE,REPORT_DATE,STD_ITEM_CODE,STD_ITEM_NAME,AMOUNT",
+        &balance_filter,
+        5_000,
+        "-1,1",
+        "REPORT_DATE,STD_ITEM_CODE",
+    )?;
+    let notices = fetch_hk_result_notices(&normalized, &earliest_period)?;
+    parse_hk_fundamental_reports(&main, &balance, &notices)
+}
+
+fn fetch_hk_finance_table(
+    report_name: &str,
+    columns: &str,
+    filter: &str,
+    page_size: usize,
+    sort_types: &str,
+    sort_columns: &str,
+) -> Result<Value> {
+    let url = format!(
+        "https://datacenter.eastmoney.com/securities/api/data/v1/get?\
+         reportName={}&columns={}&quoteColumns=&filter={}&pageNumber=1&pageSize={page_size}\
+         &sortTypes={}&sortColumns={}&source=F10&client=PC",
+        urlencoding_minimal(report_name),
+        urlencoding_minimal(columns),
+        urlencoding_minimal(filter),
+        urlencoding_minimal(sort_types),
+        urlencoding_minimal(sort_columns),
+    );
+    let value = get_json(&url)?;
+    if !value
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!(
+            "Hong Kong financial endpoint failed: {}",
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown response")
+        );
+    }
+    Ok(value)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HkResultNotice {
+    announced_on: String,
+    category_codes: Vec<String>,
+}
+
+fn fetch_hk_result_notices(code: &str, begin_time: &str) -> Result<Vec<HkResultNotice>> {
+    const PAGE_SIZE: usize = 100;
+    let end_time = chrono::Utc::now().date_naive().to_string();
+    let mut notices = Vec::new();
+    let mut page = 1usize;
+    let mut pages = 1usize;
+    while page <= pages {
+        let url = format!(
+            "https://np-anotice-stock.eastmoney.com/api/security/ann?sr=-1&page_size={PAGE_SIZE}\
+             &page_index={page}&ann_type=H&client_source=web&stock_list={}\
+             &begin_time={}&end_time={}",
+            urlencoding_minimal(code),
+            urlencoding_minimal(begin_time),
+            urlencoding_minimal(&end_time),
+        );
+        let value = get_json(&url)?;
+        if value.get("success").and_then(Value::as_i64) != Some(1) {
+            bail!(
+                "Hong Kong announcement endpoint failed: {}",
+                value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown response")
+            );
+        }
+        let total_hits = value
+            .pointer("/data/total_hits")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        pages = total_hits.div_ceil(PAGE_SIZE).max(1);
+        notices.extend(parse_hk_result_notices(&value)?);
+        page += 1;
+    }
+    Ok(notices)
+}
+
+fn parse_hk_result_notices(value: &Value) -> Result<Vec<HkResultNotice>> {
+    let rows = value
+        .pointer("/data/list")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("Hong Kong announcement response missing data.list"))?;
+    let mut notices = Vec::new();
+    for row in rows {
+        let category_codes = row
+            .get("columns")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|column| column.get("column_code").and_then(Value::as_str))
+            .filter(|code| matches!(*code, "011001003005" | "011001003007" | "011001003011"))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if category_codes.is_empty() {
+            continue;
+        }
+        notices.push(HkResultNotice {
+            announced_on: iso_date(row.get("notice_date"), "notice_date")?,
+            category_codes,
+        });
+    }
+    Ok(notices)
+}
+
+fn parse_hk_fundamental_reports(
+    main: &Value,
+    balance: &Value,
+    notices: &[HkResultNotice],
+) -> Result<Vec<FundamentalReportRow>> {
+    let mut balance_by_period: HashMap<String, (Option<f64>, Option<f64>)> = HashMap::new();
+    for row in response_rows(balance)? {
+        let period = iso_date(row.get("REPORT_DATE"), "HK balance REPORT_DATE")?;
+        let entry = balance_by_period.entry(period).or_default();
+        match row.get("STD_ITEM_CODE").and_then(Value::as_str) {
+            Some("004001005") => entry.0 = optional_f64(row.get("AMOUNT")),
+            Some("004009999") => entry.1 = optional_f64(row.get("AMOUNT")),
+            _ => {}
+        }
+    }
+
+    let mut reports = Vec::new();
+    for row in response_rows(main)? {
+        let reporting_period = iso_date(row.get("REPORT_DATE"), "HK main REPORT_DATE")?;
+        let date_type = row
+            .get("DATE_TYPE_CODE")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("Hong Kong financial response missing DATE_TYPE_CODE"))?;
+        let Some(announced_on) = match_hk_result_notice(&reporting_period, date_type, notices)?
+        else {
+            continue;
+        };
+        let currency = match row.get("CURRENCY").and_then(Value::as_str) {
+            Some("HKD") | None => Currency::Hkd,
+            Some("CNY") | Some("RMB") => Currency::Cny,
+            Some(other) => bail!("unsupported Hong Kong financial currency {other}"),
+        };
+        let operating_cash_to_profit = optional_f64(row.get("PER_NETCASH_OPERATE"))
+            .zip(optional_f64(row.get("BASIC_EPS")))
+            .and_then(|(cash, earnings)| {
+                (earnings.abs() > f64::EPSILON).then_some(cash / earnings)
+            });
+        let goodwill_ratio_pct = balance_by_period
+            .get(&reporting_period)
+            .and_then(|(goodwill, assets)| goodwill.zip(*assets))
+            .and_then(|(goodwill, assets)| (assets > 0.0).then_some(goodwill / assets * 100.0));
+        reports.push(FundamentalReportRow {
+            reporting_period,
+            announced_on,
+            is_annual: date_type == "001",
+            currency,
+            roe_pct: optional_f64(row.get("ROE_YEARLY")),
+            roic_pct: optional_f64(row.get("ROIC_YEARLY")),
+            operating_cash_to_profit,
+            debt_ratio_pct: optional_f64(row.get("DEBT_ASSET_RATIO")),
+            revenue_growth_pct: optional_f64(row.get("OPERATE_INCOME_YOY")),
+            profit_growth_pct: optional_f64(row.get("HOLDER_PROFIT_YOY")),
+            goodwill_ratio_pct,
+            // The free structured endpoint does not carry the auditor's opinion.
+            // Keeping this absent is safer than inferring it from the auditor name.
+            audit_risk_flag: None,
+        });
+    }
+    if reports.is_empty() {
+        bail!("no Hong Kong report had a traceable results announcement date");
+    }
+    Ok(reports)
+}
+
+fn match_hk_result_notice(
+    reporting_period: &str,
+    date_type: &str,
+    notices: &[HkResultNotice],
+) -> Result<Option<String>> {
+    let expected_category = match date_type {
+        "001" => "011001003005",         // final results
+        "002" => "011001003007",         // interim results
+        "003" | "004" => "011001003011", // quarterly results
+        _ => return Ok(None),
+    };
+    let period = chrono::NaiveDate::parse_from_str(reporting_period, "%Y-%m-%d")
+        .context("invalid Hong Kong reporting period")?;
+    let latest = (period + chrono::Duration::days(210)).to_string();
+    Ok(notices
+        .iter()
+        .filter(|notice| {
+            notice
+                .category_codes
+                .iter()
+                .any(|code| code == expected_category)
+                && notice.announced_on.as_str() > reporting_period
+                && notice.announced_on <= latest
+        })
+        .map(|notice| notice.announced_on.clone())
+        .min())
+}
+
+pub fn fetch_dividend_continuity(
+    code: &str,
+    annual_reports: &[FundamentalReportRow],
+) -> Result<Vec<DividendContinuityPoint>> {
+    let normalized = normalize_code(code)
+        .ok_or_else(|| anyhow!("dividend provider requires a valid stock code"))?;
+    let value = if is_hk_code(&normalized) {
+        fetch_hk_dividends(&normalized)?
+    } else {
+        fetch_a_share_dividends(&normalized)?
+    };
+    parse_dividend_continuity(&value, is_hk_code(&normalized), annual_reports)
+}
+
+fn fetch_hk_dividends(code: &str) -> Result<Value> {
+    let filter = format!("(SECURITY_CODE=\"{code}\")(IS_BFP=\"0\")");
+    fetch_hk_finance_table(
+        "RPT_HKF10_MAIN_DIVBASIC",
+        "SECURITY_CODE,UPDATE_DATE,NOTICE_DATE,REPORT_TYPE,YEAR,PLAN_EXPLAIN,IS_BFP",
+        &filter,
+        500,
+        "-1,-1",
+        "NOTICE_DATE,EX_DIVIDEND_DATE",
+    )
+}
+
+fn fetch_a_share_dividends(code: &str) -> Result<Value> {
+    let filter = urlencoding_minimal(&format!("(SECURITY_CODE=\"{code}\")"));
+    let url = format!(
+        "https://datacenter-web.eastmoney.com/api/data/v1/get?sortColumns=REPORT_DATE\
+         &sortTypes=-1&pageSize=500&pageNumber=1&reportName=RPT_SHAREBONUS_DET\
+         &columns=ALL&quoteColumns=&source=WEB&client=WEB&filter={filter}"
+    );
+    let value = get_json(&url)?;
+    if !value
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!("A-share dividend endpoint failed");
+    }
+    Ok(value)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DividendStateEvent {
+    fiscal_year: i32,
+    announced_on: String,
+    paid: Option<bool>,
+}
+
+fn parse_dividend_continuity(
+    value: &Value,
+    is_hong_kong: bool,
+    annual_reports: &[FundamentalReportRow],
+) -> Result<Vec<DividendContinuityPoint>> {
+    let mut events = Vec::<DividendStateEvent>::new();
+    for row in response_rows(value)? {
+        let event = if is_hong_kong {
+            parse_hk_dividend_event(row)?
+        } else {
+            parse_a_share_dividend_event(row)?
+        };
+        if let Some(event) = event {
+            events.push(event);
+        }
+    }
+    for report in annual_reports.iter().filter(|report| report.is_annual) {
+        let fiscal_year = report
+            .reporting_period
+            .get(..4)
+            .and_then(|year| year.parse::<i32>().ok())
+            .ok_or_else(|| anyhow!("invalid annual reporting period"))?;
+        let known_at_report = events.iter().any(|event| {
+            event.fiscal_year == fiscal_year && event.announced_on <= report.announced_on
+        });
+        if !known_at_report {
+            events.push(DividendStateEvent {
+                fiscal_year,
+                announced_on: report.announced_on.clone(),
+                paid: None,
+            });
+        }
+    }
+    events.sort_by(|left, right| {
+        (&left.announced_on, left.fiscal_year, left.paid).cmp(&(
+            &right.announced_on,
+            right.fiscal_year,
+            right.paid,
+        ))
+    });
+    events.dedup();
+
+    let mut state = HashMap::<i32, Option<bool>>::new();
+    let mut points = Vec::with_capacity(events.len());
+    for event in events {
+        state.insert(event.fiscal_year, event.paid);
+        let consecutive_years = event.paid.map(|_| {
+            let mut count = 0u32;
+            let mut year = event.fiscal_year;
+            while state.get(&year).copied().flatten() == Some(true) {
+                count += 1;
+                year -= 1;
+            }
+            count
+        });
+        points.push(DividendContinuityPoint {
+            fiscal_year: event.fiscal_year,
+            announced_on: event.announced_on,
+            consecutive_years,
+        });
+    }
+    Ok(points)
+}
+
+fn parse_hk_dividend_event(row: &Value) -> Result<Option<DividendStateEvent>> {
+    if !row
+        .get("REPORT_TYPE")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.contains("年度"))
+    {
+        return Ok(None);
+    }
+    let fiscal_year = row
+        .get("YEAR")
+        .and_then(Value::as_str)
+        .and_then(|year| year.parse::<i32>().ok())
+        .ok_or_else(|| anyhow!("Hong Kong dividend response missing fiscal year"))?;
+    let plan = row
+        .get("PLAN_EXPLAIN")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Ok(Some(DividendStateEvent {
+        fiscal_year,
+        announced_on: iso_date(row.get("NOTICE_DATE"), "HK dividend NOTICE_DATE")?,
+        paid: Some(
+            !plan.trim().is_empty()
+                && !plan.contains("不分红")
+                && !plan.contains("不派")
+                && !plan.contains("无分配"),
+        ),
+    }))
+}
+
+fn parse_a_share_dividend_event(row: &Value) -> Result<Option<DividendStateEvent>> {
+    let reporting_period = iso_date(row.get("REPORT_DATE"), "dividend REPORT_DATE")?;
+    if !reporting_period.ends_with("-12-31") {
+        return Ok(None);
+    }
+    let fiscal_year = reporting_period
+        .get(..4)
+        .and_then(|year| year.parse::<i32>().ok())
+        .ok_or_else(|| anyhow!("A-share dividend response missing fiscal year"))?;
+    let announced_on = row
+        .get("PLAN_NOTICE_DATE")
+        .or_else(|| row.get("PUBLISH_DATE"));
+    Ok(Some(DividendStateEvent {
+        fiscal_year,
+        announced_on: iso_date(announced_on, "dividend PLAN_NOTICE_DATE")?,
+        paid: Some(optional_f64(row.get("PRETAX_BONUS_RMB")).is_some_and(|value| value > 0.0)),
+    }))
 }
 
 fn response_rows(value: &Value) -> Result<&Vec<Value>> {
@@ -859,12 +1282,109 @@ mod fundamental_tests {
     }
 
     #[test]
+    fn hong_kong_fixture_matches_real_result_categories_point_in_time() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/fundamentals-hk.json"))
+                .unwrap();
+        let notices = parse_hk_result_notices(&fixture["notices"]).unwrap();
+        let reports =
+            parse_hk_fundamental_reports(&fixture["main"], &fixture["balance"], &notices).unwrap();
+
+        assert_eq!(reports.len(), 2, "unannounced interim row must be omitted");
+        let annual = reports
+            .iter()
+            .find(|report| report.reporting_period == "2025-12-31")
+            .unwrap();
+        assert_eq!(annual.announced_on, "2026-03-18");
+        assert!(annual.is_annual);
+        assert_eq!(annual.operating_cash_to_profit, Some(1.2));
+        assert_eq!(annual.goodwill_ratio_pct, Some(5.0));
+        assert_eq!(annual.audit_risk_flag, None);
+
+        let first_quarter = reports
+            .iter()
+            .find(|report| report.reporting_period == "2026-03-31")
+            .unwrap();
+        assert_eq!(first_quarter.announced_on, "2026-05-13");
+        assert!(!first_quarter.is_annual);
+    }
+
+    #[test]
+    fn dividend_continuity_breaks_on_a_missing_fiscal_year() {
+        let value = serde_json::json!({
+            "result": {"data": [
+                {
+                    "REPORT_TYPE": "年度分配",
+                    "YEAR": "2025",
+                    "NOTICE_DATE": "2026-03-18 00:00:00",
+                    "PLAN_EXPLAIN": "每股派港币5.3元"
+                },
+                {
+                    "REPORT_TYPE": "年度分配",
+                    "YEAR": "2024",
+                    "NOTICE_DATE": "2025-03-19 00:00:00",
+                    "PLAN_EXPLAIN": "每股派港币4.5元"
+                },
+                {
+                    "REPORT_TYPE": "年度分配",
+                    "YEAR": "2022",
+                    "NOTICE_DATE": "2023-03-22 00:00:00",
+                    "PLAN_EXPLAIN": "每股派港币2.4元"
+                },
+                {
+                    "REPORT_TYPE": "特别分配",
+                    "YEAR": "2023",
+                    "NOTICE_DATE": "2023-12-01 00:00:00",
+                    "PLAN_EXPLAIN": "特别分配"
+                }
+            ]}
+        });
+        let points = parse_dividend_continuity(&value, true, &[]).unwrap();
+        let latest = points.last().unwrap();
+        assert_eq!(latest.fiscal_year, 2025);
+        assert_eq!(latest.consecutive_years, Some(2));
+    }
+
+    #[test]
+    fn absent_dividend_record_is_unknown_at_annual_results_date() {
+        let value = serde_json::json!({"result": {"data": []}});
+        let annual_report = FundamentalReportRow {
+            reporting_period: "2025-12-31".into(),
+            announced_on: "2026-03-18".into(),
+            is_annual: true,
+            currency: Currency::Hkd,
+            roe_pct: None,
+            roic_pct: None,
+            operating_cash_to_profit: None,
+            debt_ratio_pct: None,
+            revenue_growth_pct: None,
+            profit_growth_pct: None,
+            goodwill_ratio_pct: None,
+            audit_risk_flag: None,
+        };
+        let points = parse_dividend_continuity(&value, true, &[annual_report]).unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].consecutive_years, None);
+        assert_eq!(points[0].announced_on, "2026-03-18");
+    }
+
+    #[test]
     #[ignore = "requires public financial-data network"]
     fn fundamental_reports_smoke() {
         let reports = fetch_fundamental_reports("600519", 2).expect("financial reports");
         assert!(!reports.is_empty());
         assert!(reports.iter().all(|report| {
             !report.reporting_period.is_empty() && !report.announced_on.is_empty()
+        }));
+    }
+
+    #[test]
+    #[ignore = "requires public financial-data network"]
+    fn hong_kong_fundamental_reports_smoke() {
+        let reports = fetch_hk_fundamental_reports("00700", 4).expect("HK financial reports");
+        assert!(!reports.is_empty());
+        assert!(reports.iter().all(|report| {
+            !report.reporting_period.is_empty() && report.announced_on > report.reporting_period
         }));
     }
 }

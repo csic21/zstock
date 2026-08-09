@@ -638,7 +638,7 @@ UX：
 | U2 | 代码完成 | 领域生成的决策卡、支持/风险/观察/失效/目标/RR、来源/时间/复权/样本/版本/证据等级与下一步动作 | 5 名用户的 45 秒判断测试 |
 | U3 | 代码完成 | CNY/HKD 分组、集中度、现金比例、按失效价计算风险、行情/失效/行业覆盖率、未知与过期显式展示 | 5 名用户的 30 秒风险识别测试 |
 | U4 | 代码完成 | 次日开盘成交、市场成本/滑点、基准/超额/回撤/分布/CI、70/30 样本外、偏差检查、策略/数据集/成本版本、三种规则 | 更长固定数据集与滚动样本外观察 |
-| U5 | A 股 Provider 完成 | point-in-time 财务契约；东财主指标与资产负债表按报告期合并并取较晚公告日；ROE/ROIC、现金利润匹配、负债、增长、商誉与审计意见均保留值、单位、报告期、公告日和来源；价值陷阱、未来公告、缺失未知测试；决策卡展示逐项证据 | 港股免费接口缺少可靠公告日，继续显示未知；分红连续性与 PE/PB 历史分位仍需可追溯数据 |
+| U5 | A 股/港股 Provider 完成 | A 股按东财 `NOTICE_DATE` 合并主指标与资产负债表；港股财务期按末期/中期/季度业绩公告分类匹配真实公告日，无法匹配则不用；两市场分红按财政年度与首次公告日计算连续性；百度三年 PE(TTM)/PB 日期序列逐日计算 point-in-time 分位；最新一期缺失不回退旧值；逐项保留值、单位、报告期、公告日和来源；决策卡展示 11 项证据 | 港股免费结构化源没有审计意见，保持未知且不能通过；真实源稳定性由 nightly 继续观察 |
 | U6 | 代码完成 | 计划—执行—结果—复盘、证据快照和版本、到期状态、5/10/20 交易日结果、MFE/MAE、幂等、20 份后才显示趋势、本地导出与确认删除 | Beta 真实日记数据复核 |
 
 ### 14.3 本地质量门禁
@@ -652,11 +652,11 @@ cargo clippy --all-targets -- -D warnings          PASS (0 warnings)
 cargo check --all-targets --no-default-features    PASS (0 warnings)
 cargo clippy --all-targets --no-default-features -- -D warnings
                                                     PASS (0 warnings)
-cargo test --all-targets                           PASS (134 passed, 14 ignored)
+cargo test --all-targets                           PASS (141 passed, 17 ignored)
 cargo build --release                              PASS
 ```
 
-14 个 ignored 测试是联网或原生凭据库 smoke tests，由 nightly workflow 串行执行；A 股财务 Provider 真实接口与 macOS Keychain 写入/读取/删除 smoke test均已单独通过。质量矩阵使用 Linux x64、Windows x64、macOS 15 arm64 和 macOS 15 Intel x64 原生 runner；两种 macOS 架构均执行离线测试。
+17 个 ignored 测试是联网或原生凭据库 smoke tests，由 nightly workflow 串行执行；A 股/港股完整基本面 Provider 真实接口与 macOS Keychain 写入/读取/删除 smoke test 均已单独通过。U5 数据语义和实测证据见 `docs/validation/u5-fundamentals.md`。质量矩阵使用 Linux x64、Windows x64、macOS 15 arm64 和 macOS 15 Intel x64 原生 runner；两种 macOS 架构均执行离线测试。
 
 ### 14.4 发布验收清单
 
@@ -670,7 +670,7 @@ cargo build --release                              PASS
 - [ ] 累积 20 次缓存导航、GPU 图表帧 p95/p99 及连续 1 小时 RSS 证据并达到预算。
 - [ ] 至少 5 名目标用户完成首次导航、保存候选、决策判断、组合风险识别和建计划测试。
 - [x] A 股 point-in-time 财务 Provider 接入，并满足 U5 的来源、单位、报告期和公告日覆盖。
-- [ ] 港股公告日、分红连续性及 PE/PB 历史分位接入可追溯数据源。
+- [x] 港股公告日、A/H 分红连续性及 PE/PB 三年历史分位接入可追溯数据源；缺失值保持未知。
 - [ ] 一个稳定版本周期无回退后，删除 `legacy AppState`、兼容 flags 和旧实现。
 
 这些检查完成后，才可把本文状态改为“全部验收完成”。
