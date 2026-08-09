@@ -29,14 +29,6 @@ pub enum RadarStrategy {
 }
 
 impl RadarStrategy {
-    pub fn id(self) -> &'static str {
-        match self {
-            Self::Pullback => "pullback",
-            Self::Breakout => "breakout",
-            Self::OversoldBounce => "oversold",
-        }
-    }
-
     pub fn label(self, work: bool) -> &'static str {
         match (self, work) {
             (Self::Pullback, true) => "Pullback",
@@ -141,9 +133,7 @@ pub fn evaluate_strategy(
     match strategy {
         RadarStrategy::Pullback => score_pullback(code, name, candles, &snap, day_change_pct),
         RadarStrategy::Breakout => score_breakout(code, name, candles, &snap, day_change_pct),
-        RadarStrategy::OversoldBounce => {
-            score_oversold(code, name, candles, &snap, day_change_pct)
-        }
+        RadarStrategy::OversoldBounce => score_oversold(code, name, candles, &snap, day_change_pct),
     }
 }
 
@@ -173,7 +163,7 @@ fn score_pullback(
     if dist_ma20 < -0.02 {
         return None; // 明显在均线下方，不是回踩
     }
-    if dist_ma20 >= 0.0 && dist_ma20 <= 0.06 {
+    if (0.0..=0.06).contains(&dist_ma20) {
         score += 18.0;
         reasons.push("价格贴近/略上 MA20".into());
     } else if dist_ma20 > 0.06 && dist_ma20 <= 0.12 {
@@ -295,11 +285,11 @@ fn score_breakout(
         reasons.push("逼近 20 日高".into());
     }
 
-    if let Some(h60) = high_60 {
-        if close >= h60 * 0.998 {
-            score += 10.0;
-            reasons.push("同步挑战 60 日高".into());
-        }
+    if let Some(h60) = high_60
+        && close >= h60 * 0.998
+    {
+        score += 10.0;
+        reasons.push("同步挑战 60 日高".into());
     }
 
     if let Some(vr) = snap.volume_ratio_20 {

@@ -1,65 +1,17 @@
 //! Chart paint data, formatting helpers, drawing anchors.
 
-#![allow(unused_imports)]
+use gpui::App;
+use gpui_component::ActiveTheme;
 
-use std::collections::HashMap;
-use std::time::Duration;
-
-use gpui::{
-    canvas, div, point, px, size, App, AppContext, Bounds, Context, Entity, FocusHandle,
-    InteractiveElement, IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, Timer, Window, WindowBounds, WindowOptions,
-    prelude::FluentBuilder,
-};
-use gpui_component::{
-    button::{Button, ButtonVariants},
-    h_flex,
-    IconName,
-    input::{Input, InputEvent, InputState},
-    resizable::{h_resizable, resizable_panel, v_resizable, ResizableState},
-    v_flex, ActiveTheme, Disableable, PixelsExt, Root, Sizable, StyledExt, Theme, ThemeMode,
-    TitleBar, TITLE_BAR_HEIGHT,
-};
-use gpui_component::tooltip::Tooltip;
-
-use crate::chart::{
-    chart_layout, index_from_x, paint_chart, paint_sparkline, price_from_y, BollPaintData,
-    ChartPaintData, ChartStyle, MacdPaintData, MinutePaintData,
-};
-use crate::data::ai::{self, AiCliProvider, AiConfig, AiKind, AiTransport};
+use crate::chart::{BollPaintData, ChartPaintData, ChartStyle, MacdPaintData, MinutePaintData};
 use crate::data::levels;
-use crate::data::portfolio::{
-    self, format_money, format_shares, Portfolio, PortfolioSummary, TradeSide,
-};
-use crate::data::scout::{self, ScoutPick, ScoutVerdict, SCOUT_CANDIDATE_N};
-use crate::data::treasure::{self, fmt_dd, fmt_pos, TreasureHit, TREASURE_KLINE_LIMIT};
-use crate::data::universe::{self, FinFilter, TreasurePool, TREASURE_SCAN_CAP, TREASURE_TOP_N};
-use crate::data::{
-    indicators::{BollSeries, MaSeries, MacdSeries},
-    market, session, signals,
-};
-use crate::data::market::Sourced;
-use crate::data::session::{filter_codes_in_session, idle_delay_secs, open_markets_now, MarketSet};
+use crate::data::{indicators::MaSeries, signals};
 use crate::model::{
-    board_for_code, disguise_index, disguise_label, format_index, format_pct, format_price,
-    format_volume, normalize_code, shared, Candle, IndexSnap, MinutePeriod, MinuteSeries,
-    QuoteSnapshot, Symbol, TrendLine,
+    IndexSnap, TrendLine, disguise_index, disguise_label, format_index, format_pct, format_price,
 };
-use crate::storage::{
-    self, clamp_quote_interval_secs, normalize_status_bar, AppConfig, ColorScheme, DockLayout,
-    WatchlistSort, STATUS_BAR_MAX_CODES,
-};
-use crate::update::{self, UpdateState};
 
-use super::{
-    AiCacheEntry, AiPanelState, AiSource, ChartKind, ChartRange, DetailTab, LeftTab, SettingsSection,
-    StockApp, CHART_MIN_VISIBLE, QUOTE_INTERVAL_ERR_MAX, QUOTE_INTERVAL_PRESETS, TITLE_NORMAL,
-    TITLE_WORK, TREASURE_SCAN_GAP,
-};
 use super::helpers::*;
-
-
+use super::{ChartKind, StockApp};
 
 impl StockApp {
     pub(crate) fn chart_paint_data(&self, cx: &App) -> ChartPaintData {
@@ -145,14 +97,17 @@ impl StockApp {
                     color_ix: line.color_ix,
                 });
             }
-            if let Some(draft) = self.draft_line {
-                if draft.from.0 >= start && draft.from.0 < end && draft.to.0 >= start && draft.to.0 < end {
-                    lines.push(TrendLine {
-                        from: (draft.from.0 - start, draft.from.1),
-                        to: (draft.to.0 - start, draft.to.1),
-                        color_ix: draft.color_ix,
-                    });
-                }
+            if let Some(draft) = self.draft_line
+                && draft.from.0 >= start
+                && draft.from.0 < end
+                && draft.to.0 >= start
+                && draft.to.0 < end
+            {
+                lines.push(TrendLine {
+                    from: (draft.from.0 - start, draft.from.1),
+                    to: (draft.to.0 - start, draft.to.1),
+                    color_ix: draft.color_ix,
+                });
             }
         }
         // Open position average cost (hidden in work mode).
@@ -204,11 +159,7 @@ impl StockApp {
             },
             bullish: self.chg_color(true, cx),
             bearish: self.chg_color(false, cx),
-            line_color: if work {
-                theme.blue
-            } else {
-                theme.foreground
-            },
+            line_color: if work { theme.blue } else { theme.foreground },
             area_fill: theme.blue.opacity(0.18),
             border: theme.border,
             ma5_color: if work {
@@ -363,17 +314,16 @@ impl StockApp {
             .is_some_and(|c| c == self.selected.as_ref());
         if matched {
             let (start, end) = self.chart_visible_range();
-            if end > start {
-                if let Some(c) = self.candles.get(start) {
-                    if c.close > 0.0 {
-                        return c.close;
-                    }
-                }
+            if end > start
+                && let Some(c) = self.candles.get(start)
+                && c.close > 0.0
+            {
+                return c.close;
             }
-            if let Some(c) = self.candles.last() {
-                if c.close > 0.0 {
-                    return c.close;
-                }
+            if let Some(c) = self.candles.last()
+                && c.close > 0.0
+            {
+                return c.close;
             }
         }
         self.current_symbol()
@@ -440,7 +390,9 @@ impl StockApp {
 
     /// RSS MB from volume + stable code salt.
     pub(crate) fn sys_rss_mb(code: &str, volume: u64, max_vol: u64) -> u32 {
-        let salt = code.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
+        let salt = code
+            .bytes()
+            .fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
         let base = 48 + (salt % 180);
         let vol = (Self::load_factor(volume, max_vol) * 720.0) as u32;
         base + vol
@@ -469,9 +421,11 @@ impl StockApp {
         if self.candles.is_empty() {
             self.signal_cache = None;
             self.levels_cache = None;
+            self.analysis_state.decision_card = None;
         } else {
             self.signal_cache = signals::analyze(&self.candles);
             self.levels_cache = levels::compute(&self.candles);
+            self.analysis_state.decision_card = Some(self.decision_card_view_model());
         }
     }
 
@@ -492,11 +446,6 @@ impl StockApp {
         // Cap points so the spark stays readable.
         let n = slice.len();
         let step = (n / 80).max(1);
-        slice
-            .iter()
-            .step_by(step)
-            .map(|c| c.close)
-            .collect()
+        slice.iter().step_by(step).map(|c| c.close).collect()
     }
-
 }

@@ -1,69 +1,22 @@
 //! Watchlist, selection, treasure scan, scout picks, command palette.
 
-#![allow(unused_imports)]
-
 use std::collections::HashMap;
-use std::time::Duration;
 
-use gpui::{
-    canvas, div, point, px, size, App, AppContext, Bounds, Context, Entity, FocusHandle,
-    InteractiveElement, IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, Timer, Window, WindowBounds, WindowOptions,
-    prelude::FluentBuilder,
-};
-use gpui_component::{
-    button::{Button, ButtonVariants},
-    h_flex,
-    IconName,
-    input::{Input, InputEvent, InputState},
-    resizable::{h_resizable, resizable_panel, v_resizable, ResizableState},
-    v_flex, ActiveTheme, Disableable, PixelsExt, Root, Sizable, StyledExt, Theme, ThemeMode,
-    TitleBar, TITLE_BAR_HEIGHT,
-};
-use gpui_component::tooltip::Tooltip;
+use gpui::{Context, SharedString, Timer, Window};
 
-use crate::chart::{
-    chart_layout, index_from_x, paint_chart, paint_sparkline, price_from_y, BollPaintData,
-    ChartPaintData, ChartStyle, MacdPaintData, MinutePaintData,
-};
-use crate::data::ai::{self, AiCliProvider, AiConfig, AiKind, AiTransport};
-use crate::data::levels;
-use crate::data::portfolio::{
-    self, format_money, format_shares, Portfolio, PortfolioSummary, TradeSide,
-};
 use crate::data::groups::{FindMode, WatchTag};
 use crate::data::radar::{
-    self, RadarHit, RadarStrategy, RADAR_KLINE_LIMIT, RADAR_PROBE_N, RADAR_RESULT_N,
+    self, RADAR_KLINE_LIMIT, RADAR_PROBE_N, RADAR_RESULT_N, RadarHit, RadarStrategy,
 };
-use crate::data::scout::{self, ScoutPick, ScoutVerdict, SCOUT_CANDIDATE_N};
-use crate::data::treasure::{self, fmt_dd, fmt_pos, TreasureHit, TREASURE_KLINE_LIMIT};
-use crate::data::universe::{self, FinFilter, TreasurePool, TREASURE_SCAN_CAP, TREASURE_TOP_N};
-use crate::data::{
-    eastmoney, indicators::{BollSeries, MaSeries, MacdSeries},
-    market, session, signals,
-};
-use crate::data::market::Sourced;
-use crate::data::session::{filter_codes_in_session, idle_delay_secs, open_markets_now, MarketSet};
-use crate::model::{
-    board_for_code, disguise_index, disguise_label, format_index, format_pct, format_price,
-    format_volume, normalize_code, shared, Candle, IndexSnap, MinutePeriod, MinuteSeries,
-    QuoteSnapshot, Symbol, TrendLine,
-};
-use crate::storage::{
-    self, clamp_quote_interval_secs, normalize_status_bar, AppConfig, ColorScheme, DockLayout,
-    WatchlistSort, STATUS_BAR_MAX_CODES,
-};
-use crate::update::{self, UpdateState};
+use crate::data::scout::{self, SCOUT_CANDIDATE_N, ScoutPick, ScoutVerdict};
+use crate::data::treasure::{self, TREASURE_KLINE_LIMIT, TreasureHit};
+use crate::data::universe::{self, FinFilter, TREASURE_TOP_N, TreasurePool};
+use crate::data::{eastmoney, market, session};
+use crate::model::{Symbol, board_for_code, normalize_code, shared};
+use crate::storage::{self};
 
-use super::{
-    AiCacheEntry, AiPanelState, AiSource, ChartKind, ChartRange, DetailTab, LeftTab, SettingsSection,
-    StockApp, CHART_MIN_VISIBLE, QUOTE_INTERVAL_ERR_MAX, QUOTE_INTERVAL_PRESETS, TITLE_NORMAL,
-    TITLE_WORK, TREASURE_SCAN_GAP,
-};
 use super::helpers::*;
-
-
+use super::{ChartKind, ChartRange, DetailTab, LeftTab, StockApp, TREASURE_SCAN_GAP};
 
 impl StockApp {
     pub(crate) fn select_symbol(&mut self, code: SharedString, cx: &mut Context<Self>) {
@@ -72,9 +25,12 @@ impl StockApp {
             cx.notify();
             return;
         }
+        self.portfolio_state.selected_currency =
+            crate::domain::money::Currency::for_code(code.as_ref());
         self.selected = code;
         self.palette_open = false;
         self.schedule_persist(cx);
+        self.reload_fundamentals(cx);
         self.reload_chart(cx);
     }
 
@@ -145,7 +101,8 @@ impl StockApp {
                     }
                     if let Some(&ix) = symbol_ix.get(&t.code) {
                         let sym = &mut app.symbols[ix];
-                        if !is_real_name(sym.name.as_ref(), &t.code) || sym.name.as_ref() != t.name {
+                        if !is_real_name(sym.name.as_ref(), &t.code) || sym.name.as_ref() != t.name
+                        {
                             sym.name = shared(t.name.clone());
                         }
                         if t.last > 0.0 {
@@ -168,7 +125,9 @@ impl StockApp {
                         universe: "watchlist+extended".into(),
                         hits: app.treasure_hits.clone(),
                     };
-                    let _ = storage::save_treasure_cache(&cache);
+                    if let Err(error) = storage::save_treasure_cache(&cache) {
+                        storage::record_storage_error(format!("保存机会缓存失败：{error:#}"));
+                    }
                 }
                 app.persist();
                 app.sync_status_bar();
@@ -255,7 +214,7 @@ impl StockApp {
     pub(crate) fn start_treasure_scan_with(&mut self, silent: bool, cx: &mut Context<Self>) {
         if self.treasure_scanning {
             if !silent {
-                self.status = shared("寻宝扫描进行中…");
+                self.status = shared("低位策略扫描进行中…");
                 cx.notify();
             }
             return;
@@ -266,6 +225,7 @@ impl StockApp {
 
         self.treasure_gen = self.treasure_gen.wrapping_add(1);
         let scan_id = self.treasure_gen;
+        let discovery_ticket = self.discovery_state.controller.begin("long-term");
         self.treasure_scanning = true;
         self.treasure_scan_silent = silent;
         self.treasure_done = 0;
@@ -306,7 +266,7 @@ impl StockApp {
             }
         } else {
             self.status = shared(format!(
-                "🐭 寻宝 · {}池 · {} · 入榜{TREASURE_TOP_N}",
+                "机会 · {}池 · {} · 候选{TREASURE_TOP_N}",
                 pool.label(),
                 fin.label()
             ));
@@ -329,8 +289,11 @@ impl StockApp {
                         return;
                     }
                     app.treasure_scanning = false;
+                    app.discovery_state
+                        .controller
+                        .fail(&discovery_ticket, "候选池为空");
                     app.treasure_status = shared(format!("没有可扫描代码 · {filter_note}"));
-                    app.status = shared("寻宝失败：候选池为空");
+                    app.status = shared("机会扫描失败：候选池为空");
                     cx.notify();
                 });
                 return;
@@ -439,7 +402,9 @@ impl StockApp {
                 universe: format!("{pool_src}/scan{total}/top{TREASURE_TOP_N}"),
                 hits: hits.clone(),
             };
-            let _ = storage::save_treasure_cache(&cache);
+            if let Err(error) = storage::save_treasure_cache(&cache) {
+                storage::record_storage_error(format!("保存机会缓存失败：{error:#}"));
+            }
 
             let _ = this.update(cx, |app, cx| {
                 if app.treasure_gen != scan_id {
@@ -447,18 +412,26 @@ impl StockApp {
                 }
                 app.treasure_scanning = false;
                 app.treasure_hits = hits;
+                let result_codes = app
+                    .treasure_hits
+                    .iter()
+                    .map(|hit| hit.code.clone())
+                    .collect();
+                app.discovery_state
+                    .controller
+                    .finish(&discovery_ticket, result_codes);
                 app.treasure_updated_at = updated_at.clone();
                 app.treasure_done = total;
                 // 同步名称到已在自选里的同代码
-                for hit in &app.treasure_hits {
+                let treasure_hits = app.treasure_hits.clone();
+                for hit in &treasure_hits {
                     if !is_real_name(&hit.name, &hit.code) {
                         continue;
                     }
-                    if let Some(sym) = app.symbols.iter_mut().find(|s| s.code == hit.code) {
-                        if !is_real_name(sym.name.as_ref(), &hit.code) {
+                    if let Some(sym) = app.symbols.iter_mut().find(|s| s.code == hit.code)
+                        && !is_real_name(sym.name.as_ref(), &hit.code) {
                             sym.name = shared(hit.name.clone());
                         }
-                    }
                 }
                 let silent = app.treasure_scan_silent;
                 app.treasure_scan_silent = false;
@@ -468,12 +441,12 @@ impl StockApp {
                 ));
                 if silent {
                     app.status = shared(format!(
-                        "长线榜已更新 · Top {} · 正在静默筛可买…",
+                        "低位策略已更新 · Top {} · 正在静默运行规则筛选…",
                         app.treasure_hits.len(),
                     ));
                 } else {
                     app.status = shared(format!(
-                        "🐭 寻宝完成 · Top {} / 扫描 {total} · 正在筛可买…",
+                        "机会扫描完成 · Top {} / 扫描 {total} · 正在运行规则筛选…",
                         app.treasure_hits.len(),
                     ));
                 }
@@ -496,21 +469,21 @@ impl StockApp {
     pub(crate) fn start_scout_picks_with(&mut self, silent: bool, cx: &mut Context<Self>) {
         if self.scout_running {
             if !silent {
-                self.status = shared("可买筛分进行中…");
+                self.status = shared("规则筛选进行中…");
                 cx.notify();
             }
             return;
         }
         if self.treasure_scanning {
             if !silent {
-                self.status = shared("请等寻宝扫描结束后再筛可买");
+                self.status = shared("请等机会扫描结束后再运行规则筛选");
                 cx.notify();
             }
             return;
         }
         if self.treasure_hits.is_empty() {
             if !silent {
-                self.scout_summary = shared("请先「开始搜罗」生成寻宝榜，再筛可买。");
+                self.scout_summary = shared("请先运行低位策略生成候选，再执行规则筛选。");
                 self.status = shared("无可筛标的 · 先搜罗");
                 cx.notify();
             }
@@ -536,7 +509,7 @@ impl StockApp {
         self.scout_total = total;
         self.scout_picks.clear();
         self.scout_summary = shared(format!(
-            "对寻宝 Top {total} 做可买深评（位置+雷达+价位带）…"
+            "对机会 Top {total} 做规则深评（位置+雷达+观察区间）…"
         ));
         self.scout_source = shared(if self.work_mode {
             "Scoring…"
@@ -545,7 +518,7 @@ impl StockApp {
         });
         if !silent {
             self.left_tab = LeftTab::Treasure;
-            self.status = shared(format!("🎯 筛可买 0/{total}"));
+            self.status = shared(format!("规则筛选 0/{total}"));
         }
         cx.notify();
 
@@ -593,7 +566,7 @@ impl StockApp {
                         app.scout_picks.len()
                     ));
                     if done == total || done % 5 == 0 {
-                        app.status = shared(format!("🎯 筛可买 {done}/{total}"));
+                        app.status = shared(format!("规则筛选 {done}/{total}"));
                     }
                     cx.notify();
                 });
@@ -630,7 +603,7 @@ impl StockApp {
                         app.scout_picks.len()
                     ));
                     app.treasure_status = shared(format!(
-                        "② 可买清单就绪 · 可关注 {buy_n} · 观察 {} · 本地",
+                        "② 候选观察就绪 · 符合 {buy_n} · 等待 {} · 本地规则",
                         app.scout_picks.len().saturating_sub(buy_n)
                     ));
                     app.finish_scout_ux(cx);
@@ -679,9 +652,8 @@ impl StockApp {
                         ));
                     }
                     Err(e) => {
-                        app.scout_summary = shared(format!(
-                            "{local}\n\n（LLM 摘要失败：{e} · 已保留本地清单）"
-                        ));
+                        app.scout_summary =
+                            shared(format!("{local}\n\n（LLM 摘要失败：{e} · 已保留本地清单）"));
                         app.scout_source = shared("本地规则 · LLM 失败回退");
                         app.status = shared(format!(
                             "🎯 可关注 {buy_n} / 共 {} · 本地回退",
@@ -690,7 +662,7 @@ impl StockApp {
                     }
                 }
                 app.treasure_status = shared(format!(
-                    "② 可买清单就绪 · 可关注 {buy_n} · 观察 {} · {}",
+                    "② 候选观察就绪 · 符合 {buy_n} · 等待 {} · {}",
                     app.scout_picks.len().saturating_sub(buy_n),
                     app.scout_source
                 ));
@@ -710,7 +682,7 @@ impl StockApp {
             "已取消筛分 · 保留 {} 条中间结果",
             self.scout_picks.len()
         ));
-        self.status = shared("已取消可买筛分");
+        self.status = shared("已取消规则筛选");
         cx.notify();
     }
 
@@ -777,11 +749,7 @@ impl StockApp {
             .filter(|p| p.verdict == ScoutVerdict::BuyWatch)
             .count();
         // 没有「可关注」时别留空列表，自动显示观察。
-        if buy_n == 0 {
-            self.scout_only_buy_watch = false;
-        } else {
-            self.scout_only_buy_watch = true;
-        }
+        self.scout_only_buy_watch = buy_n != 0;
         self.treasure_list_expanded = false;
         if silent {
             self.status = shared(format!(
@@ -811,41 +779,13 @@ impl StockApp {
     // —— 决策日记 ——
 
     pub(crate) fn persist_journal(&self) {
-        let _ = storage::save_journal(&self.journal);
+        if let Err(error) = storage::save_journal(&self.journal) {
+            storage::record_storage_error(format!("保存复盘记录失败：{error:#}"));
+        }
     }
 
-    pub(crate) fn record_journal_entry(
-        &mut self,
-        code: String,
-        name: String,
-        kind: crate::data::journal::JournalKind,
-        price: Option<f64>,
-        target: Option<f64>,
-        note: String,
-        cx: &mut Context<Self>,
-    ) {
-        use crate::data::journal::{self, JournalEntry};
-        let entry = JournalEntry {
-            id: journal::new_id(),
-            code,
-            name,
-            kind,
-            price,
-            target,
-            note,
-            created_at: journal::now_stamp(),
-        };
-        self.journal.push(entry);
-        self.persist_journal();
-        cx.notify();
-    }
-
-    pub(crate) fn add_manual_journal_note(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        use crate::data::journal::JournalKind;
+    pub(crate) fn add_manual_journal_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::data::journal::{self, JournalEntry, JournalKind};
         let note = self.journal_note_input.read(cx).value().to_string();
         let note = note.trim().to_string();
         if note.is_empty() {
@@ -871,7 +811,20 @@ impl StockApp {
             .map(|s| s.last)
             .filter(|p| *p > 0.0)
             .or_else(|| self.candles.last().map(|c| c.close));
-        self.record_journal_entry(code, name, JournalKind::Manual, price, None, note, cx);
+        self.journal.push(JournalEntry {
+            id: journal::new_id(),
+            code,
+            name,
+            kind: JournalKind::Manual,
+            price,
+            target: None,
+            note,
+            created_at: journal::now_stamp(),
+            plan: None,
+            outcomes: Vec::new(),
+        });
+        self.persist_journal();
+        cx.notify();
         self.journal_note_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
         });
@@ -883,10 +836,28 @@ impl StockApp {
     }
 
     pub(crate) fn remove_journal_entry(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.journal_delete_confirm_id.as_deref() != Some(id) {
+            self.journal_delete_confirm_id = Some(id.to_string());
+            self.status = shared("再次点击“确认删除”以删除本地记录");
+            cx.notify();
+            return;
+        }
+        self.journal_delete_confirm_id = None;
         if self.journal.remove(id) {
             self.persist_journal();
             cx.notify();
         }
+    }
+
+    pub(crate) fn export_journal_local(&mut self, cx: &mut Context<Self>) {
+        match storage::export_journal(&self.journal) {
+            Ok(path) => self.status = shared(format!("日记已导出：{}", path.display())),
+            Err(error) => {
+                storage::record_storage_error(format!("导出日记失败：{error:#}"));
+                self.status = shared("日记导出失败，请查看数据状态");
+            }
+        }
+        cx.notify();
     }
 
     pub(crate) fn toggle_journal_filter_selected(&mut self, cx: &mut Context<Self>) {
@@ -923,6 +894,8 @@ impl StockApp {
                 target: Some(hit.target_price),
                 note,
                 created_at: journal::now_stamp(),
+                plan: None,
+                outcomes: Vec::new(),
             });
         }
         self.persist_journal();
@@ -940,7 +913,7 @@ impl StockApp {
         self.status = shared(if self.work_mode {
             format!("Find · {}", mode.label(true))
         } else {
-            format!("现在找 · {}", mode.label(false))
+            format!("机会 · {}", mode.label(false))
         });
         cx.notify();
     }
@@ -1044,10 +1017,8 @@ impl StockApp {
             };
 
             let codes: Vec<String> = universe.iter().map(|r| r.code.clone()).collect();
-            let names: HashMap<String, String> = universe
-                .into_iter()
-                .map(|r| (r.code, r.name))
-                .collect();
+            let names: HashMap<String, String> =
+                universe.into_iter().map(|r| (r.code, r.name)).collect();
 
             let quotes = smol::unblock(move || market::fetch_quotes(&codes)).await;
             let mut ticks = match quotes {
@@ -1121,9 +1092,7 @@ impl StockApp {
                         name_hint
                     };
                     let hit = match strategy_filter {
-                        Some(st) => {
-                            radar::evaluate_strategy(&code, &name, &candles, day_chg, st)
-                        }
+                        Some(st) => radar::evaluate_strategy(&code, &name, &candles, day_chg, st),
                         None => radar::evaluate(&code, &name, &candles, day_chg),
                     };
                     if let Some(h) = hit {
@@ -1169,7 +1138,9 @@ impl StockApp {
                 universe: format!("liquid/probe{total}/top{RADAR_RESULT_N}"),
                 hits: hits.clone(),
             };
-            let _ = storage::save_radar_cache(&cache);
+            if let Err(error) = storage::save_radar_cache(&cache) {
+                storage::record_storage_error(format!("保存扫描缓存失败：{error:#}"));
+            }
 
             let _ = this.update(cx, |app, cx| {
                 if app.radar_gen != scan_id {
@@ -1180,14 +1151,9 @@ impl StockApp {
                 app.radar_updated_at = updated_at.clone();
                 app.radar_done = total;
                 app.radar_summary = shared(summary);
-                app.radar_status = shared(format!(
-                    "完成 · {} 只 · {updated_at}",
-                    app.radar_hits.len()
-                ));
-                app.status = shared(format!(
-                    "📡 短线雷达完成 · {} 只",
-                    app.radar_hits.len()
-                ));
+                app.radar_status =
+                    shared(format!("完成 · {} 只 · {updated_at}", app.radar_hits.len()));
+                app.status = shared(format!("📡 短线雷达完成 · {} 只", app.radar_hits.len()));
                 if let Some(first) = app.radar_hits.first().cloned() {
                     app.select_radar_hit(&first, cx);
                 } else {
@@ -1204,10 +1170,7 @@ impl StockApp {
         }
         self.radar_gen = self.radar_gen.wrapping_add(1);
         self.radar_scanning = false;
-        self.radar_status = shared(format!(
-            "已取消 · 保留 {} 条",
-            self.radar_hits.len()
-        ));
+        self.radar_status = shared(format!("已取消 · 保留 {} 条", self.radar_hits.len()));
         self.status = shared("已取消短线雷达");
         cx.notify();
     }
@@ -1311,8 +1274,12 @@ impl StockApp {
         self.set_watch_tag(code, tag, cx);
     }
 
-    pub(crate) fn run_selected_backtest(&mut self, cx: &mut Context<Self>) {
-        use crate::data::backtest::{self, BacktestRule};
+    pub(crate) fn run_selected_backtest(
+        &mut self,
+        rule: crate::data::backtest::BacktestRule,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::data::backtest;
         if self.candles.len() < 60 {
             self.backtest_report = None;
             self.status = shared(if self.work_mode {
@@ -1323,8 +1290,9 @@ impl StockApp {
             cx.notify();
             return;
         }
-        // 默认跑「站上 MA20」；策略 Tab 可再扩
-        let report = backtest::run(&self.candles, BacktestRule::Ma20CrossUp, 10);
+        let currency = crate::domain::money::Currency::for_code(self.selected.as_ref())
+            .unwrap_or(crate::domain::money::Currency::Cny);
+        let report = backtest::run(&self.candles, rule, 10, currency);
         self.backtest_report = report;
         if let Some(ref r) = self.backtest_report {
             self.status = shared(r.summary_line(self.work_mode));
@@ -1337,16 +1305,23 @@ impl StockApp {
             return;
         }
         self.treasure_gen = self.treasure_gen.wrapping_add(1);
+        self.discovery_state.controller.cancel();
         self.treasure_scanning = false;
         self.treasure_status = shared(format!(
             "已取消 · 保留 {} 条中间结果",
             self.treasure_hits.len()
         ));
-        self.status = shared("寻宝扫描已取消");
+        self.status = shared("机会扫描已取消");
         cx.notify();
     }
 
-    pub(crate) fn add_symbol(&mut self, code: String, name: String, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn add_symbol(
+        &mut self,
+        code: String,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.symbols.iter().any(|s| s.code == code) {
             self.select_symbol(shared(code), cx);
             return;
@@ -1404,11 +1379,7 @@ impl StockApp {
         if let Some(ix) = self.status_bar_codes.iter().position(|c| c == code) {
             self.status_bar_codes.remove(ix);
             if self.status_bar_active == code {
-                self.status_bar_active = self
-                    .status_bar_codes
-                    .first()
-                    .cloned()
-                    .unwrap_or_default();
+                self.status_bar_active = self.status_bar_codes.first().cloned().unwrap_or_default();
             }
         }
         self.normalize_status_bar_state();
@@ -1508,11 +1479,7 @@ impl StockApp {
         }
         let cur = self.palette_index.min(n - 1);
         let next = if delta < 0 {
-            if cur == 0 {
-                n - 1
-            } else {
-                cur - 1
-            }
+            if cur == 0 { n - 1 } else { cur - 1 }
         } else {
             (cur + 1) % n
         };
@@ -1587,7 +1554,8 @@ impl StockApp {
     }
 
     pub(crate) fn current_symbol(&self) -> Option<&Symbol> {
-        self.symbols.iter().find(|s| s.code == self.selected.as_ref())
+        self.symbols
+            .iter()
+            .find(|s| s.code == self.selected.as_ref())
     }
-
 }

@@ -88,25 +88,24 @@ impl SeriesCache {
         let Some(key) = Self::kline_key(kind, code) else {
             return;
         };
-        if matches!(kind, ChartKind::DayK) {
-            if let Some(old) = self.klines.get(&key) {
-                if old.candles.len() > entry.candles.len() {
-                    let old_last = old.candles.last().map(|c| c.date.as_ref().to_string());
-                    let new_last = entry.candles.last().map(|c| c.date.as_ref().to_string());
-                    // Prefer longer history when the new fetch is a shorter window
-                    // and the series end date still matches (same session snapshot).
-                    if old_last == new_last {
-                        let mut merged = old.clone();
-                        if !entry.name.is_empty() {
-                            merged.name = entry.name;
-                        }
-                        if !entry.source.is_empty() {
-                            merged.source = entry.source;
-                        }
-                        self.put_klines(key, merged);
-                        return;
-                    }
+        if matches!(kind, ChartKind::DayK)
+            && let Some(old) = self.klines.get(&key)
+            && old.candles.len() > entry.candles.len()
+        {
+            let old_last = old.candles.last().map(|c| c.date.as_ref().to_string());
+            let new_last = entry.candles.last().map(|c| c.date.as_ref().to_string());
+            // Prefer longer history when the new fetch is a shorter window
+            // and the series end date still matches (same session snapshot).
+            if old_last == new_last {
+                let mut merged = old.clone();
+                if !entry.name.is_empty() {
+                    merged.name = entry.name;
                 }
+                if !entry.source.is_empty() {
+                    merged.source = entry.source;
+                }
+                self.put_klines(key, merged);
+                return;
             }
         }
         self.put_klines(key, entry);
@@ -182,9 +181,10 @@ mod tests {
             );
         }
         assert!(c.get_klines("d:000000").is_none());
-        assert!(c
-            .get_klines(&format!("d:{:06}", MAX_KLINE_ENTRIES + 4))
-            .is_some());
+        assert!(
+            c.get_klines(&format!("d:{:06}", MAX_KLINE_ENTRIES + 4))
+                .is_some()
+        );
     }
 
     #[test]
@@ -199,11 +199,13 @@ mod tests {
                 source: "t".into(),
             },
         );
-        assert!(c
-            .lookup_klines(ChartKind::MinuteK(MinutePeriod::M15), "600519", 30)
-            .is_none());
-        assert!(c
-            .lookup_klines(ChartKind::MinuteK(MinutePeriod::M5), "600519", 30)
-            .is_some());
+        assert!(
+            c.lookup_klines(ChartKind::MinuteK(MinutePeriod::M15), "600519", 30)
+                .is_none()
+        );
+        assert!(
+            c.lookup_klines(ChartKind::MinuteK(MinutePeriod::M5), "600519", 30)
+                .is_some()
+        );
     }
 }

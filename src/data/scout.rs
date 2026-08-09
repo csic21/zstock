@@ -37,9 +37,9 @@ pub enum ScoutVerdict {
 impl ScoutVerdict {
     pub fn label(self) -> &'static str {
         match self {
-            Self::BuyWatch => "可关注",
-            Self::Watch => "观察",
-            Self::Skip => "暂不",
+            Self::BuyWatch => "符合策略",
+            Self::Watch => "等待触发",
+            Self::Skip => "不符合",
         }
     }
 
@@ -210,9 +210,7 @@ fn score_pick(hit: &TreasureHit, snap: &AiSnapshot, levels: &ReferenceLevels) ->
     let buy_score = score.clamp(0.0, 100.0);
     let verdict = if hit.tags.contains(&TreasureTag::StRisk) {
         ScoutVerdict::Skip
-    } else if buy_score >= SCORE_BUY_WATCH
-        && !hit.tags.contains(&TreasureTag::UptrendPullback)
-    {
+    } else if buy_score >= SCORE_BUY_WATCH && !hit.tags.contains(&TreasureTag::UptrendPullback) {
         ScoutVerdict::BuyWatch
     } else if buy_score >= SCORE_WATCH {
         ScoutVerdict::Watch
@@ -221,30 +219,29 @@ fn score_pick(hit: &TreasureHit, snap: &AiSnapshot, levels: &ReferenceLevels) ->
     };
 
     // 上行中继即使分数够也最多「观察」
-    let verdict = if hit.tags.contains(&TreasureTag::UptrendPullback)
-        && verdict == ScoutVerdict::BuyWatch
-    {
-        ScoutVerdict::Watch
-    } else {
-        verdict
-    };
+    let verdict =
+        if hit.tags.contains(&TreasureTag::UptrendPullback) && verdict == ScoutVerdict::BuyWatch {
+            ScoutVerdict::Watch
+        } else {
+            verdict
+        };
 
     let tags: Vec<String> = hit.tags.iter().map(|t| t.label().to_string()).collect();
     let headline = match verdict {
         ScoutVerdict::BuyWatch => format!(
-            "可关注 · 建仓带 {} 元 · 寻宝{:.0}/可买{:.0}",
+            "符合策略 · 参考观察区间 {} 元 · 位置{:.0}/匹配{:.0}",
             format_band(levels.buy_low, levels.buy_high),
             hit.score,
             buy_score
         ),
         ScoutVerdict::Watch => format!(
-            "观察 · 建仓带 {} 元 · 寻宝{:.0}/可买{:.0}",
+            "等待触发 · 参考观察区间 {} 元 · 位置{:.0}/匹配{:.0}",
             format_band(levels.buy_low, levels.buy_high),
             hit.score,
             buy_score
         ),
         ScoutVerdict::Skip => format!(
-            "暂不 · 寻宝{:.0}/可买{:.0}{}",
+            "不符合 · 位置{:.0}/匹配{:.0}{}",
             hit.score,
             buy_score,
             risks.first().map(|r| format!(" · {r}")).unwrap_or_default()
@@ -307,8 +304,7 @@ pub fn finalize_results(mut picks: Vec<ScoutPick>) -> Vec<ScoutPick> {
 /// 本地整榜摘要（无 LLM 时使用）。列表已展示明细，摘要保持短可扫。
 pub fn local_summary(picks: &[ScoutPick]) -> String {
     if picks.is_empty() {
-        return "本轮未筛出可关注/观察：多为上行中继、ST 或过热。可换池重扫或放宽财务过滤。"
-            .into();
+        return "本轮未筛出可关注/观察：多为上行中继、ST 或过热。可换池重扫或放宽财务过滤。".into();
     }
     let buy_n = picks
         .iter()
@@ -521,7 +517,7 @@ mod tests {
                 headline: String::new(),
             },
         ];
-        let out = finalize_results(picks.drain(..).collect());
+        let out = finalize_results(std::mem::take(&mut picks));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].code, "1");
     }

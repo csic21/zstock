@@ -3,6 +3,7 @@
 pub mod ai;
 pub mod alerts;
 pub mod backtest;
+pub mod baidu;
 pub mod eastmoney;
 pub mod freshness;
 pub mod groups;

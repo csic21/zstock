@@ -1,0 +1,55 @@
+{
+  "schema": "a6-performance-evidence-v1",
+  "captured_at": "2026-08-09T16:52:14.754500+08:00",
+  "platform": {
+    "os": "macOS 26.5.2 (25F84)",
+    "architecture": "arm64",
+    "rustc": "1.93.1 (01f6ddf75 2026-02-11)"
+  },
+  "frame_run": {
+    "commit": "b74c968e2cc6189f53f01e29149d78c3751d1dc0",
+    "measurement": "GPUI frame duration around window.draw(cx) and window.present()",
+    "sample_count": 128,
+    "p95_ms": 8.1445,
+    "p99_ms": 8.757125,
+    "min_ms": 3.859709,
+    "max_ms": 15.55725,
+    "p95_budget_ms": 16.7,
+    "p99_budget_ms": 33.0,
+    "within_budget": true
+  },
+  "rss_navigation_run": {
+    "commit": "7019e755b5b379fb7347344d1af2e6fb685fe41b",
+    "settled_baseline_rss_bytes": 106921984,
+    "report": {
+      "generated_at": "2026-08-09T16:52:14.754500+08:00",
+      "validation_mode": true,
+      "cold_start_interactive_ms": 135.706917,
+      "cached_navigation_p95_ms": 39.3915,
+      "ui_build_p95_ms": 1.0055,
+      "ui_build_p99_ms": 1.2154170000000002,
+      "latest_rss_bytes": 90144768,
+      "one_hour_rss_growth_pct": -15.691081826539993,
+      "rss_growth_baseline_elapsed_secs": 60,
+      "rss_growth_window_secs": 3600,
+      "navigation_sample_count": 25,
+      "ui_build_sample_count": 608,
+      "validation_chart_interaction_count": 120,
+      "rss_sample_count": 62
+    },
+    "budgets": {
+      "cold_start_within_budget": true,
+      "navigation_within_budget": true,
+      "ui_build_within_budget": true,
+      "rss_within_budget": true
+    }
+  },
+  "commit_boundary": {
+    "changed_between_runs": [
+      "docs/validation/a6-performance.md",
+      "src/infrastructure/performance.rs",
+      "src/services/performance.rs"
+    ],
+    "render_path_changed": false
+  }
+}

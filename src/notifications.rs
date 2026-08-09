@@ -48,6 +48,5 @@ pub fn send(title: String, body: String) {
 fn escape_applescript(raw: &str) -> String {
     raw.replace('\\', "\\\\")
         .replace('"', "\\\"")
-        .replace('\r', " ")
-        .replace('\n', " ")
+        .replace(['\r', '\n'], " ")
 }

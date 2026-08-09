@@ -1,66 +1,30 @@
 //! Bottom analysis dock tabs.
 
-#![allow(unused_imports)]
-
-use std::collections::HashMap;
-use std::time::Duration;
+mod ai;
+mod indicators;
+mod overview;
+mod strategy;
 
 use gpui::{
-    canvas, div, point, px, size, App, AppContext, Bounds, Context, Entity, FocusHandle,
-    InteractiveElement, IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, Timer, Window, WindowBounds, WindowOptions,
-    prelude::FluentBuilder,
+    App, Context, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
+    Styled, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
+    ActiveTheme, Disableable, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
-    IconName,
-    input::{Input, InputEvent, InputState},
-    resizable::{h_resizable, resizable_panel, v_resizable, ResizableState},
-    v_flex, ActiveTheme, Disableable, PixelsExt, Root, Sizable, StyledExt, Theme, ThemeMode,
-    TitleBar, TITLE_BAR_HEIGHT,
+    input::Input,
+    v_flex,
 };
-use gpui_component::tooltip::Tooltip;
 
-use crate::chart::{
-    chart_layout, index_from_x, paint_chart, paint_sparkline, price_from_y, BollPaintData,
-    ChartPaintData, ChartStyle, MacdPaintData, MinutePaintData,
-};
-use crate::data::ai::{self, AiCliProvider, AiConfig, AiKind, AiTransport};
-use crate::data::levels;
-use crate::data::portfolio::{
-    self, format_money, format_shares, Portfolio, PortfolioSummary, TradeSide,
-};
-use crate::data::scout::{self, ScoutPick, ScoutVerdict, SCOUT_CANDIDATE_N};
-use crate::data::treasure::{self, fmt_dd, fmt_pos, TreasureHit, TREASURE_KLINE_LIMIT};
-use crate::data::universe::{self, FinFilter, TreasurePool, TREASURE_SCAN_CAP, TREASURE_TOP_N};
-use crate::data::{
-    indicators::{BollSeries, MaSeries, MacdSeries},
-    market, session, signals,
-};
-use crate::data::market::Sourced;
-use crate::data::session::{filter_codes_in_session, idle_delay_secs, open_markets_now, MarketSet};
-use crate::model::{
-    board_for_code, disguise_index, disguise_label, format_index, format_pct, format_price,
-    format_volume, normalize_code, shared, Candle, IndexSnap, MinutePeriod, MinuteSeries,
-    QuoteSnapshot, Symbol, TrendLine,
-};
-use crate::storage::{
-    self, clamp_quote_interval_secs, normalize_status_bar, AppConfig, ColorScheme, DockLayout,
-    WatchlistSort, STATUS_BAR_MAX_CODES,
-};
-use crate::update::{self, UpdateState};
+use crate::data::portfolio::{self, TradeSide, format_money, format_shares};
+use crate::data::signals;
+use crate::data::treasure::{fmt_dd, fmt_pos};
+use crate::model::{QuoteSnapshot, format_pct, format_price, format_volume};
 
-use super::super::{
-    AiCacheEntry, AiPanelState, AiSource, ChartKind, ChartRange, DetailTab, LeftTab, SettingsSection,
-    StockApp, CHART_MIN_VISIBLE, QUOTE_INTERVAL_ERR_MAX, QUOTE_INTERVAL_PRESETS, TITLE_NORMAL,
-    TITLE_WORK, TREASURE_SCAN_GAP,
-};
 use super::super::helpers::*;
 use super::super::labels::L;
-
-
+use super::super::{AiPanelState, ChartKind, DetailTab, LeftTab, StockApp};
 
 impl StockApp {
     pub(crate) fn render_detail_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -110,6 +74,15 @@ impl StockApp {
                         )
                     })
                     .child(div().flex_1())
+                    .child(
+                        Button::new("journal-export")
+                            .xsmall()
+                            .ghost()
+                            .label(if work { "Export" } else { "导出" })
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.export_journal_local(cx);
+                            })),
+                    )
                     .child(
                         div()
                             .max_w(px(360.))
@@ -187,10 +160,16 @@ impl StockApp {
         let last_price = sym.map(|s| s.last).unwrap_or(0.0);
         let change_pct = sym.map(|s| s.change_pct).unwrap_or(0.0);
         let volume = sym.map(|s| s.volume).unwrap_or(0);
+        let decision_card = self
+            .analysis_state
+            .decision_card
+            .clone()
+            .unwrap_or_else(|| self.decision_card_view_model());
 
         v_flex()
             .w_full()
             .gap_2()
+            .child(self.render_decision_card_summary(&decision_card, cx))
             // Row 1: score + title/chips + quick links
             .child(
                 h_flex()
@@ -292,7 +271,7 @@ impl StockApp {
                                         cx,
                                     ))
                                     .child(metric_chip(
-                                        if work { "Conf" } else { "置信" },
+                                        if work { "Data" } else { "数据完整度" },
                                         &format!("{:.0}%", s.confidence),
                                         cx,
                                     ))
@@ -309,20 +288,18 @@ impl StockApp {
                                     .into_any_element()
                             })
                             .when_some(signal.as_ref(), |col, s| {
-                                col.child(
-                                    h_flex().gap_1().flex_wrap().children(
-                                        s.reasons.iter().take(5).map(|r| {
-                                            div()
-                                                .px_1p5()
-                                                .py_0p5()
-                                                .rounded(cx.theme().radius)
-                                                .bg(cx.theme().muted.opacity(0.55))
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child((*r).to_string())
-                                        }),
-                                    ),
-                                )
+                                col.child(h_flex().gap_1().flex_wrap().children(
+                                    s.reasons.iter().take(5).map(|r| {
+                                        div()
+                                            .px_1p5()
+                                            .py_0p5()
+                                            .rounded(cx.theme().radius)
+                                            .bg(cx.theme().muted.opacity(0.55))
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child((*r).to_string())
+                                    }),
+                                ))
                             }),
                     )
                     .child(
@@ -395,11 +372,7 @@ impl StockApp {
                     .py_1p5()
                     .rounded(cx.theme().radius)
                     .bg(cx.theme().muted.opacity(0.35))
-                    .child(metric_chip(
-                        if work { "Base" } else { "昨收" },
-                        &prev,
-                        cx,
-                    ))
+                    .child(metric_chip(if work { "Base" } else { "昨收" }, &prev, cx))
                     .child(metric_chip(
                         if work { "O" } else { "开" },
                         &last_candle
@@ -562,49 +535,69 @@ impl StockApp {
             );
         } else {
             root = root.child(
-                v_flex().gap_1().children(entries.into_iter().enumerate().map(|(ix, e)| {
-                    let id = e.id.clone();
-                    h_flex()
-                        .gap_2()
-                        .items_start()
-                        .px_1()
-                        .py_0p5()
-                        .rounded(cx.theme().radius)
-                        .bg(cx.theme().background.opacity(0.35))
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_semibold()
-                                .text_color(cx.theme().accent)
-                                .child(e.kind.badge()),
-                        )
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .min_w_0()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().foreground)
-                                        .child(e.headline(work)),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(format!("{} · {}", e.created_at, e.note)),
-                                ),
-                        )
-                        .child(
-                            Button::new(("journal-rm", ix as u32))
-                                .xsmall()
-                                .ghost()
-                                .label("×")
-                                .on_click(cx.listener(move |this, _, _w, cx| {
-                                    this.remove_journal_entry(&id, cx);
-                                })),
-                        )
-                })),
+                v_flex()
+                    .gap_1()
+                    .children(entries.into_iter().enumerate().map(|(ix, e)| {
+                        let id = e.id.clone();
+                        let confirming = self.journal_delete_confirm_id.as_deref() == Some(&id);
+                        let plan_line = e.plan.as_ref().map(|plan| {
+                            format!(
+                                "计划 {:?} · 复盘 {} · 策略 {} · 结果 {}/3",
+                                plan.status,
+                                plan.review_on,
+                                plan.evidence.strategy_version,
+                                e.outcomes.len()
+                            )
+                        });
+                        h_flex()
+                            .gap_2()
+                            .items_start()
+                            .px_1()
+                            .py_0p5()
+                            .rounded(cx.theme().radius)
+                            .bg(cx.theme().background.opacity(0.35))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_semibold()
+                                    .text_color(cx.theme().accent)
+                                    .child(e.kind.badge()),
+                            )
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().foreground)
+                                            .child(e.headline(work)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!("{} · {}", e.created_at, e.note)),
+                                    )
+                                    .when_some(plan_line, |column, line| {
+                                        column.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().warning)
+                                                .child(line),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                Button::new(("journal-rm", ix as u32))
+                                    .xsmall()
+                                    .ghost()
+                                    .label(if confirming { "确认删除" } else { "×" })
+                                    .on_click(cx.listener(move |this, _, _w, cx| {
+                                        this.remove_journal_entry(&id, cx);
+                                    })),
+                            )
+                    })),
             );
         }
 
@@ -692,11 +685,7 @@ impl StockApp {
                         "{}{}",
                         target_text(alert.target_price),
                         if alert.triggered {
-                            if work {
-                                " ✓"
-                            } else {
-                                " 已触发"
-                            }
+                            if work { " ✓" } else { " 已触发" }
                         } else {
                             ""
                         }
@@ -711,11 +700,7 @@ impl StockApp {
                         "{}{}",
                         target_text(sell),
                         if alert.sell_triggered {
-                            if work {
-                                " ✓"
-                            } else {
-                                " 已触发"
-                            }
+                            if work { " ✓" } else { " 已触发" }
                         } else {
                             ""
                         }
@@ -730,11 +715,7 @@ impl StockApp {
                         "{}{}",
                         target_text(stop),
                         if alert.stop_triggered {
-                            if work {
-                                " ✓"
-                            } else {
-                                " 已触发"
-                            }
+                            if work { " ✓" } else { " 已触发" }
                         } else {
                             ""
                         }
@@ -811,7 +792,7 @@ impl StockApp {
                 Button::new("alert-set-recommended")
                     .xsmall()
                     .ghost()
-                    .label(if work { "Ref buy" } else { "建议买" })
+                    .label(if work { "Watch ref" } else { "参考观察价" })
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.set_recommended_buy_alert(window, cx);
                     })),
@@ -822,7 +803,7 @@ impl StockApp {
                 Button::new("alert-set-rec-sell")
                     .xsmall()
                     .ghost()
-                    .label(if work { "Ref TP" } else { "建议卖" })
+                    .label(if work { "Target ref" } else { "目标价" })
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.set_sell_alert_from_levels(window, cx);
                     })),
@@ -836,17 +817,15 @@ impl StockApp {
                 .child(if let Some(price) = recommended {
                     format!(
                         "{} {} · {} {}",
-                        if work { "Buy ref" } else { "建议买" },
+                        if work { "Watch ref" } else { "参考观察价" },
                         target_text(price),
-                        if work { "TP ref" } else { "建议卖" },
-                        rec_sell
-                            .map(|p| target_text(p))
-                            .unwrap_or_else(|| "—".into())
+                        if work { "Target ref" } else { "目标价" },
+                        rec_sell.map(target_text).unwrap_or_else(|| "—".into())
                     )
                 } else if work {
                     "Load daily bars for technical reference levels".into()
                 } else {
-                    "加载日 K 后可用建议买/卖价；输入框价格对三个按钮共用".into()
+                    "加载日 K 后可用参考观察价与目标价；输入框价格对三个按钮共用".into()
                 }),
         );
 
@@ -882,7 +861,11 @@ impl StockApp {
         } else {
             (
                 "—".into(),
-                if work { "n/a".into() } else { "无数据".into() },
+                if work {
+                    "n/a".into()
+                } else {
+                    "无数据".into()
+                },
                 "—".into(),
                 cx.theme().muted_foreground,
             )
@@ -937,7 +920,7 @@ impl StockApp {
                     .child(if work {
                         format!("conf {conf_txt}")
                     } else {
-                        format!("置信 {conf_txt}")
+                        format!("数据完整度 {conf_txt}")
                     }),
             )
     }
@@ -956,372 +939,6 @@ impl StockApp {
         }
     }
 
-    /// 指标 Tab：MA / MACD / BOLL 三卡并排，上下文相关（分时隐藏无意义读数）。
-    pub(crate) fn render_indicators_detail(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let work = self.work_mode;
-        let candles_match = self
-            .candles_code
-            .as_ref()
-            .is_some_and(|c| c == self.selected.as_ref());
-        let kline_ok = candles_match && !matches!(self.chart_kind, ChartKind::Intraday);
-
-        h_flex()
-            .w_full()
-            .gap_4()
-            .items_start()
-            .child(
-                v_flex()
-                    .gap_1()
-                    .min_w(px(140.))
-                    .flex_1()
-                    .child(section_title(if work { "Moving avg" } else { "均线" }, cx))
-                    .child(detail_row(
-                        if work { "L1" } else { "MA5" },
-                        &if kline_ok {
-                            self.ma
-                                .ma5
-                                .last()
-                                .and_then(|x| *x)
-                                .map(|v| self.format_value(v))
-                                .unwrap_or_else(|| "--".into())
-                        } else {
-                            "--".into()
-                        },
-                        cx,
-                    ))
-                    .child(detail_row(
-                        if work { "L2" } else { "MA10" },
-                        &if kline_ok {
-                            self.ma
-                                .ma10
-                                .last()
-                                .and_then(|x| *x)
-                                .map(|v| self.format_value(v))
-                                .unwrap_or_else(|| "--".into())
-                        } else {
-                            "--".into()
-                        },
-                        cx,
-                    ))
-                    .child(detail_row(
-                        if work { "L3" } else { "MA20" },
-                        &if kline_ok {
-                            self.ma
-                                .ma20
-                                .last()
-                                .and_then(|x| *x)
-                                .map(|v| self.format_value(v))
-                                .unwrap_or_else(|| "--".into())
-                        } else {
-                            "--".into()
-                        },
-                        cx,
-                    ))
-                    .child(detail_row(
-                        if work { "L4" } else { "MA60" },
-                        &if kline_ok {
-                            self.ma
-                                .ma60
-                                .last()
-                                .and_then(|x| *x)
-                                .map(|v| self.format_value(v))
-                                .unwrap_or_else(|| "--".into())
-                        } else {
-                            "--".into()
-                        },
-                        cx,
-                    ))
-                    .when(!kline_ok, |col| {
-                        col.child(
-                            div()
-                                .mt_1()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(if work {
-                                    "Switch to daily/minute K for MA."
-                                } else {
-                                    "切换到日 K / 分钟 K 查看均线。"
-                                }),
-                        )
-                    }),
-            )
-            .child(
-                v_flex()
-                    .gap_1()
-                    .min_w(px(140.))
-                    .flex_1()
-                    .child(self.render_macd_detail_col(cx)),
-            )
-            .child(
-                v_flex()
-                    .gap_1()
-                    .min_w(px(140.))
-                    .flex_1()
-                    .child(self.render_boll_detail_col(cx)),
-            )
-    }
-
-    pub(crate) fn render_macd_detail_col(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let candles_match = self
-            .candles_code
-            .as_ref()
-            .is_some_and(|c| c == self.selected.as_ref())
-            && !matches!(self.chart_kind, ChartKind::Intraday);
-        let (dif, dea, hist) = self.macd.value_at(self.macd.dif.len().saturating_sub(1));
-        let fmt = |v: Option<f64>| {
-            v.map(|n| format!("{n:.3}"))
-                .unwrap_or_else(|| "--".into())
-        };
-        v_flex()
-            .gap_1()
-            .min_w(px(120.))
-            .child(
-                div()
-                    .text_xs()
-                    .font_semibold()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(if self.work_mode { "MACD" } else { "MACD 12/26/9" }),
-            )
-            .child(detail_row(
-                if self.work_mode { "DIF" } else { "DIF" },
-                &if candles_match { fmt(dif) } else { "--".into() },
-                cx,
-            ))
-            .child(detail_row(
-                if self.work_mode { "DEA" } else { "DEA" },
-                &if candles_match { fmt(dea) } else { "--".into() },
-                cx,
-            ))
-            .child(detail_row(
-                if self.work_mode { "HIST" } else { "柱" },
-                &if candles_match { fmt(hist) } else { "--".into() },
-                cx,
-            ))
-            .child(detail_row(
-                if self.work_mode { "Mode" } else { "显示" },
-                if self.show_macd { "开" } else { "关" },
-                cx,
-            ))
-    }
-
-    pub(crate) fn render_boll_detail_col(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let candles_match = self
-            .candles_code
-            .as_ref()
-            .is_some_and(|c| c == self.selected.as_ref())
-            && !matches!(self.chart_kind, ChartKind::Intraday);
-        let (up, mid, low) = self.boll.value_at(self.boll.mid.len().saturating_sub(1));
-        let fmt = |v: Option<f64>| {
-            v.map(|n| self.format_value(n))
-                .unwrap_or_else(|| "--".into())
-        };
-        v_flex()
-            .gap_1()
-            .min_w(px(120.))
-            .child(
-                div()
-                    .text_xs()
-                    .font_semibold()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(if self.work_mode { "BOLL" } else { "BOLL 20·2σ" }),
-            )
-            .child(detail_row(
-                "上轨",
-                &if candles_match { fmt(up) } else { "--".into() },
-                cx,
-            ))
-            .child(detail_row(
-                "中轨",
-                &if candles_match { fmt(mid) } else { "--".into() },
-                cx,
-            ))
-            .child(detail_row(
-                "下轨",
-                &if candles_match { fmt(low) } else { "--".into() },
-                cx,
-            ))
-            .child(detail_row(
-                if self.work_mode { "Mode" } else { "显示" },
-                if self.show_boll { "开" } else { "关" },
-                cx,
-            ))
-    }
-
-    pub(crate) fn render_signal_detail_col(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let work = self.work_mode;
-        let signal = self.current_signal();
-
-        let mut root = h_flex().w_full().gap_4().items_start();
-
-        if let Some(s) = signal {
-            let fmt = |v: Option<f64>, suffix: &str| {
-                v.map(|n| format!("{n:.1}{suffix}"))
-                    .unwrap_or_else(|| "—".into())
-            };
-            let regime = if work {
-                s.regime.service_state()
-            } else {
-                s.regime.label()
-            };
-            root = root
-                .child(self.render_score_badge(Some(&s), cx))
-                .child(
-                    v_flex()
-                        .gap_1()
-                        .min_w(px(220.))
-                        .flex_1()
-                        .child(section_title(
-                            if work {
-                                "Factors"
-                            } else {
-                                "策略雷达 · 多因子"
-                            },
-                            cx,
-                        ))
-                        .child(detail_kv(
-                            if work { "Composite" } else { "综合" },
-                            &format!("{:.0}/100 · {regime}", s.score),
-                            cx,
-                        ))
-                        .child(detail_kv("RSI14", &fmt(s.rsi14, ""), cx))
-                        .child(detail_kv(
-                            if work { "Mom 20d" } else { "20日动量" },
-                            &fmt(s.momentum_20_pct, "%"),
-                            cx,
-                        ))
-                        .child(detail_kv(
-                            if work { "Vol 20d ann" } else { "20日年化波动" },
-                            &fmt(s.volatility_20_ann_pct, "%"),
-                            cx,
-                        ))
-                        .child(detail_kv(
-                            if work { "Max DD 1Y" } else { "1Y最大回撤" },
-                            &fmt(s.max_drawdown_1y_pct, "%"),
-                            cx,
-                        ))
-                        .child(detail_kv(
-                            if work { "Vol ratio" } else { "量能比" },
-                            &fmt(s.volume_ratio_20, "x"),
-                            cx,
-                        ))
-                        .child(detail_kv(
-                            if work { "Confidence" } else { "数据置信" },
-                            &format!("{:.0}%", s.confidence),
-                            cx,
-                        )),
-                )
-                .child(
-                    v_flex()
-                        .gap_1()
-                        .min_w(px(200.))
-                        .flex_1()
-                        .child(section_title(if work { "Rationale" } else { "依据" }, cx))
-                        .children(s.reasons.iter().map(|r| {
-                            div()
-                                .px_2()
-                                .py_1()
-                                .rounded(cx.theme().radius)
-                                .bg(cx.theme().muted.opacity(0.45))
-                                .text_xs()
-                                .text_color(cx.theme().foreground)
-                                .child((*r).to_string())
-                        }))
-                        .child(
-                            div()
-                                .mt_2()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground.opacity(0.8))
-                                .child(if work {
-                                    "Explainable snapshot, not a trade instruction."
-                                } else {
-                                    "可解释技术快照，仅供学习研究，不构成投资建议。"
-                                }),
-                        ),
-                );
-        } else {
-            root = root.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(if work {
-                        "Need ≥20 valid daily bars."
-                    } else {
-                        "至少需要 20 根有效日 K 数据。"
-                    }),
-            );
-        }
-
-        // 轻量回测：当前标的上跑「站上 MA20」规则
-        root = root.child(
-            v_flex()
-                .gap_1()
-                .min_w(px(200.))
-                .p_2()
-                .rounded(cx.theme().radius)
-                .border_1()
-                .border_color(cx.theme().border)
-                .bg(cx.theme().muted.opacity(0.28))
-                .child(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_semibold()
-                                .text_color(cx.theme().foreground)
-                                .child(if work {
-                                    "Light backtest"
-                                } else {
-                                    "轻量回测"
-                                }),
-                        )
-                        .child(div().flex_1())
-                        .child(
-                            Button::new("bt-run")
-                                .xsmall()
-                                .primary()
-                                .label(if work { "Run MA20" } else { "跑 MA20" })
-                                .tooltip(if work {
-                                    "Cross above MA20 · hold 10 sessions"
-                                } else {
-                                    "规则：站上 MA20，持有 10 个交易日"
-                                })
-                                .on_click(cx.listener(|this, _, _w, cx| {
-                                    this.run_selected_backtest(cx);
-                                })),
-                        ),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(
-                            self.backtest_report
-                                .as_ref()
-                                .map(|r| r.summary_line(work))
-                                .unwrap_or_else(|| {
-                                    if work {
-                                        "Run on current daily series".into()
-                                    } else {
-                                        "对当前日 K 样本做可解释统计，非预测".into()
-                                    }
-                                }),
-                        ),
-                )
-                .when_some(self.backtest_report.as_ref(), |col, r| {
-                    col.child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground.opacity(0.85))
-                            .child(r.notes.first().cloned().unwrap_or_default()),
-                    )
-                }),
-        );
-
-        root
-    }
-
     pub(crate) fn render_portfolio_detail_col(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let work = self.work_mode;
         let code = self.selected.to_string();
@@ -1334,9 +951,10 @@ impl StockApp {
             .filter(|p| *p > 0.0)
             .or_else(|| self.candles.last().map(|c| c.close))
             .unwrap_or(0.0);
-        let mark = pos.as_ref().filter(|p| p.shares > 1e-9).map(|p| {
-            portfolio::PositionMark::from_position(p.clone(), last, 0.0)
-        });
+        let mark = pos
+            .as_ref()
+            .filter(|p| p.shares > 1e-9)
+            .map(|p| portfolio::PositionMark::from_position(p.clone(), last, 0.0));
         let trades: Vec<_> = self
             .portfolio
             .trades_for(&code)
@@ -1358,66 +976,58 @@ impl StockApp {
         let busy = shown && loading;
         let has_signal = self.current_signal().is_some();
 
-        let mut col = v_flex()
-            .gap_2()
-            .w_full()
-            .max_w(px(780.))
-            .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .child(section_title(
-                        if work {
-                            "Position"
-                        } else {
-                            "持仓与买卖建议"
-                        },
-                        cx,
-                    ))
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .child(
-                                Button::new("pd-buy")
-                                    .xsmall()
-                                    .primary()
-                                    .label(if work { "Buy" } else { "买入" })
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_trade_form(TradeSide::Buy, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("pd-sell")
-                                    .xsmall()
-                                    .ghost()
-                                    .label(if work { "Sell" } else { "卖出" })
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_trade_form(TradeSide::Sell, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("pd-ai")
-                                    .xsmall()
-                                    .when(!busy && has_signal, |b| b.primary())
-                                    .when(busy || !has_signal, |b| b.ghost())
-                                    .label(if busy {
-                                        if work {
-                                            "Working…"
-                                        } else {
-                                            "分析中…"
-                                        }
-                                    } else if work {
-                                        "Advice"
-                                    } else {
-                                        "AI 建议"
-                                    })
-                                    .disabled(busy || !has_signal)
-                                    .on_click(cx.listener(|this, _, _w, cx| {
-                                        this.request_portfolio_ai(cx);
-                                    })),
-                            ),
-                    ),
-            );
+        let mut col = v_flex().gap_2().w_full().max_w(px(780.)).child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .child(section_title(
+                    if work {
+                        "Position"
+                    } else {
+                        "持仓与买卖建议"
+                    },
+                    cx,
+                ))
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Button::new("pd-buy")
+                                .xsmall()
+                                .primary()
+                                .label(if work { "Buy" } else { "买入" })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_trade_form(TradeSide::Buy, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("pd-sell")
+                                .xsmall()
+                                .ghost()
+                                .label(if work { "Sell" } else { "卖出" })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_trade_form(TradeSide::Sell, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("pd-ai")
+                                .xsmall()
+                                .when(!busy && has_signal, |b| b.primary())
+                                .when(busy || !has_signal, |b| b.ghost())
+                                .label(if busy {
+                                    if work { "Working…" } else { "分析中…" }
+                                } else if work {
+                                    "Advice"
+                                } else {
+                                    "AI 建议"
+                                })
+                                .disabled(busy || !has_signal)
+                                .on_click(cx.listener(|this, _, _w, cx| {
+                                    this.request_portfolio_ai(cx);
+                                })),
+                        ),
+                ),
+        );
 
         // 持仓数字
         if let Some(m) = &mark {
@@ -1462,17 +1072,13 @@ impl StockApp {
                                     .text_color(cx.theme().muted_foreground)
                                     .child(if work { "P&L" } else { "浮盈亏" }),
                             )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .text_color(pnl_c)
-                                    .child(format!(
-                                        "{} ({})",
-                                        format_money(m.unrealized_pnl),
-                                        format_pct(m.unrealized_pnl_pct)
-                                    )),
-                            ),
+                            .child(div().text_sm().font_semibold().text_color(pnl_c).child(
+                                format!(
+                                    "{} ({})",
+                                    format_money(m.unrealized_pnl),
+                                    format_pct(m.unrealized_pnl_pct)
+                                ),
+                            )),
                     ),
             );
             if m.position.realized_pnl.abs() > 1e-6 {
@@ -1623,10 +1229,7 @@ impl StockApp {
             h_flex()
                 .items_center()
                 .justify_between()
-                .child(section_title(
-                    if work { "Trades" } else { "成交记录" },
-                    cx,
-                ))
+                .child(section_title(if work { "Trades" } else { "成交记录" }, cx))
                 .child(
                     Button::new("pd-undo")
                         .xsmall()
@@ -1682,32 +1285,29 @@ impl StockApp {
                         t.time
                     )
                 };
-                col = col.child(
-                    h_flex()
-                        .id(("trade-row", ix))
-                        .gap_2()
-                        .items_center()
-                        .px_1()
-                        .py_0p5()
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_semibold()
-                                .text_color(side_c)
-                                .child(if work {
+                col =
+                    col.child(
+                        h_flex()
+                            .id(("trade-row", ix))
+                            .gap_2()
+                            .items_center()
+                            .px_1()
+                            .py_0p5()
+                            .child(div().text_xs().font_semibold().text_color(side_c).child(
+                                if work {
                                     t.side.label_work()
                                 } else {
                                     t.side.label()
-                                }),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_xs()
-                                .text_color(cx.theme().foreground)
-                                .child(line),
-                        ),
-                );
+                                },
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_xs()
+                                    .text_color(cx.theme().foreground)
+                                    .child(line),
+                            ),
+                    );
                 if !t.note.is_empty() && !work {
                     col = col.child(
                         div()
@@ -1740,11 +1340,7 @@ impl StockApp {
                             .when(self.portfolio.track_cash, |b| b.primary())
                             .when(!self.portfolio.track_cash, |b| b.ghost())
                             .label(if self.portfolio.track_cash {
-                                if work {
-                                    "On"
-                                } else {
-                                    "约束开"
-                                }
+                                if work { "On" } else { "约束开" }
                             } else if work {
                                 "Off"
                             } else {
@@ -1754,7 +1350,11 @@ impl StockApp {
                                 this.toggle_track_cash(cx);
                             })),
                     )
-                    .child(div().flex_1().child(Input::new(&self.portfolio_cash_input).small()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Input::new(&self.portfolio_cash_input).small()),
+                    )
                     .child(
                         Button::new("pd-set-cash")
                             .xsmall()
@@ -1789,144 +1389,6 @@ impl StockApp {
         col
     }
 
-    pub(crate) fn render_ai_detail_col(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let work = self.work_mode;
-        let current = self.ai_current_key();
-        let shown = current.is_some() && self.ai_key.as_deref() == current.as_deref();
-        let loading = matches!(&self.ai_panel, AiPanelState::Loading { .. });
-        // 只有「正在分析当前标的」时才禁用按钮；其他标的可并行触发。
-        let busy = shown && loading;
-        let has_signal = self.current_signal().is_some();
-
-        let mut col = v_flex()
-            .gap_2()
-            .w_full()
-            .max_w(px(720.))
-            .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .child(section_title(if work { "AI Brief" } else { "AI 点评" }, cx))
-                    .child(
-                        Button::new("ai-request-btn")
-                            .xsmall()
-                            .when(!busy && has_signal, |b| b.primary())
-                            .when(busy || !has_signal, |b| b.ghost())
-                            .label(if busy {
-                                if work { "Working…" } else { "分析中…" }
-                            } else if work {
-                                "Generate"
-                            } else {
-                                "生成点评"
-                            })
-                            .disabled(busy || !has_signal)
-                            .on_click(cx.listener(|this, _, _w, cx| {
-                                this.request_ai_commentary(cx);
-                            })),
-                    ),
-            );
-
-        if shown {
-            match &self.ai_panel {
-                AiPanelState::Loading { text } => {
-                    col = col.child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().foreground)
-                            .child(text.clone()),
-                    );
-                    col = col.child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(if work {
-                                "LLM brief in progress…"
-                            } else {
-                                "正在请求 LLM 点评…"
-                            }),
-                    );
-                }
-                AiPanelState::Ready { text, source, note } => {
-                    let source_color = if source.is_llm() {
-                        cx.theme().accent
-                    } else {
-                        cx.theme().muted_foreground
-                    };
-                    col = col.child(
-                        h_flex()
-                            .gap_1()
-                            .items_center()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_semibold()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(if work { "Source" } else { "来源" }),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_semibold()
-                                    .text_color(source_color)
-                                    .child(source.label(work)),
-                            ),
-                    );
-                    col = col.child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().foreground)
-                            .child(text.clone()),
-                    );
-                    if let Some(note) = note {
-                        col = col.child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground.opacity(0.9))
-                                .child(note.clone()),
-                        );
-                    }
-                }
-                AiPanelState::Idle => {
-                    col = col.child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(if work { "Not generated." } else { "尚未生成。" }),
-                    );
-                }
-            }
-        } else if !has_signal {
-            col = col.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("至少需要 20 根有效日K数据。"),
-            );
-        } else {
-            col = col.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(if work {
-                        "Click Generate for an AI brief."
-                    } else {
-                        "点击「生成点评」查看 AI 分析。"
-                    }),
-            );
-        }
-
-        col.child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground.opacity(0.75))
-                .child(if work {
-                    "For reference only, not investment advice."
-                } else {
-                    "仅供学习研究，不构成投资建议。"
-                }),
-        )
-    }
-
     pub(crate) fn render_treasure_detail_col(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let work = self.work_mode;
         let hit = self
@@ -1938,14 +1400,18 @@ impl StockApp {
         // 参考建仓/减仓带：用 K 线 apply 时缓存的结果（与选中标的匹配时）。
         let levels = self.current_levels();
 
-        let mut col = v_flex().gap_2().w_full().max_w(px(640.)).child(section_title(
-            if work {
-                "Scout · levels"
-            } else {
-                "寻宝鼠 · 搜罗价位"
-            },
-            cx,
-        ));
+        let mut col = v_flex()
+            .gap_2()
+            .w_full()
+            .max_w(px(640.))
+            .child(section_title(
+                if work {
+                    "Scout · levels"
+                } else {
+                    "低位策略 · 参考区间"
+                },
+                cx,
+            ));
 
         if let Some(lv) = levels.as_ref() {
             col = col
@@ -1980,11 +1446,7 @@ impl StockApp {
                     cx,
                 ));
             if let Some(atr) = lv.atr14 {
-                col = col.child(detail_kv(
-                    "ATR14",
-                    &format!("{} 元", format_price(atr)),
-                    cx,
-                ));
+                col = col.child(detail_kv("ATR14", &format!("{} 元", format_price(atr)), cx));
             }
             if !lv.notes.is_empty() {
                 col = col.child(detail_kv(
@@ -2074,14 +1536,14 @@ impl StockApp {
                         .child(if work {
                             "Not in latest scan. Open the left Scan tab."
                         } else {
-                            "当前标的不在最近寻宝结果中。可打开左侧「寻宝」扫描；加载日 K 后也会显示参考价位。"
+                            "当前标的不在最近机会结果中。可打开左侧「机会」扫描；加载日 K 后也会显示参考区间。"
                         }),
                 )
                 .child(
                     Button::new("open-treasure-tab")
                         .xsmall()
                         .ghost()
-                        .label(if work { "Open Scan" } else { "打开寻宝" })
+                        .label(if work { "Open Scan" } else { "打开机会" })
                         .on_click(cx.listener(|this, _, _w, cx| {
                             this.set_left_tab(LeftTab::Treasure, cx);
                         })),
@@ -2093,11 +1555,10 @@ impl StockApp {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(
-                        "当前不在寻宝榜内，仍可根据日 K 显示技术参考价位。左侧「寻宝」可扩大搜罗。仅供学习，非投资建议。",
+                        "当前不在机会候选内，仍可根据日 K 显示技术参考区间。左侧「机会」可扩大扫描。仅供学习，非投资建议。",
                     ),
             );
         }
         col
     }
-
 }

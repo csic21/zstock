@@ -1,7 +1,7 @@
 //! macOS trackpad pinch (magnify) → channel, since GPUI 0.2 does not forward NSEventTypeMagnify.
 
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::OnceLock;
+use std::sync::mpsc::{self, Receiver, Sender};
 
 use block::ConcreteBlock;
 use cocoa::appkit::{NSEvent, NSEventMask, NSEventType};
@@ -28,10 +28,10 @@ fn install_monitor() {
             }
             // Relative scale change for this sample of the gesture.
             let mag: f64 = NSEvent::magnification(event);
-            if mag.abs() > 1e-6 {
-                if let Some(tx) = PINCH_TX.get() {
-                    let _ = tx.send(mag as f32);
-                }
+            if mag.abs() > 1e-6
+                && let Some(tx) = PINCH_TX.get()
+            {
+                let _ = tx.send(mag as f32);
             }
             event
         });

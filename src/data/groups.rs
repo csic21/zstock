@@ -61,10 +61,6 @@ impl WatchTag {
     pub fn all_filters() -> [Self; 4] {
         [Self::None, Self::Long, Self::Short, Self::Watch]
     }
-
-    pub fn assignable() -> [Self; 3] {
-        [Self::Long, Self::Short, Self::Watch]
-    }
 }
 
 /// 左侧「现在找」主模式。
@@ -108,15 +104,6 @@ impl FindMode {
             (Self::Long, false) => "历史低位 · 估值观察 · 建仓带",
             (Self::Short, true) => "Momentum radar · pullback / breakout",
             (Self::Short, false) => "强势回踩 · 放量突破 · 超跌反弹",
-        }
-    }
-
-    pub fn cta(self, work: bool) -> &'static str {
-        match (self, work) {
-            (Self::Long, true) => "Scan longs",
-            (Self::Long, false) => "找长线",
-            (Self::Short, true) => "Scan shorts",
-            (Self::Short, false) => "找短线",
         }
     }
 }

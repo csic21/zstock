@@ -46,33 +46,6 @@ impl ReferenceLevels {
     pub fn sell_band_text(&self) -> String {
         format!("{} – {}", fmt_px(self.sell_low), fmt_px(self.sell_high))
     }
-
-    /// 本地规则短文（寻宝搜罗 / AI 回退共用）。
-    pub fn local_brief(&self) -> String {
-        let mut lines = Vec::with_capacity(6);
-        lines.push(format!(
-            "【现价】{} 元",
-            fmt_px(self.close)
-        ));
-        lines.push(format!(
-            "【参考建仓带】{} 元（偏支撑 / 分批）",
-            self.buy_band_text()
-        ));
-        lines.push(format!(
-            "【参考减仓带】{} 元（偏阻力 / 反弹观察）",
-            self.sell_band_text()
-        ));
-        if let Some(atr) = self.atr14 {
-            lines.push(format!("【波动】ATR14 ≈ {} 元", fmt_px(atr)));
-        }
-        if !self.notes.is_empty() {
-            lines.push(format!("【依据】{}", self.notes.join("；")));
-        }
-        lines.push(
-            "价位由本地技术指标推算，仅供学习研究，不构成任何投资建议。".into(),
-        );
-        lines.join("\n")
-    }
 }
 
 /// 从日 K 推算参考建仓 / 减仓价位带。
@@ -179,21 +152,22 @@ fn buy_band(
     let fallback_hi = atr14.map(|a| close - 0.3 * a).unwrap_or(close * 0.99);
     let fallback_lo = atr14.map(|a| close - 1.5 * a).unwrap_or(close * 0.94);
 
-    let near = supports
-        .iter()
-        .find(|(v, _)| *v < close * 0.999)
-        .copied();
+    let near = supports.iter().find(|(v, _)| *v < close * 0.999).copied();
     let deeper = supports
         .iter()
         .filter(|(v, _)| near.is_none_or(|(n, _)| *v < n * 0.995))
         .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
         .copied();
 
-    let buy_high = near.map(|(v, label)| {
-        notes.push(format!("建仓上沿参考{label}"));
-        // 允许略高于支撑一点作为「可接受回踩」
-        atr14.map(|a| (v + 0.25 * a).min(close)).unwrap_or(v.min(close))
-    }).unwrap_or(fallback_hi.min(close));
+    let buy_high = near
+        .map(|(v, label)| {
+            notes.push(format!("建仓上沿参考{label}"));
+            // 允许略高于支撑一点作为「可接受回踩」
+            atr14
+                .map(|a| (v + 0.25 * a).min(close))
+                .unwrap_or(v.min(close))
+        })
+        .unwrap_or(fallback_hi.min(close));
 
     let buy_low = deeper
         .map(|(v, label)| {
@@ -219,10 +193,7 @@ fn sell_band(
     let fallback_lo = atr14.map(|a| close + 0.5 * a).unwrap_or(close * 1.03);
     let fallback_hi = atr14.map(|a| close + 1.5 * a).unwrap_or(close * 1.08);
 
-    let near = resists
-        .iter()
-        .find(|(v, _)| *v > close * 1.001)
-        .copied();
+    let near = resists.iter().find(|(v, _)| *v > close * 1.001).copied();
     let farther = resists
         .iter()
         .filter(|(v, _)| near.is_none_or(|(n, _)| *v > n * 1.005))
@@ -232,7 +203,9 @@ fn sell_band(
     let sell_low = near
         .map(|(v, label)| {
             notes.push(format!("减仓下沿参考{label}"));
-            atr14.map(|a| (v - 0.2 * a).max(close)).unwrap_or(v.max(close))
+            atr14
+                .map(|a| (v - 0.2 * a).max(close))
+                .unwrap_or(v.max(close))
         })
         .unwrap_or(fallback_lo.max(close));
 
@@ -305,7 +278,8 @@ fn atr(candles: &[Candle], period: usize) -> Option<f64> {
     for i in 1..candles.len() {
         let c = &candles[i];
         let p = &candles[i - 1];
-        if !(c.high.is_finite() && c.low.is_finite() && c.close.is_finite() && p.close.is_finite()) {
+        if !(c.high.is_finite() && c.low.is_finite() && c.close.is_finite() && p.close.is_finite())
+        {
             continue;
         }
         let tr = (c.high - c.low)
@@ -364,9 +338,6 @@ mod tests {
         assert!(lv.sell_low <= lv.sell_high);
         assert!(lv.buy_high <= lv.close * 1.02);
         assert!(lv.sell_low >= lv.close * 0.98);
-        let brief = lv.local_brief();
-        assert!(brief.contains("参考建仓带"));
-        assert!(brief.contains("不构成任何投资建议"));
     }
 
     #[test]

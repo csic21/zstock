@@ -228,12 +228,7 @@ impl StockApp {
     }
 
     /// 点击行业板块 → 拉取成分股列表（下钻）。
-    pub(crate) fn open_sector_drill(
-        &mut self,
-        code: String,
-        name: String,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn open_sector_drill(&mut self, code: String, name: String, cx: &mut Context<Self>) {
         self.sector_drill_gen = self.sector_drill_gen.wrapping_add(1);
         let drill_id = self.sector_drill_gen;
         self.sector_drill_code = Some(code.clone());

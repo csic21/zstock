@@ -228,7 +228,11 @@ fn install_macos(extracted: &Path) -> Result<(), String> {
             .ok_or_else(|| format!("更新包中缺少 {APP_BUNDLE_NAME} 或 {LEGACY_BUNDLE_NAME}"))?;
 
         if rsync_into(&new_bundle, &bundle).is_ok()
-            && bundle.join("Contents").join("MacOS").join(BINARY_NAME).is_file()
+            && bundle
+                .join("Contents")
+                .join("MacOS")
+                .join(BINARY_NAME)
+                .is_file()
         {
             // Re-sign ad-hoc so the bundle stays consistent after the sync.
             let _ = Command::new("codesign")
@@ -316,7 +320,7 @@ fn swap_bundle(bundle: &Path, new_bundle: &Path) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn bundle_dir(exe: &Path) -> Option<PathBuf> {
     exe.ancestors()
-        .find(|p| p.extension().map_or(false, |e| e == "app"))
+        .find(|p| p.extension().is_some_and(|e| e == "app"))
         .map(Path::to_path_buf)
 }
 
@@ -435,10 +439,10 @@ mod tests {
         assert_eq!(manifest.version, "0.0.3");
         assert_eq!(manifest.notes, "bug fixes");
         let asset = manifest.platforms.get("macos-arm64").unwrap();
-        assert_eq!(asset.url.ends_with(".zip"), true);
+        assert!(asset.url.ends_with(".zip"));
         assert_eq!(asset.sha256.as_deref(), Some("abc123"));
         // A platform missing from the manifest is fine; the client reports it.
-        assert!(manifest.platforms.get("windows-x64").is_none());
+        assert!(!manifest.platforms.contains_key("windows-x64"));
     }
 
     #[test]

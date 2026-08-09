@@ -130,9 +130,8 @@ fn default_max_tokens() -> u32 {
     1000
 }
 
-/// User-configurable LLM settings. The API key is stored only in the local
-/// config.json, never sent anywhere except the configured endpoint. CLI mode
-/// reuses the login state of the installed agent binary.
+/// User-configurable LLM settings. The API key is populated from the native
+/// credential store and is deliberately excluded from JSON serialization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiConfig {
     #[serde(default)]
@@ -146,7 +145,7 @@ pub struct AiConfig {
     pub base_url: String,
     #[serde(default = "default_model")]
     pub model: String,
-    #[serde(default)]
+    #[serde(skip, default)]
     pub api_key: String,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
@@ -335,9 +334,9 @@ pub fn local_commentary(snap: &AiSnapshot) -> String {
     let mut lines: Vec<String> = Vec::with_capacity(10);
 
     lines.push(format!(
-        "【综合】策略雷达 {} 分（{}）· 数据置信 {:.0}%。{}",
-        snap.score.round() as i64,
+        "【综合】技术状态：{}（证据分 {}）· 数据完整度 {:.0}%。{}",
         snap.regime,
+        snap.score.round() as i64,
         snap.confidence,
         regime_sentence(snap.regime.as_str())
     ));
@@ -375,7 +374,9 @@ pub fn local_commentary(snap: &AiSnapshot) -> String {
             p if p >= 55.0 => "区间中上沿",
             _ => "区间中下沿",
         };
-        lines.push(format!("【位置】现价位于近 60 日区间的 {pos:.0}% 分位（{pos_desc}）。"));
+        lines.push(format!(
+            "【位置】现价位于近 60 日区间的 {pos:.0}% 分位（{pos_desc}）。"
+        ));
     }
 
     if let Some(ratio) = snap.volume_ratio_20 {
@@ -562,10 +563,14 @@ fn decide_position_action(
     let range_pos = tech.range_position_60_pct;
 
     // 相对参考价位
-    let near_buy_band = tech.levels.as_ref().is_some_and(|lv| {
-        last <= lv.buy_high * 1.01 && last >= lv.buy_low * 0.98
-    });
-    let near_sell_band = tech.levels.as_ref().is_some_and(|lv| last >= lv.sell_low * 0.99);
+    let near_buy_band = tech
+        .levels
+        .as_ref()
+        .is_some_and(|lv| last <= lv.buy_high * 1.01 && last >= lv.buy_low * 0.98);
+    let near_sell_band = tech
+        .levels
+        .as_ref()
+        .is_some_and(|lv| last >= lv.sell_low * 0.99);
     let below_cost = has_pos && avg_cost > 0.0 && last < avg_cost;
 
     if !has_pos {
@@ -903,10 +908,10 @@ fn parse_responses(text: &str) -> Result<String> {
             }
             if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
                 for c in content {
-                    if c.get("type").and_then(|t| t.as_str()) == Some("output_text") {
-                        if let Some(t) = c.get("text").and_then(|t| t.as_str()) {
-                            parts.push(t);
-                        }
+                    if c.get("type").and_then(|t| t.as_str()) == Some("output_text")
+                        && let Some(t) = c.get("text").and_then(|t| t.as_str())
+                    {
+                        parts.push(t);
                     }
                 }
             }
@@ -1062,7 +1067,8 @@ fn write_temp_prompt(content: &str) -> Result<PathBuf> {
         std::process::id(),
         Instant::now().elapsed().as_nanos()
     ));
-    std::fs::write(&path, content).with_context(|| format!("写入临时提示失败：{}", path.display()))?;
+    std::fs::write(&path, content)
+        .with_context(|| format!("写入临时提示失败：{}", path.display()))?;
     Ok(path)
 }
 
@@ -1368,17 +1374,9 @@ fn macd_snapshot(candles: &[Candle]) -> MacdSnapshot {
 
     let ema12 = ema_series(&values, 12);
     let ema26 = ema_series(&values, 26);
-    let dif: Vec<f64> = ema12
-        .iter()
-        .zip(ema26.iter())
-        .map(|(a, b)| a - b)
-        .collect();
+    let dif: Vec<f64> = ema12.iter().zip(ema26.iter()).map(|(a, b)| a - b).collect();
     let dea = ema_series(&dif, 9);
-    let hist: Vec<f64> = dif
-        .iter()
-        .zip(dea.iter())
-        .map(|(d, e)| d - e)
-        .collect();
+    let hist: Vec<f64> = dif.iter().zip(dea.iter()).map(|(d, e)| d - e).collect();
 
     let cur = hist.last().copied();
     let recent = &hist[hist.len().saturating_sub(WINDOW + 1)..];
@@ -1532,7 +1530,12 @@ mod tests {
     #[test]
     fn api_error_is_surfaced() {
         let raw = r#"{"error":{"message":"Invalid API key"}}"#;
-        assert!(parse_chat(raw).unwrap_err().to_string().contains("Invalid API key"));
+        assert!(
+            parse_chat(raw)
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid API key")
+        );
     }
 
     #[test]
@@ -1549,9 +1552,11 @@ mod tests {
 
     #[test]
     fn cli_transport_is_configured_when_enabled() {
-        let mut cfg = AiConfig::default();
-        cfg.enabled = true;
-        cfg.transport = AiTransport::Cli;
+        let mut cfg = AiConfig {
+            enabled: true,
+            transport: AiTransport::Cli,
+            ..AiConfig::default()
+        };
         cfg.model.clear();
         assert!(cfg.is_configured());
         assert_eq!(cfg.source_label(), "CLI · Grok");
@@ -1561,9 +1566,11 @@ mod tests {
 
     #[test]
     fn api_transport_requires_key_and_model() {
-        let mut cfg = AiConfig::default();
-        cfg.enabled = true;
-        cfg.transport = AiTransport::Api;
+        let mut cfg = AiConfig {
+            enabled: true,
+            transport: AiTransport::Api,
+            ..AiConfig::default()
+        };
         assert!(!cfg.is_configured());
         cfg.api_key = "sk-test".into();
         assert!(cfg.is_configured());

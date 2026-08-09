@@ -1,5 +1,8 @@
 //! macOS menu bar (NSStatusItem) for live watchlist quotes.
 //!
+//! `objc` 0.2 expands a historical `cfg(feature = "cargo-clippy")`. Keep the
+//! compatibility exception local to this FFI boundary until the Cocoa stack moves on.
+//!
 //! Install once on the main thread. UI updates (title / menu) must also run on
 //! the main thread — GPUI's AppKit run loop satisfies that when called from
 //! `cx.update` / bootstrap.
@@ -17,18 +20,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 
-use cocoa::appkit::{
-    NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
-};
-use cocoa::base::{id, nil, NO, YES};
+use cocoa::appkit::{NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength};
+use cocoa::base::{NO, YES, id, nil};
 use cocoa::foundation::{NSData, NSSize, NSString};
 use objc::declare::ClassDecl;
 use objc::runtime::{Object, Sel};
 use objc::{class, msg_send, sel, sel_impl};
 
 /// Embedded menu-bar mark (template PNG, black + alpha).
-const STATUS_BAR_LOGO_PNG: &[u8] =
-    include_bytes!("../assets/logo/status-bar-mark.png");
+const STATUS_BAR_LOGO_PNG: &[u8] = include_bytes!("../assets/logo/status-bar-mark.png");
 
 /// Actions sent from menu item clicks back into the GPUI app.
 #[derive(Debug, Clone)]
@@ -357,12 +357,7 @@ unsafe fn rebuild_menu_items(item: id, target: id, entries: &[MenuEntry], work_m
         } else {
             "显示主窗口"
         };
-        menu.addItem_(menu_item_label(
-            show_label,
-            sel!(showWindow:),
-            target,
-            None,
-        ));
+        menu.addItem_(menu_item_label(show_label, sel!(showWindow:), target, None));
 
         let quit_label = if work_mode { "Quit" } else { "退出 ZStock" };
         menu.addItem_(menu_item_label(quit_label, sel!(quitApp:), target, None));
@@ -564,8 +559,7 @@ unsafe fn register_target_class() {
     }
     unsafe {
         let superclass = class!(NSObject);
-        let mut decl =
-            ClassDecl::new(TARGET_CLASS, superclass).expect("declare status bar target");
+        let mut decl = ClassDecl::new(TARGET_CLASS, superclass).expect("declare status bar target");
         decl.add_method(
             sel!(selectCode:),
             select_code as extern "C" fn(&Object, Sel, id),

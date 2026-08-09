@@ -50,22 +50,21 @@ impl FearGreedIndex {
 }
 
 /// Calculate the index from the same values shown in the market-analysis UI.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BreadthCounts {
+    pub advances: u64,
+    pub declines: u64,
+    pub unchanged: u64,
+}
+
 pub fn fear_greed_index(
-    stock_advances: u64,
-    stock_declines: u64,
-    stock_unchanged: u64,
-    sector_advances: usize,
-    sector_declines: usize,
-    sector_unchanged: usize,
+    stocks: BreadthCounts,
+    sectors: BreadthCounts,
     sector_average_change: Option<f64>,
     index_changes: &[f64],
 ) -> FearGreedIndex {
-    let stock_breadth = breadth_score(stock_advances, stock_declines, stock_unchanged);
-    let sector_breadth = breadth_score(
-        sector_advances as u64,
-        sector_declines as u64,
-        sector_unchanged as u64,
-    );
+    let stock_breadth = breadth_score(stocks.advances, stocks.declines, stocks.unchanged);
+    let sector_breadth = breadth_score(sectors.advances, sectors.declines, sectors.unchanged);
     let index_momentum = signed_move_score(
         index_changes.iter().copied().sum::<f64>() / index_changes.len().max(1) as f64,
     );
@@ -163,12 +162,16 @@ pub fn build_context(
     };
     let index_changes: Vec<f64> = indices.iter().map(|i| i.change_pct).collect();
     let fear_greed = fear_greed_index(
-        stock_advances,
-        stock_declines,
-        stock_unchanged,
-        sector_advances,
-        sector_declines,
-        sector_unchanged,
+        BreadthCounts {
+            advances: stock_advances,
+            declines: stock_declines,
+            unchanged: stock_unchanged,
+        },
+        BreadthCounts {
+            advances: sector_advances as u64,
+            declines: sector_declines as u64,
+            unchanged: sector_unchanged as u64,
+        },
         sector_average_change,
         &index_changes,
     );
@@ -375,7 +378,12 @@ mod tests {
 
     #[test]
     fn empty_inputs_are_neutral() {
-        let index = fear_greed_index(0, 0, 0, 0, 0, 0, None, &[]);
+        let index = fear_greed_index(
+            BreadthCounts::default(),
+            BreadthCounts::default(),
+            None,
+            &[],
+        );
         assert_eq!(index.score, 50.0);
         assert_eq!(index.label, "中性");
         assert!(!index.is_greed());
@@ -384,7 +392,15 @@ mod tests {
 
     #[test]
     fn sentiment_thresholds_match_labels() {
-        assert!(!fear_greed_index(0, 0, 0, 0, 0, 0, None, &[]).is_greed());
+        assert!(
+            !fear_greed_index(
+                BreadthCounts::default(),
+                BreadthCounts::default(),
+                None,
+                &[]
+            )
+            .is_greed()
+        );
 
         let greed = FearGreedIndex {
             score: 60.0,
@@ -411,8 +427,34 @@ mod tests {
 
     #[test]
     fn broad_rally_is_greedier_than_broad_selloff() {
-        let greed = fear_greed_index(900, 50, 50, 90, 5, 5, Some(2.0), &[1.0, 0.8, 0.5]);
-        let fear = fear_greed_index(50, 900, 50, 5, 90, 5, Some(-2.0), &[-1.0, -0.8, -0.5]);
+        let greed = fear_greed_index(
+            BreadthCounts {
+                advances: 900,
+                declines: 50,
+                unchanged: 50,
+            },
+            BreadthCounts {
+                advances: 90,
+                declines: 5,
+                unchanged: 5,
+            },
+            Some(2.0),
+            &[1.0, 0.8, 0.5],
+        );
+        let fear = fear_greed_index(
+            BreadthCounts {
+                advances: 50,
+                declines: 900,
+                unchanged: 50,
+            },
+            BreadthCounts {
+                advances: 5,
+                declines: 90,
+                unchanged: 5,
+            },
+            Some(-2.0),
+            &[-1.0, -0.8, -0.5],
+        );
         assert!(greed.score > fear.score);
         assert!(greed.score > 70.0);
         assert!(fear.score < 30.0);

@@ -1,63 +1,25 @@
 //! Work-mode dashboard rendering.
 
-#![allow(unused_imports)]
-
-use std::collections::HashMap;
-use std::time::Duration;
-
 use gpui::{
-    canvas, div, point, px, size, App, AppContext, Bounds, Context, Entity, FocusHandle,
-    InteractiveElement, IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, Timer, Window, WindowBounds, WindowOptions,
-    prelude::FluentBuilder,
-};
-use gpui_component::{
-    button::{Button, ButtonVariants},
-    h_flex,
-    IconName,
-    input::{Input, InputEvent, InputState},
-    resizable::{h_resizable, resizable_panel, v_resizable, ResizableState},
-    v_flex, ActiveTheme, Disableable, PixelsExt, Root, Sizable, StyledExt, Theme, ThemeMode,
-    TitleBar, TITLE_BAR_HEIGHT,
+    Context, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled,
+    canvas, div, prelude::FluentBuilder, px,
 };
 use gpui_component::tooltip::Tooltip;
+use gpui_component::{
+    ActiveTheme, Sizable, StyledExt,
+    button::{Button, ButtonVariants},
+    h_flex,
+    input::Input,
+    resizable::{h_resizable, resizable_panel},
+    v_flex,
+};
 
-use crate::chart::{
-    chart_layout, index_from_x, paint_chart, paint_sparkline, price_from_y, BollPaintData,
-    ChartPaintData, ChartStyle, MacdPaintData, MinutePaintData,
-};
-use crate::data::ai::{self, AiCliProvider, AiConfig, AiKind, AiTransport};
-use crate::data::levels;
-use crate::data::portfolio::{
-    self, format_money, format_shares, Portfolio, PortfolioSummary, TradeSide,
-};
-use crate::data::scout::{self, ScoutPick, ScoutVerdict, SCOUT_CANDIDATE_N};
-use crate::data::treasure::{self, fmt_dd, fmt_pos, TreasureHit, TREASURE_KLINE_LIMIT};
-use crate::data::universe::{self, FinFilter, TreasurePool, TREASURE_SCAN_CAP, TREASURE_TOP_N};
-use crate::data::{
-    indicators::{BollSeries, MaSeries, MacdSeries},
-    market, session, signals,
-};
-use crate::data::market::Sourced;
-use crate::data::session::{filter_codes_in_session, idle_delay_secs, open_markets_now, MarketSet};
-use crate::model::{
-    board_for_code, disguise_index, disguise_label, format_index, format_pct, format_price,
-    format_volume, normalize_code, shared, Candle, IndexSnap, MinutePeriod, MinuteSeries,
-    QuoteSnapshot, Symbol, TrendLine,
-};
-use crate::storage::{
-    self, clamp_quote_interval_secs, normalize_status_bar, AppConfig, ColorScheme, DockLayout,
-    WatchlistSort, WorkDensity, STATUS_BAR_MAX_CODES,
-};
-use crate::update::{self, UpdateState};
+use crate::chart::paint_sparkline;
+use crate::model::{IndexSnap, Symbol, format_price, shared};
+use crate::storage::WorkDensity;
 
-use super::super::{
-    AiCacheEntry, AiPanelState, AiSource, ChartKind, ChartRange, DetailTab, LeftTab, SettingsSection,
-    StockApp, CHART_MIN_VISIBLE, QUOTE_INTERVAL_ERR_MAX, QUOTE_INTERVAL_PRESETS, TITLE_NORMAL,
-    TITLE_WORK, TREASURE_SCAN_GAP,
-};
 use super::super::helpers::*;
+use super::super::{ChartRange, StockApp};
 
 /// Pixel metrics for a work-mode density level.
 #[derive(Clone, Copy)]
@@ -652,11 +614,15 @@ impl StockApp {
         let sh_load = sh.map(|s| telemetry(s.change_pct));
         let hs300_load = hs300.map(|s| telemetry(s.change_pct));
         let cyb_load = cyb.map(|s| telemetry(s.change_pct));
-        let sh_pct = sh_load.map(|v| format!("{v:.0}%")).unwrap_or_else(|| "--".into());
+        let sh_pct = sh_load
+            .map(|v| format!("{v:.0}%"))
+            .unwrap_or_else(|| "--".into());
         let hs300_pct = hs300_load
             .map(|v| format!("{v:.0}%"))
             .unwrap_or_else(|| "--".into());
-        let cyb_pct = cyb_load.map(|v| format!("{v:.0}%")).unwrap_or_else(|| "--".into());
+        let cyb_pct = cyb_load
+            .map(|v| format!("{v:.0}%"))
+            .unwrap_or_else(|| "--".into());
         let gauge_value = |snap: Option<IndexSnap>, unit: &str| match snap {
             Some(s) if self.work_identity_reveal => {
                 format!("{} {}", s.point_label(), s.pct_label())
@@ -713,7 +679,11 @@ impl StockApp {
                             .text_xs()
                             .font_semibold()
                             .text_color(cx.theme().muted_foreground)
-                            .child(if self.work_identity_reveal { "大盘" } else { "host" }),
+                            .child(if self.work_identity_reveal {
+                                "大盘"
+                            } else {
+                                "host"
+                            }),
                     )
                     .child(
                         div()
@@ -736,7 +706,11 @@ impl StockApp {
                     .border_color(cx.theme().border)
                     .child(sys_gauge(
                         1,
-                        if self.work_identity_reveal { "上证" } else { "cpu" },
+                        if self.work_identity_reveal {
+                            "上证"
+                        } else {
+                            "cpu"
+                        },
                         gauge_value(sh, "MHz"),
                         sh_load.unwrap_or(20.0),
                         gauge_tip("上证综指", sh),
@@ -744,7 +718,11 @@ impl StockApp {
                     ))
                     .child(sys_gauge(
                         2,
-                        if self.work_identity_reveal { "沪深" } else { "mem" },
+                        if self.work_identity_reveal {
+                            "沪深"
+                        } else {
+                            "mem"
+                        },
                         gauge_value(hs300, "MB"),
                         hs300_load.unwrap_or(20.0),
                         gauge_tip("沪深300", hs300),
@@ -752,7 +730,11 @@ impl StockApp {
                     ))
                     .child(sys_gauge(
                         3,
-                        if self.work_identity_reveal { "创业" } else { "disk" },
+                        if self.work_identity_reveal {
+                            "创业"
+                        } else {
+                            "disk"
+                        },
                         gauge_value(cyb, "IOPS"),
                         cyb_load.unwrap_or(20.0),
                         gauge_tip("创业板指", cyb),
@@ -767,20 +749,21 @@ impl StockApp {
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(if self.work_identity_reveal { "大盘" } else { "net" }),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().foreground)
                                     .child(if self.work_identity_reveal {
-                                        market_avg
-                                            .map(|v| format!("平均 {v:+.2}%"))
-                                            .unwrap_or_else(|| "--".into())
+                                        "大盘"
                                     } else {
-                                        format!("↓{net_in:.1}  ↑{net_out:.1} MB/s")
+                                        "net"
                                     }),
-                            ),
+                            )
+                            .child(div().text_xs().text_color(cx.theme().foreground).child(
+                                if self.work_identity_reveal {
+                                    market_avg
+                                        .map(|v| format!("平均 {v:+.2}%"))
+                                        .unwrap_or_else(|| "--".into())
+                                } else {
+                                    format!("↓{net_in:.1}  ↑{net_out:.1} MB/s")
+                                },
+                            )),
                     ),
             )
             .child(
@@ -838,9 +821,7 @@ impl StockApp {
                             .cursor_pointer()
                             .border_b_1()
                             .border_color(cx.theme().border.opacity(0.25))
-                            .when(is_selected, |this| {
-                                this.bg(cx.theme().accent.opacity(0.14))
-                            })
+                            .when(is_selected, |this| this.bg(cx.theme().accent.opacity(0.14)))
                             .hover(|this| this.bg(cx.theme().accent.opacity(0.08)))
                             .on_click(cx.listener(move |this, _, _w, cx| {
                                 this.select_symbol(code.clone(), cx);
@@ -896,5 +877,4 @@ impl StockApp {
                 )
             })
     }
-
 }

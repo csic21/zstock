@@ -1,67 +1,24 @@
 //! Chart area, MA toggles, drawing mode, hover strip.
 
-#![allow(unused_imports)]
-
-use std::collections::HashMap;
-use std::time::Duration;
-
 use gpui::{
-    canvas, div, point, px, size, App, AppContext, Bounds, Context, Entity, FocusHandle,
-    InteractiveElement, IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, Timer, Window, WindowBounds, WindowOptions,
-    prelude::FluentBuilder,
+    Bounds, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    ParentElement, Pixels, ScrollWheelEvent, Styled, canvas, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
+    ActiveTheme, PixelsExt, Sizable, StyledExt,
     button::{Button, ButtonVariants},
-    h_flex,
-    IconName,
-    input::{Input, InputEvent, InputState},
-    resizable::{h_resizable, resizable_panel, v_resizable, ResizableState},
-    v_flex, ActiveTheme, Disableable, PixelsExt, Root, Sizable, StyledExt, Theme, ThemeMode,
-    TitleBar, TITLE_BAR_HEIGHT,
+    h_flex, v_flex,
 };
-use gpui_component::tooltip::Tooltip;
 
-use crate::chart::{
-    chart_layout, index_from_x, paint_chart, paint_sparkline, price_from_y, BollPaintData,
-    ChartPaintData, ChartStyle, MacdPaintData, MinutePaintData,
-};
-use crate::data::ai::{self, AiCliProvider, AiConfig, AiKind, AiTransport};
-use crate::data::levels;
-use crate::data::portfolio::{
-    self, format_money, format_shares, Portfolio, PortfolioSummary, TradeSide,
-};
-use crate::data::scout::{self, ScoutPick, ScoutVerdict, SCOUT_CANDIDATE_N};
-use crate::data::treasure::{self, fmt_dd, fmt_pos, TreasureHit, TREASURE_KLINE_LIMIT};
-use crate::data::universe::{self, FinFilter, TreasurePool, TREASURE_SCAN_CAP, TREASURE_TOP_N};
-use crate::data::{
-    indicators::{BollSeries, MaSeries, MacdSeries},
-    market, session, signals,
-};
-use crate::data::market::Sourced;
-use crate::data::session::{filter_codes_in_session, idle_delay_secs, open_markets_now, MarketSet};
+use crate::chart::{ChartPaintData, chart_layout, index_from_x, paint_chart, price_from_y};
 use crate::model::{
-    board_for_code, disguise_index, disguise_label, format_index, format_pct, format_price,
-    format_volume, normalize_code, shared, Candle, IndexSnap, MinutePeriod, MinuteSeries,
-    QuoteSnapshot, Symbol, TrendLine,
+    MinutePeriod, QuoteSnapshot, TrendLine, format_pct, format_price, format_volume, shared,
 };
-use crate::storage::{
-    self, clamp_quote_interval_secs, normalize_status_bar, AppConfig, ColorScheme, DockLayout,
-    WatchlistSort, STATUS_BAR_MAX_CODES,
-};
-use crate::update::{self, UpdateState};
 
-use super::super::{
-    AiCacheEntry, AiPanelState, AiSource, ChartKind, ChartRange, DetailTab, LeftTab, SettingsSection,
-    StockApp, CHART_MIN_VISIBLE, QUOTE_INTERVAL_ERR_MAX, QUOTE_INTERVAL_PRESETS, TITLE_NORMAL,
-    TITLE_WORK, TREASURE_SCAN_GAP,
-};
 use super::super::helpers::*;
 use super::super::labels::L;
+use super::super::{ChartKind, ChartRange, DetailTab, StockApp};
 use gpui_component::skeleton::Skeleton;
-
-
 
 impl StockApp {
     pub(crate) fn render_chart_area(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -102,8 +59,7 @@ impl StockApp {
         let board = if work {
             shared("metric")
         } else {
-            sym.map(|s| s.board.clone())
-                .unwrap_or_else(|| shared(""))
+            sym.map(|s| s.board.clone()).unwrap_or_else(|| shared(""))
         };
         // Prefer live quote on the watchlist; fall back to last candle only if matched
         let close = sym
@@ -530,8 +486,7 @@ impl StockApp {
                                     let bounds = this.chart_bounds;
                                     if let Some((ix, price)) =
                                         this.anchor_from_local(&paint, bounds, local_x, local_y)
-                                    {
-                                        if let Some((ax, ap)) = this.drawing_anchor {
+                                        && let Some((ax, ap)) = this.drawing_anchor {
                                             let color_ix = this.draw_color_ix;
                                             this.draft_line = Some(TrendLine::new(
                                                 (ax, ap),
@@ -540,7 +495,6 @@ impl StockApp {
                                             ));
                                             cx.notify();
                                         }
-                                    }
                                     return;
                                 }
                                 let (start, end) = this.chart_visible_range();
@@ -620,8 +574,9 @@ impl StockApp {
                                                 }
                                             };
                                             if let Some(line) = commit {
+                                                let selected = this.selected.to_string();
                                                 this.chart_lines
-                                                    .entry(this.selected.to_string())
+                                                    .entry(selected)
                                                     .or_default()
                                                     .push(line);
                                                 this.draw_color_ix = this.draw_color_ix.wrapping_add(1);
@@ -701,14 +656,14 @@ impl StockApp {
         let removed = self.chart_lines.remove(&code).unwrap_or_default().len();
         self.draft_line = None;
         self.drawing_anchor = None;
-        self.status = shared(format!(
-            "{}",
-            if self.work_mode {
+        self.status = shared(
+            (if self.work_mode {
                 format!("removed {removed} line(s)")
             } else {
                 format!("已清除 {removed} 条画线")
-            }
-        ));
+            })
+            .to_string(),
+        );
         self.schedule_persist(cx);
         cx.notify();
     }
@@ -774,153 +729,151 @@ impl StockApp {
             .as_ref()
             .is_some_and(|c| c == self.selected.as_ref());
         let work = self.work_mode;
-        if candles_match && matches!(self.chart_kind, ChartKind::Intraday) {
-            if let Some(ix) = self.hover_ix {
-                if let (Some(m), Some(p)) = (self.minute.as_ref(), self.minute.as_ref().and_then(|m| m.points.get(ix))) {
-                    let color = self.chg_color(p.price >= m.prev_close, cx);
-                    let vol = p.minute_volume(ix.checked_sub(1).map(|j| &m.points[j]));
-                    return h_flex()
-                        .gap_2()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(
-                            div()
-                                .font_semibold()
-                                .text_color(cx.theme().foreground)
-                                .child(p.time.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_color(color)
-                                .child(format!("价 {}", format_price(p.price))),
-                        )
-                        .child(format!("均价 {}", format_price(p.avg_price())))
-                        .child(format!(
-                            "涨跌 {}",
-                            format_pct(if m.prev_close > 0.0 {
-                                (p.price - m.prev_close) / m.prev_close * 100.0
-                            } else {
-                                0.0
-                            })
-                        ))
-                        .child(format!("量 {}", format_volume(vol)))
-                        .into_any_element();
-                }
-            }
+        if candles_match
+            && matches!(self.chart_kind, ChartKind::Intraday)
+            && let Some(ix) = self.hover_ix
+            && let (Some(m), Some(p)) = (
+                self.minute.as_ref(),
+                self.minute.as_ref().and_then(|m| m.points.get(ix)),
+            )
+        {
+            let color = self.chg_color(p.price >= m.prev_close, cx);
+            let vol = p.minute_volume(ix.checked_sub(1).map(|j| &m.points[j]));
+            return h_flex()
+                .gap_2()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(
+                    div()
+                        .font_semibold()
+                        .text_color(cx.theme().foreground)
+                        .child(p.time.clone()),
+                )
+                .child(
+                    div()
+                        .text_color(color)
+                        .child(format!("价 {}", format_price(p.price))),
+                )
+                .child(format!("均价 {}", format_price(p.avg_price())))
+                .child(format!(
+                    "涨跌 {}",
+                    format_pct(if m.prev_close > 0.0 {
+                        (p.price - m.prev_close) / m.prev_close * 100.0
+                    } else {
+                        0.0
+                    })
+                ))
+                .child(format!("量 {}", format_volume(vol)))
+                .into_any_element();
         }
-        if candles_match {
-            if let Some(ix) = self.hover_ix {
-                if let Some(c) = self.candles.get(ix) {
-                    let color = self.chg_color(c.close >= c.open, cx);
-                    let (m5, m10, m20, m60) = self.ma.value_at(ix);
-                    let (dif, dea, hist) = self.macd.value_at(ix);
-                    let (b_up, b_mid, b_low) = self.boll.value_at(ix);
-                    let date_label = format_candle_date(c.date.as_ref());
-                    if work {
-                        return h_flex()
-                            .gap_2()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(
-                                div()
-                                    .font_semibold()
-                                    .text_color(cx.theme().foreground)
-                                    .child(date_label),
-                            )
-                            .child(format!("v {}", self.format_value(c.close)))
-                            .child(format!("lo {}", self.format_value(c.low)))
-                            .child(format!("hi {}", self.format_value(c.high)))
-                            .when(m5.is_some(), |this| {
-                                this.child(format!("L1 {}", self.format_value(m5.unwrap())))
-                            })
-                            .when(m10.is_some(), |this| {
-                                this.child(format!("L2 {}", self.format_value(m10.unwrap())))
-                            })
-                            .when(m20.is_some(), |this| {
-                                this.child(format!("L3 {}", self.format_value(m20.unwrap())))
-                            })
-                            .when(m60.is_some(), |this| {
-                                this.child(format!("L4 {}", self.format_value(m60.unwrap())))
-                            })
-                            .into_any_element();
-                    }
-                    let row = h_flex()
-                        .gap_2()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(
-                            div()
-                                .font_semibold()
-                                .text_color(cx.theme().foreground)
-                                .child(date_label),
-                        )
-                        .child(format!(
-                            "开{} 高{} 低{}",
-                            format_price(c.open),
-                            format_price(c.high),
-                            format_price(c.low)
-                        ))
-                        .child(
-                            div()
-                                .text_color(color)
-                                .child(format!("收{}", format_price(c.close))),
-                        )
-                        .child(format!("量{}", format_volume(c.volume)))
-                        .when_some(
-                            self.portfolio
-                                .position_of(self.selected.as_ref())
-                                .filter(|p| p.is_open() && p.avg_cost > 0.0)
-                                .map(|p| p.avg_cost),
-                            |this, cost| {
-                                let vs = (c.close - cost) / cost * 100.0;
-                                this.child(
-                                    div()
-                                        .text_color(self.chg_color(vs >= 0.0, cx))
-                                        .child(format!(
-                                            "成本{} · {:+.2}%",
-                                            format_price(cost),
-                                            vs
-                                        )),
-                                )
-                            },
-                        )
-                        .when(m5.is_some(), |this| {
-                            this.child(format!("MA5 {}", format_price(m5.unwrap())))
-                        })
-                        .when(m10.is_some(), |this| {
-                            this.child(format!("MA10 {}", format_price(m10.unwrap())))
-                        })
-                        .when(m20.is_some(), |this| {
-                            this.child(format!("MA20 {}", format_price(m20.unwrap())))
-                        })
-                        .when(m60.is_some(), |this| {
-                            this.child(format!("MA60 {}", format_price(m60.unwrap())))
-                        })
-                        .when(
-                            self.show_macd && dif.is_some() && dea.is_some() && hist.is_some(),
-                            |this| {
-                                this.child(format!(
-                                    "MACD {:.3}/{:.3}/{:.3}",
-                                    dif.unwrap(),
-                                    dea.unwrap(),
-                                    hist.unwrap()
-                                ))
-                            },
-                        )
-                        .when(
-                            self.show_boll && b_up.is_some() && b_mid.is_some() && b_low.is_some(),
-                            |this| {
-                                this.child(format!(
-                                    "BOLL {:.2}/{:.2}/{:.2}",
-                                    b_up.unwrap(),
-                                    b_mid.unwrap(),
-                                    b_low.unwrap()
-                                ))
-                            },
-                        );
-                    return row.into_any_element();
-                }
+        if candles_match
+            && let Some(ix) = self.hover_ix
+            && let Some(c) = self.candles.get(ix)
+        {
+            let color = self.chg_color(c.close >= c.open, cx);
+            let (m5, m10, m20, m60) = self.ma.value_at(ix);
+            let (dif, dea, hist) = self.macd.value_at(ix);
+            let (b_up, b_mid, b_low) = self.boll.value_at(ix);
+            let date_label = format_candle_date(c.date.as_ref());
+            if work {
+                return h_flex()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        div()
+                            .font_semibold()
+                            .text_color(cx.theme().foreground)
+                            .child(date_label),
+                    )
+                    .child(format!("v {}", self.format_value(c.close)))
+                    .child(format!("lo {}", self.format_value(c.low)))
+                    .child(format!("hi {}", self.format_value(c.high)))
+                    .when(m5.is_some(), |this| {
+                        this.child(format!("L1 {}", self.format_value(m5.unwrap())))
+                    })
+                    .when(m10.is_some(), |this| {
+                        this.child(format!("L2 {}", self.format_value(m10.unwrap())))
+                    })
+                    .when(m20.is_some(), |this| {
+                        this.child(format!("L3 {}", self.format_value(m20.unwrap())))
+                    })
+                    .when(m60.is_some(), |this| {
+                        this.child(format!("L4 {}", self.format_value(m60.unwrap())))
+                    })
+                    .into_any_element();
             }
+            let row = h_flex()
+                .gap_2()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(
+                    div()
+                        .font_semibold()
+                        .text_color(cx.theme().foreground)
+                        .child(date_label),
+                )
+                .child(format!(
+                    "开{} 高{} 低{}",
+                    format_price(c.open),
+                    format_price(c.high),
+                    format_price(c.low)
+                ))
+                .child(
+                    div()
+                        .text_color(color)
+                        .child(format!("收{}", format_price(c.close))),
+                )
+                .child(format!("量{}", format_volume(c.volume)))
+                .when_some(
+                    self.portfolio
+                        .position_of(self.selected.as_ref())
+                        .filter(|p| p.is_open() && p.avg_cost > 0.0)
+                        .map(|p| p.avg_cost),
+                    |this, cost| {
+                        let vs = (c.close - cost) / cost * 100.0;
+                        this.child(
+                            div()
+                                .text_color(self.chg_color(vs >= 0.0, cx))
+                                .child(format!("成本{} · {:+.2}%", format_price(cost), vs)),
+                        )
+                    },
+                )
+                .when(m5.is_some(), |this| {
+                    this.child(format!("MA5 {}", format_price(m5.unwrap())))
+                })
+                .when(m10.is_some(), |this| {
+                    this.child(format!("MA10 {}", format_price(m10.unwrap())))
+                })
+                .when(m20.is_some(), |this| {
+                    this.child(format!("MA20 {}", format_price(m20.unwrap())))
+                })
+                .when(m60.is_some(), |this| {
+                    this.child(format!("MA60 {}", format_price(m60.unwrap())))
+                })
+                .when(
+                    self.show_macd && dif.is_some() && dea.is_some() && hist.is_some(),
+                    |this| {
+                        this.child(format!(
+                            "MACD {:.3}/{:.3}/{:.3}",
+                            dif.unwrap(),
+                            dea.unwrap(),
+                            hist.unwrap()
+                        ))
+                    },
+                )
+                .when(
+                    self.show_boll && b_up.is_some() && b_mid.is_some() && b_low.is_some(),
+                    |this| {
+                        this.child(format!(
+                            "BOLL {:.2}/{:.2}/{:.2}",
+                            b_up.unwrap(),
+                            b_mid.unwrap(),
+                            b_low.unwrap()
+                        ))
+                    },
+                );
+            return row.into_any_element();
         }
         let (vs, ve) = self.chart_visible_range();
         let zoom_hint = if self.drawing_mode && !work {
@@ -1002,5 +955,4 @@ impl StockApp {
         self.schedule_persist(cx);
         cx.notify();
     }
-
 }

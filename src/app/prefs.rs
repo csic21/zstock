@@ -1,65 +1,26 @@
 //! Preferences, layout, work mode, status bar, AI settings, updates.
 
-#![allow(unused_imports)]
-
-use std::collections::HashMap;
 use std::time::Duration;
 
-use gpui::{
-    canvas, div, point, px, size, App, AppContext, Bounds, Context, Entity, FocusHandle,
-    InteractiveElement, IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, Timer, Window, WindowBounds, WindowOptions,
-    prelude::FluentBuilder,
-};
+use gpui::{App, Context, Entity, Timer, Window, px, size};
 use gpui_component::{
+    ActiveTheme, Disableable, PixelsExt, Sizable,
     button::{Button, ButtonVariants},
-    h_flex,
-    IconName,
-    input::{Input, InputEvent, InputState},
-    resizable::{h_resizable, resizable_panel, v_resizable, ResizableState},
-    v_flex, ActiveTheme, Disableable, PixelsExt, Root, Sizable, StyledExt, Theme, ThemeMode,
-    TitleBar, TITLE_BAR_HEIGHT,
+    resizable::ResizableState,
 };
-use gpui_component::tooltip::Tooltip;
 
-use crate::chart::{
-    chart_layout, index_from_x, paint_chart, paint_sparkline, price_from_y, BollPaintData,
-    ChartPaintData, ChartStyle, MacdPaintData, MinutePaintData,
-};
-use crate::data::ai::{self, AiCliProvider, AiConfig, AiKind, AiTransport};
-use crate::data::levels;
-use crate::data::portfolio::{
-    self, format_money, format_shares, Portfolio, PortfolioSummary, TradeSide,
-};
-use crate::data::scout::{self, ScoutPick, ScoutVerdict, SCOUT_CANDIDATE_N};
-use crate::data::treasure::{self, fmt_dd, fmt_pos, TreasureHit, TREASURE_KLINE_LIMIT};
-use crate::data::universe::{self, FinFilter, TreasurePool, TREASURE_SCAN_CAP, TREASURE_TOP_N};
-use crate::data::{
-    indicators::{BollSeries, MaSeries, MacdSeries},
-    market, session, signals,
-};
-use crate::data::market::Sourced;
-use crate::data::session::{filter_codes_in_session, idle_delay_secs, open_markets_now, MarketSet};
-use crate::model::{
-    board_for_code, disguise_index, disguise_label, format_index, format_pct, format_price,
-    format_volume, normalize_code, sanitize_work_alias, shared, Candle, IndexSnap, MinutePeriod,
-    MinuteSeries, QuoteSnapshot, Symbol, TrendLine,
-};
+use crate::data::ai::{self, AiCliProvider, AiKind, AiTransport};
+use crate::model::{Symbol, disguise_label, format_pct, format_price, sanitize_work_alias, shared};
 use crate::storage::{
-    self, clamp_quote_interval_secs, normalize_status_bar, AppConfig, ColorScheme, DockLayout,
-    WatchlistSort, WorkDensity, STATUS_BAR_MAX_CODES,
+    ColorScheme, STATUS_BAR_MAX_CODES, WatchlistSort, WorkDensity, clamp_quote_interval_secs,
+    normalize_status_bar,
 };
 use crate::update::{self, UpdateState};
 
-use super::{
-    AiCacheEntry, AiPanelState, AiSource, ChartKind, ChartRange, DetailTab, LeftTab, SettingsSection,
-    StockApp, CHART_MIN_VISIBLE, QUOTE_INTERVAL_ERR_MAX, QUOTE_INTERVAL_PRESETS, TITLE_NORMAL,
-    TITLE_WORK, TREASURE_SCAN_GAP, WORK_IDENTITY_AUTO_HIDE,
-};
 use super::helpers::*;
-
-
+use super::{
+    AiCacheEntry, AiPanelState, AiSource, SettingsSection, StockApp, WORK_IDENTITY_AUTO_HIDE,
+};
 
 impl StockApp {
     pub(crate) fn select_adjacent_symbol(&mut self, delta: i32, cx: &mut Context<Self>) {
@@ -170,6 +131,8 @@ impl StockApp {
             return;
         }
         self.work_mode = on;
+        #[cfg(feature = "work-mode")]
+        self.work_mode_feature.state.set_enabled(on);
         self.market_analysis_open = false;
         self.clear_work_identity(cx);
         self.cancel_work_alias_edit(cx);
@@ -216,11 +179,11 @@ impl StockApp {
     ) {
         let sizes = state.read(cx).sizes().clone();
         // Two panels: [service list, host panel]. Persist the right width.
-        if let Some(w) = sizes.get(1).map(|s| s.as_f32()) {
-            if (w - self.work_right_width).abs() > 0.5 {
-                self.work_right_width = w;
-                self.schedule_persist(cx);
-            }
+        if let Some(w) = sizes.get(1).map(|s| s.as_f32())
+            && (w - self.work_right_width).abs() > 0.5
+        {
+            self.work_right_width = w;
+            self.schedule_persist(cx);
         }
     }
 
@@ -243,18 +206,17 @@ impl StockApp {
         }
         let prev = self.work_density;
         // Snapshot roomy bounds before the first compact step.
-        if prev == WorkDensity::Wide && density != WorkDensity::Wide {
-            if let Some(b) = self.window_bounds {
-                self.work_restore_bounds = Some(b);
-            }
+        if prev == WorkDensity::Wide
+            && density != WorkDensity::Wide
+            && let Some(b) = self.window_bounds
+        {
+            self.work_restore_bounds = Some(b);
         }
         // If the user hand-resized while in Fit/Mini and right width still
         // matches the old density default, snap to the new default so Mini
         // does not keep a Wide-sized host panel.
         let prev_default = prev.default_right_width();
-        if self.work_right_width <= 0.0
-            || (self.work_right_width - prev_default).abs() < 1.0
-        {
+        if self.work_right_width <= 0.0 || (self.work_right_width - prev_default).abs() < 1.0 {
             self.work_right_width = density.default_right_width();
         } else {
             let (lo, hi) = density.right_width_range();
@@ -284,8 +246,7 @@ impl StockApp {
 
     /// Refresh `work_identity_reveal` from peek / Map latch state.
     fn sync_work_identity_reveal(&mut self) {
-        self.work_identity_reveal =
-            self.work_identity_peek_held || self.work_identity_map_latched;
+        self.work_identity_reveal = self.work_identity_peek_held || self.work_identity_map_latched;
     }
 
     fn clear_work_identity(&mut self, _cx: &mut Context<Self>) {
@@ -375,11 +336,7 @@ impl StockApp {
     }
 
     /// Open the alias editor for the currently selected service.
-    pub(crate) fn start_work_alias_edit(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn start_work_alias_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.work_mode {
             return;
         }
@@ -387,11 +344,7 @@ impl StockApp {
         if code.is_empty() {
             return;
         }
-        let current = self
-            .work_aliases
-            .get(&code)
-            .cloned()
-            .unwrap_or_default();
+        let current = self.work_aliases.get(&code).cloned().unwrap_or_default();
         let placeholder = disguise_label(
             &code,
             self.symbols
@@ -520,11 +473,7 @@ impl StockApp {
         if let Some(ix) = self.status_bar_codes.iter().position(|c| c == code) {
             self.status_bar_codes.remove(ix);
             if self.status_bar_active == code {
-                self.status_bar_active = self
-                    .status_bar_codes
-                    .first()
-                    .cloned()
-                    .unwrap_or_default();
+                self.status_bar_active = self.status_bar_codes.first().cloned().unwrap_or_default();
             }
         } else {
             if self.status_bar_codes.len() >= STATUS_BAR_MAX_CODES {
@@ -545,19 +494,6 @@ impl StockApp {
             }
         }
         self.normalize_status_bar_state();
-        self.schedule_persist(cx);
-        self.sync_status_bar();
-        cx.notify();
-    }
-
-    pub(crate) fn set_status_bar_active(&mut self, code: &str, cx: &mut Context<Self>) {
-        if !self.status_bar_codes.iter().any(|c| c == code) {
-            return;
-        }
-        if self.status_bar_active == code {
-            return;
-        }
-        self.status_bar_active = code.to_string();
         self.schedule_persist(cx);
         self.sync_status_bar();
         cx.notify();
@@ -643,11 +579,7 @@ impl StockApp {
         if self.work_mode {
             let alias = disguise_label(&sym.code, sym.name.as_ref());
             if sym.last > 0.0 {
-                format!(
-                    "{alias} {} {:+.2}%",
-                    format_price(sym.last),
-                    sym.change_pct
-                )
+                format!("{alias} {} {:+.2}%", format_price(sym.last), sym.change_pct)
             } else {
                 alias
             }
@@ -670,11 +602,7 @@ impl StockApp {
         if self.work_mode {
             let alias = disguise_label(&sym.code, sym.name.as_ref());
             if sym.last > 0.0 {
-                format!(
-                    "{alias} {}{:+.2}%",
-                    format_price(sym.last),
-                    sym.change_pct
-                )
+                format!("{alias} {}{:+.2}%", format_price(sym.last), sym.change_pct)
             } else {
                 alias
             }
@@ -947,7 +875,11 @@ impl StockApp {
         cx.notify();
     }
 
-    pub(crate) fn set_settings_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+    pub(crate) fn set_settings_section(
+        &mut self,
+        section: SettingsSection,
+        cx: &mut Context<Self>,
+    ) {
         if self.settings_section == section {
             return;
         }
@@ -980,9 +912,7 @@ impl StockApp {
                     cx.notify();
                 })
                 .is_err()
-            {
-                return;
-            }
+            {}
         })
         .detach();
     }
@@ -1041,17 +971,28 @@ impl StockApp {
 
     pub(crate) fn update_status_line(&self, work: bool) -> String {
         match &self.update_state {
-            UpdateState::Idle | UpdateState::Checking => {
-                (if work { "Checking…" } else { "正在检查更新…" }).to_string()
-            }
+            UpdateState::Idle | UpdateState::Checking => (if work {
+                "Checking…"
+            } else {
+                "正在检查更新…"
+            })
+            .to_string(),
             UpdateState::UpToDate => format!(
                 "v{} · {}",
                 env!("CARGO_PKG_VERSION"),
-                if work { "up to date" } else { "已是最新版本" }
+                if work {
+                    "up to date"
+                } else {
+                    "已是最新版本"
+                }
             ),
             UpdateState::Available(info) => format!(
                 "{} v{}（{} v{}）",
-                if work { "New version" } else { "发现新版本" },
+                if work {
+                    "New version"
+                } else {
+                    "发现新版本"
+                },
                 info.version,
                 if work { "current" } else { "当前" },
                 env!("CARGO_PKG_VERSION")
@@ -1091,7 +1032,6 @@ impl StockApp {
             }
         }
     }
-
 }
 
 /// Hold-to-peek keys: backtick or Space, without modifiers.

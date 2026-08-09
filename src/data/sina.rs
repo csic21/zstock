@@ -10,8 +10,7 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 
 const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
-const HQ_NODE: &str =
-    "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData";
+const HQ_NODE: &str = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData";
 
 /// One index member with optional valuation fields.
 #[derive(Debug, Clone)]

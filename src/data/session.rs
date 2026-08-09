@@ -157,11 +157,7 @@ pub fn idle_delay_secs(present: MarketSet, max_secs: u64) -> u64 {
     idle_delay_secs_at(present, Local::now(), max_secs)
 }
 
-pub fn idle_delay_secs_at(
-    present: MarketSet,
-    now: chrono::DateTime<Local>,
-    max_secs: u64,
-) -> u64 {
+pub fn idle_delay_secs_at(present: MarketSet, now: chrono::DateTime<Local>, max_secs: u64) -> u64 {
     let max_secs = max_secs.clamp(5, 300);
     if present.is_empty() {
         return max_secs;
@@ -254,11 +250,7 @@ mod tests {
 
     #[test]
     fn filter_respects_open_set() {
-        let codes = vec![
-            "600519".into(),
-            "00700".into(),
-            "000001".into(),
-        ];
+        let codes = vec!["600519".into(), "00700".into(), "000001".into()];
         let only_a = filter_codes_in_session(&codes, MarketSet { a: true, hk: false });
         assert_eq!(only_a, vec!["600519", "000001"]);
         let only_hk = filter_codes_in_session(&codes, MarketSet { a: false, hk: true });

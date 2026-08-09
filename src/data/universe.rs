@@ -58,7 +58,14 @@ impl TreasurePool {
     }
 
     pub fn all() -> [Self; 6] {
-        [Self::Mcap, Self::Hs300, Self::Zz500, Self::Sh50, Self::Cyb, Self::Kc50]
+        [
+            Self::Mcap,
+            Self::Hs300,
+            Self::Zz500,
+            Self::Sh50,
+            Self::Cyb,
+            Self::Kc50,
+        ]
     }
 
     pub fn from_id(s: &str) -> Self {
@@ -240,7 +247,9 @@ fn fetch_pool_rows(pool: TreasurePool) -> Result<Vec<PoolRow>> {
                 .collect())
         }
         _ => {
-            let node = pool.sina_node().ok_or_else(|| anyhow::anyhow!("无指数节点"))?;
+            let node = pool
+                .sina_node()
+                .ok_or_else(|| anyhow::anyhow!("无指数节点"))?;
             let rows = sina::fetch_index_constituents(node)?;
             Ok(rows
                 .into_iter()
@@ -257,14 +266,17 @@ fn fetch_pool_rows(pool: TreasurePool) -> Result<Vec<PoolRow>> {
 /// 池内 PE / PB 横截面分位过滤。返回过滤后的行与说明文本。
 fn apply_fin_filter(rows: Vec<PoolRow>, fin: FinFilter) -> (Vec<PoolRow>, String) {
     if fin == FinFilter::Off || rows.is_empty() {
-        return (rows, format!("{}", fin.label()));
+        return (rows, fin.label().to_string());
     }
     let coverage_pe = rows.iter().filter(|r| r.pe.is_some()).count();
     let coverage_pb = rows.iter().filter(|r| r.pb.is_some()).count();
     if coverage_pe == 0 && coverage_pb == 0 {
         return (rows, format!("{} · 无财务数据", fin.label()));
     }
-    let (pe_rank, pb_rank) = (percentile_ranks(rows.iter().map(|r| r.pe)), percentile_ranks(rows.iter().map(|r| r.pb)));
+    let (pe_rank, pb_rank) = (
+        percentile_ranks(rows.iter().map(|r| r.pe)),
+        percentile_ranks(rows.iter().map(|r| r.pb)),
+    );
     let before = rows.len();
     let keep = |i: usize| -> bool {
         match fin {

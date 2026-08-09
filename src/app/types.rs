@@ -3,7 +3,7 @@
 use gpui::SharedString;
 
 use crate::data::treasure::TREASURE_KLINE_LIMIT;
-use crate::model::{shared, MinutePeriod};
+use crate::model::{MinutePeriod, shared};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -88,7 +88,6 @@ impl ChartKind {
             Self::MinuteK(p) => p.param(),
         }
     }
-
 }
 
 /// 左侧栏：自选 / 持仓 / 现在找（长线寻宝 + 短线雷达）。
@@ -202,12 +201,7 @@ pub(crate) enum DetailTab {
 impl DetailTab {
     /// Primary analysis-dock tabs (no list duplication with the left sidebar).
     pub(crate) fn dock_tabs() -> [Self; 4] {
-        [
-            Self::Overview,
-            Self::Strategy,
-            Self::Ai,
-            Self::Indicators,
-        ]
+        [Self::Overview, Self::Strategy, Self::Ai, Self::Indicators]
     }
 
     /// Whether this tab is a primary dock tab (shown in the strip always).
@@ -312,10 +306,11 @@ pub(crate) fn insert_ai_cache(
     key: String,
     entry: AiCacheEntry,
 ) {
-    if map.len() >= AI_CACHE_MAX && !map.contains_key(&key) {
-        if let Some(old) = map.keys().next().cloned() {
-            map.remove(&old);
-        }
+    if map.len() >= AI_CACHE_MAX
+        && !map.contains_key(&key)
+        && let Some(old) = map.keys().next().cloned()
+    {
+        map.remove(&old);
     }
     map.insert(key, entry);
 }

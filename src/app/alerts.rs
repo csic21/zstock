@@ -6,8 +6,8 @@ use crate::data::alerts::{self, AlertLeg, BuyAlert, BuyAlertBasis};
 use crate::model::{format_price, shared};
 use crate::notifications;
 
-use super::helpers::parse_f64;
 use super::StockApp;
+use super::helpers::parse_f64;
 
 /// A newly fired alert, passed to the quote loop for status/UI handling.
 #[derive(Debug, Clone)]
@@ -91,7 +91,11 @@ impl StockApp {
         self.status = shared(if self.work_mode {
             format!("Buy zone · {}", format_price(price))
         } else {
-            format!("已开启买入观察 · {} 元 · {}", format_price(price), basis.label())
+            format!(
+                "已开启买入观察 · {} 元 · {}",
+                format_price(price),
+                basis.label()
+            )
         });
         cx.notify();
     }
@@ -167,9 +171,11 @@ impl StockApp {
             return;
         };
         let code = self.selected.to_string();
-        let mut alert = self.buy_alerts.get(&code).cloned().unwrap_or_else(|| {
-            BuyAlert::new(price * 1.05, BuyAlertBasis::Manual)
-        });
+        let mut alert = self
+            .buy_alerts
+            .get(&code)
+            .cloned()
+            .unwrap_or_else(|| BuyAlert::new(price * 1.05, BuyAlertBasis::Manual));
         alert.stop_price = Some(price);
         alert.stop_triggered = false;
         self.buy_alerts.insert(code, alert);

@@ -1,13 +1,13 @@
 //! Pure UI/string helpers shared across app modules.
 
 use gpui::{
-    div, px, prelude::FluentBuilder, App, Context, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled,
+    App, Context, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
+    Styled, div, prelude::FluentBuilder, px,
 };
-use gpui_component::{h_flex, v_flex, ActiveTheme, StyledExt};
 use gpui_component::tooltip::Tooltip;
+use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
 
-use crate::model::{disguise_label, format_pct, format_price, shared, Symbol};
+use crate::model::{Symbol, disguise_label, format_pct, format_price, shared};
 use crate::storage::ColorScheme;
 
 use super::StockApp;
@@ -43,20 +43,36 @@ pub(crate) fn chart_line_palette(theme: &gpui_component::Theme) -> Vec<gpui::Hsl
     ]
 }
 
+pub(crate) struct PaletteRowOptions {
+    pub(crate) in_watchlist: bool,
+    pub(crate) row_id: u64,
+    pub(crate) highlighted: bool,
+    pub(crate) color_scheme: ColorScheme,
+    pub(crate) work_mode: bool,
+    pub(crate) reveal_identity: bool,
+}
+
 pub(crate) fn palette_row(
     sym: Symbol,
-    in_watchlist: bool,
-    row_id: u64,
-    highlighted: bool,
-    color_scheme: ColorScheme,
-    work_mode: bool,
-    reveal_identity: bool,
+    options: PaletteRowOptions,
     cx: &mut Context<StockApp>,
 ) -> impl IntoElement {
     use super::labels::L;
+    let PaletteRowOptions {
+        in_watchlist,
+        row_id,
+        highlighted,
+        color_scheme,
+        work_mode,
+        reveal_identity,
+    } = options;
     let code = sym.code.clone();
     let name = sym.name.to_string();
-    let code_width = if work_mode && reveal_identity { 180.0 } else { 64.0 };
+    let code_width = if work_mode && reveal_identity {
+        180.0
+    } else {
+        64.0
+    };
     let code_show = if work_mode && reveal_identity {
         if is_real_name(sym.name.as_ref(), &sym.code) {
             format!("{} · {}", sym.name, sym.code)
@@ -272,16 +288,12 @@ pub(crate) fn section_title(text: &str, cx: &App) -> impl IntoElement {
 
 /// 解析用户输入的金额/股数（允许千分位逗号、空白）。
 pub(crate) fn parse_f64(raw: &str) -> Option<f64> {
-    let s = raw.trim().replace(',', "").replace('，', "");
+    let s = raw.trim().replace([',', '，'], "");
     if s.is_empty() {
         return None;
     }
     let v: f64 = s.parse().ok()?;
-    if v.is_finite() {
-        Some(v)
-    } else {
-        None
-    }
+    if v.is_finite() { Some(v) } else { None }
 }
 
 /// Compact metric pill used on the overview / treasure dashboards.
@@ -358,7 +370,6 @@ pub(crate) fn short_status_name(name: &str, code: &str) -> String {
 }
 
 #[cfg(test)]
-
 mod name_label_tests {
     use super::{is_real_name, short_status_name, strip_fund_suffix};
 
@@ -391,5 +402,3 @@ mod name_label_tests {
         assert!(!is_real_name("588710", "588710"));
     }
 }
-
-
