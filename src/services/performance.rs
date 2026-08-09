@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 const SAMPLE_CAPACITY: usize = 2_000;
 const MIN_NAVIGATION_SAMPLES: usize = 20;
+const RSS_WARMUP_SECS: u64 = 60;
+const RSS_GROWTH_WINDOW_SECS: u64 = 3_600;
 static PROCESS_STARTED: OnceLock<Instant> = OnceLock::new();
 
 pub fn mark_process_started() {
@@ -41,6 +43,8 @@ pub struct PerformanceReport {
     pub ui_build_p99_ms: Option<f64>,
     pub latest_rss_bytes: Option<u64>,
     pub one_hour_rss_growth_pct: Option<f64>,
+    pub rss_growth_baseline_elapsed_secs: Option<u64>,
+    pub rss_growth_window_secs: Option<u64>,
     pub navigation_sample_count: usize,
     pub ui_build_sample_count: usize,
     pub validation_chart_interaction_count: usize,
@@ -131,14 +135,16 @@ impl PerformanceTracker {
 
     pub fn report(&self) -> PerformanceReport {
         let latest_rss_bytes = self.rss.back().map(|sample| sample.bytes);
-        let one_hour_rss_growth_pct = self.rss.back().and_then(|latest| {
-            let baseline =
-                self.rss.iter().rev().find(|sample| {
-                    latest.elapsed_secs.saturating_sub(sample.elapsed_secs) >= 3_600
-                })?;
-            (baseline.bytes > 0).then_some(
-                (latest.bytes as f64 - baseline.bytes as f64) / baseline.bytes as f64 * 100.0,
-            )
+        let rss_growth_pair = self.rss.back().and_then(|latest| {
+            let baseline = self.rss.iter().rev().find(|sample| {
+                sample.elapsed_secs >= RSS_WARMUP_SECS
+                    && latest.elapsed_secs.saturating_sub(sample.elapsed_secs)
+                        >= RSS_GROWTH_WINDOW_SECS
+            })?;
+            (baseline.bytes > 0).then_some((baseline, latest))
+        });
+        let one_hour_rss_growth_pct = rss_growth_pair.map(|(baseline, latest)| {
+            (latest.bytes as f64 - baseline.bytes as f64) / baseline.bytes as f64 * 100.0
         });
         PerformanceReport {
             generated_at: chrono::Local::now().to_rfc3339(),
@@ -149,6 +155,11 @@ impl PerformanceTracker {
             ui_build_p99_ms: percentile(&self.ui_build_ms, 0.99),
             latest_rss_bytes,
             one_hour_rss_growth_pct,
+            rss_growth_baseline_elapsed_secs: rss_growth_pair
+                .map(|(baseline, _)| baseline.elapsed_secs),
+            rss_growth_window_secs: rss_growth_pair.map(|(baseline, latest)| {
+                latest.elapsed_secs.saturating_sub(baseline.elapsed_secs)
+            }),
             navigation_sample_count: self.navigation_ms.len(),
             ui_build_sample_count: self.ui_build_ms.len(),
             validation_chart_interaction_count: self.validation_chart_interaction_count,
@@ -184,11 +195,14 @@ mod tests {
     #[test]
     fn report_requires_a_full_hour_before_claiming_rss_growth() {
         let mut tracker = PerformanceTracker::default();
-        tracker.record_rss(0, 100);
-        tracker.record_rss(3_599, 105);
+        tracker.record_rss(0, 80);
+        tracker.record_rss(60, 100);
+        tracker.record_rss(3_659, 105);
         assert_eq!(tracker.report().one_hour_rss_growth_pct, None);
-        tracker.record_rss(3_600, 109);
+        tracker.record_rss(3_660, 109);
         assert_eq!(tracker.report().one_hour_rss_growth_pct, Some(9.0));
+        assert_eq!(tracker.report().rss_growth_baseline_elapsed_secs, Some(60));
+        assert_eq!(tracker.report().rss_growth_window_secs, Some(3_600));
         assert_eq!(tracker.report().rss_within_budget(), Some(true));
     }
 

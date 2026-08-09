@@ -63,6 +63,8 @@ mod tests {
             ui_build_p99_ms: Some(12.0),
             latest_rss_bytes: Some(100 * 1024 * 1024),
             one_hour_rss_growth_pct: Some(2.0),
+            rss_growth_baseline_elapsed_secs: Some(60),
+            rss_growth_window_secs: Some(3_600),
             navigation_sample_count: 20,
             ui_build_sample_count: 100,
             validation_chart_interaction_count: 120,
