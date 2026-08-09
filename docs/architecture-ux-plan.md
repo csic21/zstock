@@ -674,3 +674,5 @@ cargo build --release                              PASS
 - [ ] 一个稳定版本周期无回退后，删除 `legacy AppState`、兼容 flags 和旧实现。
 
 这些检查完成后，才可把本文状态改为“全部验收完成”。
+
+Beta 与可用性测试使用 `docs/validation/beta-usability-protocol.md` 逐日、逐参与者记录；空模板不构成通过证据。
