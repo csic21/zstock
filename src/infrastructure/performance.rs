@@ -56,6 +56,7 @@ mod tests {
         let monitor = LocalPerformanceMonitor::new(path.clone());
         let report = PerformanceReport {
             generated_at: "2026-08-09T10:00:00+08:00".into(),
+            validation_mode: true,
             cold_start_interactive_ms: Some(900.0),
             cached_navigation_p95_ms: Some(20.0),
             ui_build_p95_ms: Some(8.0),
@@ -64,6 +65,7 @@ mod tests {
             one_hour_rss_growth_pct: Some(2.0),
             navigation_sample_count: 20,
             ui_build_sample_count: 100,
+            validation_chart_interaction_count: 120,
             rss_sample_count: 61,
         };
         monitor.persist(&report).unwrap();

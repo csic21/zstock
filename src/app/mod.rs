@@ -992,6 +992,17 @@ impl Render for StockApp {
         self.runtime_state
             .performance
             .record_ui_build(render_started.elapsed().as_secs_f64() * 1_000.0);
+        if let Some(started) = self.runtime_state.performance.take_navigation_started() {
+            let entity = cx.entity().clone();
+            window.on_next_frame(move |_, cx| {
+                entity.update(cx, |app, _| {
+                    app.runtime_state
+                        .performance
+                        .record_navigation(started.elapsed().as_secs_f64() * 1_000.0);
+                });
+            });
+            window.request_animation_frame();
+        }
         self.runtime_state
             .performance
             .record_first_interactive(crate::services::performance::process_elapsed_ms());

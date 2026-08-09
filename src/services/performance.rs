@@ -5,6 +5,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 const SAMPLE_CAPACITY: usize = 2_000;
+const MIN_NAVIGATION_SAMPLES: usize = 20;
 static PROCESS_STARTED: OnceLock<Instant> = OnceLock::new();
 
 pub fn mark_process_started() {
@@ -33,6 +34,7 @@ pub struct TimedRssSample {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PerformanceReport {
     pub generated_at: String,
+    pub validation_mode: bool,
     pub cold_start_interactive_ms: Option<f64>,
     pub cached_navigation_p95_ms: Option<f64>,
     pub ui_build_p95_ms: Option<f64>,
@@ -41,6 +43,7 @@ pub struct PerformanceReport {
     pub one_hour_rss_growth_pct: Option<f64>,
     pub navigation_sample_count: usize,
     pub ui_build_sample_count: usize,
+    pub validation_chart_interaction_count: usize,
     pub rss_sample_count: usize,
 }
 
@@ -50,7 +53,10 @@ impl PerformanceReport {
     }
 
     pub fn navigation_within_budget(&self) -> Option<bool> {
-        self.cached_navigation_p95_ms.map(|value| value <= 100.0)
+        (self.navigation_sample_count >= MIN_NAVIGATION_SAMPLES)
+            .then_some(self.cached_navigation_p95_ms)
+            .flatten()
+            .map(|value| value <= 100.0)
     }
 
     pub fn ui_build_within_budget(&self) -> Option<bool> {
@@ -68,13 +74,20 @@ impl PerformanceReport {
 
 #[derive(Debug, Default)]
 pub struct PerformanceTracker {
+    validation_mode: bool,
     cold_start_interactive_ms: Option<f64>,
     navigation_ms: VecDeque<f64>,
     ui_build_ms: VecDeque<f64>,
     rss: VecDeque<TimedRssSample>,
+    navigation_started: Option<Instant>,
+    validation_chart_interaction_count: usize,
 }
 
 impl PerformanceTracker {
+    pub fn mark_validation_run(&mut self) {
+        self.validation_mode = true;
+    }
+
     pub fn record_first_interactive(&mut self, elapsed_ms: f64) {
         if self.cold_start_interactive_ms.is_none() && elapsed_ms.is_finite() && elapsed_ms >= 0.0 {
             self.cold_start_interactive_ms = Some(elapsed_ms);
@@ -85,8 +98,25 @@ impl PerformanceTracker {
         push_bounded(&mut self.navigation_ms, elapsed_ms);
     }
 
+    pub fn begin_navigation(&mut self) {
+        if self.navigation_started.is_none() {
+            self.navigation_started = Some(Instant::now());
+        }
+    }
+
+    pub fn take_navigation_started(&mut self) -> Option<Instant> {
+        self.navigation_started.take()
+    }
+
     pub fn record_ui_build(&mut self, elapsed_ms: f64) {
         push_bounded(&mut self.ui_build_ms, elapsed_ms);
+    }
+
+    pub fn record_validation_chart_interaction(&mut self) {
+        if self.validation_mode {
+            self.validation_chart_interaction_count =
+                self.validation_chart_interaction_count.saturating_add(1);
+        }
     }
 
     pub fn record_rss(&mut self, elapsed_secs: u64, bytes: u64) {
@@ -112,6 +142,7 @@ impl PerformanceTracker {
         });
         PerformanceReport {
             generated_at: chrono::Local::now().to_rfc3339(),
+            validation_mode: self.validation_mode,
             cold_start_interactive_ms: self.cold_start_interactive_ms,
             cached_navigation_p95_ms: percentile(&self.navigation_ms, 0.95),
             ui_build_p95_ms: percentile(&self.ui_build_ms, 0.95),
@@ -120,6 +151,7 @@ impl PerformanceTracker {
             one_hour_rss_growth_pct,
             navigation_sample_count: self.navigation_ms.len(),
             ui_build_sample_count: self.ui_build_ms.len(),
+            validation_chart_interaction_count: self.validation_chart_interaction_count,
             rss_sample_count: self.rss.len(),
         }
     }
@@ -172,5 +204,30 @@ mod tests {
         assert_eq!(report.cold_start_within_budget(), Some(true));
         assert_eq!(report.navigation_within_budget(), Some(true));
         assert_eq!(report.ui_build_within_budget(), Some(true));
+    }
+
+    #[test]
+    fn percentile_budgets_require_acceptance_sample_counts() {
+        let mut tracker = PerformanceTracker::default();
+        for _ in 0..19 {
+            tracker.record_navigation(1.0);
+        }
+        let report = tracker.report();
+        assert_eq!(report.navigation_within_budget(), None);
+
+        tracker.record_navigation(1.0);
+        let report = tracker.report();
+        assert_eq!(report.navigation_within_budget(), Some(true));
+    }
+
+    #[test]
+    fn validation_interactions_are_only_counted_in_validation_mode() {
+        let mut tracker = PerformanceTracker::default();
+        tracker.record_validation_chart_interaction();
+        assert_eq!(tracker.report().validation_chart_interaction_count, 0);
+
+        tracker.mark_validation_run();
+        tracker.record_validation_chart_interaction();
+        assert_eq!(tracker.report().validation_chart_interaction_count, 1);
     }
 }

@@ -140,7 +140,7 @@ impl super::StockApp {
         if self.ui_state.primary_task == task {
             return;
         }
-        let navigation_started = Instant::now();
+        self.runtime_state.performance.begin_navigation();
         let previous = match self.ui_state.primary_task {
             PrimaryTask::Today => TaskName::Today,
             PrimaryTask::Research => TaskName::Research,
@@ -178,9 +178,89 @@ impl super::StockApp {
             }
         }
         self.schedule_persist(cx);
-        self.runtime_state
-            .performance
-            .record_navigation(navigation_started.elapsed().as_secs_f64() * 1_000.0);
         cx.notify();
+    }
+
+    /// Deterministic, opt-in A6 exercise. It only runs when explicitly enabled
+    /// and is intended to be paired with an isolated `ZSTOCK_DATA_DIR`.
+    pub(crate) fn start_a6_validation(&mut self, cx: &mut gpui::Context<Self>) {
+        if std::env::var("ZSTOCK_A6_VALIDATE").as_deref() != Ok("1") {
+            return;
+        }
+        if std::env::var_os("ZSTOCK_DATA_DIR")
+            .filter(|path| !path.is_empty())
+            .is_none()
+        {
+            self.runtime_state.last_error =
+                Some("A6 验证已拒绝启动：必须设置隔离的 ZSTOCK_DATA_DIR".to_string());
+            return;
+        }
+        self.runtime_state.performance.mark_validation_run();
+        cx.spawn(async move |this, cx| {
+            gpui::Timer::after(Duration::from_secs(3)).await;
+            let tasks = [
+                PrimaryTask::Today,
+                PrimaryTask::Research,
+                PrimaryTask::Opportunities,
+                PrimaryTask::Portfolio,
+            ];
+            for index in 0..24 {
+                if this
+                    .update(cx, |app, cx| {
+                        app.set_primary_task(tasks[index % tasks.len()], cx)
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                gpui::Timer::after(Duration::from_millis(150)).await;
+            }
+            if this
+                .update(cx, |app, cx| {
+                    app.set_primary_task(PrimaryTask::Research, cx)
+                })
+                .is_err()
+            {
+                return;
+            }
+            let mut chart_ready = false;
+            for _ in 0..30 {
+                match this.update(cx, |app, _| app.candles.len() > super::CHART_MIN_VISIBLE) {
+                    Ok(true) => {
+                        chart_ready = true;
+                        break;
+                    }
+                    Ok(false) => {
+                        gpui::Timer::after(Duration::from_secs(1)).await;
+                    }
+                    Err(_) => return,
+                }
+            }
+            if !chart_ready {
+                let _ = this.update(cx, |app, _| {
+                    app.runtime_state.last_error =
+                        Some("A6 验证未采集图表帧：等待 30 秒后仍没有足够行情数据".to_string());
+                });
+                return;
+            }
+            eprintln!("A6_CHART_FRAMES_BEGIN expected_interactions=120");
+            for index in 0..120 {
+                if this
+                    .update(cx, |app, cx| {
+                        app.runtime_state
+                            .performance
+                            .record_validation_chart_interaction();
+                        app.chart_zoom(index % 2 == 0, None);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                gpui::Timer::after(Duration::from_millis(40)).await;
+            }
+            eprintln!("A6_CHART_FRAMES_END completed_interactions=120");
+        })
+        .detach();
     }
 }
