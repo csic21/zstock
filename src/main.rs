@@ -20,5 +20,6 @@ mod mac_gesture;
 mod mac_status_bar;
 
 fn main() {
+    services::performance::mark_process_started();
     app::run();
 }

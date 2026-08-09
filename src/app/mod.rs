@@ -22,7 +22,7 @@ mod ui;
 mod view_models;
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     App, AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
@@ -792,6 +792,7 @@ impl StockApp {
 
 impl Render for StockApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let render_started = Instant::now();
         // Persist the window frame whenever it changes (complete dock serialization).
         if !window.is_fullscreen() {
             let b = window.bounds();
@@ -817,7 +818,7 @@ impl Render for StockApp {
             .unwrap_or(self.bottom_height);
         let work = self.work_mode;
 
-        div()
+        let view = div()
             .relative()
             .size_full()
             .flex()
@@ -987,7 +988,14 @@ impl Render for StockApp {
                 self.palette_open && !self.settings_open && !self.market_analysis_open,
                 |this| this.child(self.render_palette(cx)),
             )
-            .children(Root::render_dialog_layer(window, cx))
+            .children(Root::render_dialog_layer(window, cx));
+        self.runtime_state
+            .performance
+            .record_ui_build(render_started.elapsed().as_secs_f64() * 1_000.0);
+        self.runtime_state
+            .performance
+            .record_first_interactive(crate::services::performance::process_elapsed_ms());
+        view
     }
 }
 

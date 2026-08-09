@@ -18,3 +18,7 @@ pub fn portfolio() -> PathBuf {
 pub fn journal() -> PathBuf {
     app_data_dir().join("journal.json")
 }
+
+pub fn performance_report() -> PathBuf {
+    app_data_dir().join("performance-report.json")
+}

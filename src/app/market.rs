@@ -82,6 +82,7 @@ impl StockApp {
     }
 
     pub(crate) fn bootstrap(&mut self, cx: &mut Context<Self>) {
+        self.start_performance_monitor(cx);
         // Paint instantly from cache if we have a prior series for the selected symbol.
         let _ = self.try_restore_series_cache();
         // Initial hydrate + klines

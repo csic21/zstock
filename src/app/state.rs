@@ -7,14 +7,16 @@ use crate::domain::fundamentals::FundamentalSnapshot;
 use crate::domain::market::KlineSeries;
 use crate::domain::money::Currency;
 use crate::services::fundamentals::FundamentalsProvider;
+use crate::services::performance::{PerformanceMonitor, PerformanceTracker};
 use crate::services::task_metrics::{TaskMetric, TaskMetricsSink, TaskName};
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub struct AppServices {
     pub market: MarketController,
     pub fundamentals: Arc<dyn FundamentalsProvider>,
+    pub performance: Arc<dyn PerformanceMonitor>,
     pub task_metrics: Arc<dyn TaskMetricsSink>,
 }
 
@@ -23,6 +25,9 @@ impl Default for AppServices {
         Self {
             market: MarketController::default(),
             fundamentals: Arc::new(crate::infrastructure::market::eastmoney::EastmoneyProvider),
+            performance: Arc::new(
+                crate::infrastructure::performance::LocalPerformanceMonitor::default(),
+            ),
             task_metrics: Arc::new(
                 crate::infrastructure::task_metrics::LocalTaskMetrics::default(),
             ),
@@ -83,6 +88,7 @@ impl Default for UiState {
 #[derive(Default)]
 pub struct RuntimeState {
     pub last_error: Option<String>,
+    pub performance: PerformanceTracker,
 }
 
 #[cfg(feature = "work-mode")]
@@ -92,10 +98,49 @@ pub struct WorkModeFeature {
 }
 
 impl super::StockApp {
+    pub(crate) fn start_performance_monitor(&mut self, cx: &mut gpui::Context<Self>) {
+        let monitor = Arc::clone(&self.services.performance);
+        cx.spawn(async move |this, cx| {
+            loop {
+                let sampler = Arc::clone(&monitor);
+                let rss = smol::unblock(move || sampler.current_rss_bytes()).await;
+                let report = match this.update(cx, |app, _| match rss {
+                    Ok(bytes) => {
+                        app.runtime_state.performance.record_rss(
+                            crate::services::performance::process_elapsed_ms() as u64 / 1_000,
+                            bytes,
+                        );
+                        Some(app.runtime_state.performance.report())
+                    }
+                    Err(error) => {
+                        app.runtime_state.last_error =
+                            Some(format!("采集本地性能指标失败：{error:#}"));
+                        None
+                    }
+                }) {
+                    Ok(report) => report,
+                    Err(_) => break,
+                };
+                if let Some(report) = report {
+                    let persistence = Arc::clone(&monitor);
+                    if let Err(error) = smol::unblock(move || persistence.persist(&report)).await {
+                        let _ = this.update(cx, |app, _| {
+                            app.runtime_state.last_error =
+                                Some(format!("保存本地性能报告失败：{error:#}"));
+                        });
+                    }
+                }
+                gpui::Timer::after(Duration::from_secs(60)).await;
+            }
+        })
+        .detach();
+    }
+
     pub(crate) fn set_primary_task(&mut self, task: PrimaryTask, cx: &mut gpui::Context<Self>) {
         if self.ui_state.primary_task == task {
             return;
         }
+        let navigation_started = Instant::now();
         let previous = match self.ui_state.primary_task {
             PrimaryTask::Today => TaskName::Today,
             PrimaryTask::Research => TaskName::Research,
@@ -133,6 +178,9 @@ impl super::StockApp {
             }
         }
         self.schedule_persist(cx);
+        self.runtime_state
+            .performance
+            .record_navigation(navigation_started.elapsed().as_secs_f64() * 1_000.0);
         cx.notify();
     }
 }
