@@ -10,6 +10,10 @@ or modified.
 | Linux | Secret Service via `secret-tool` | Pending | Must run in a desktop session with an unlocked collection |
 | Windows | DPAPI via PowerShell secure strings | Pending | Must run under the same Windows user for write/read/delete |
 
+The `credential-smoke.yml` workflow runs the same test on macOS, Windows and a temporary Linux
+D-Bus/GNOME Keyring session. It is scheduled separately from PR quality gates and can also be
+started manually.
+
 Platform command:
 
 ```text

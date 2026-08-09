@@ -664,7 +664,7 @@ cargo build --release                              PASS
 
 - [ ] GitHub Actions 四平台/架构质量矩阵全绿。
 - [x] macOS Keychain 保存、读取、删除实机通过。
-- [ ] Linux Secret Service、Windows DPAPI 的保存、读取、删除实机通过。
+- [ ] Linux Secret Service、Windows DPAPI 的保存、读取、删除实机通过（三平台独立 credential-smoke workflow 已就绪，待远端运行）。
 - [ ] Internal/Beta 连续运行至少 5 个交易日，无 P0/P1。
 - [x] A6 冷启动、任务切换、UI build 与 RSS 本地匿名测量链路及预算判定完成。
 - [ ] 累积 20 次缓存导航、GPU 图表帧 p95/p99 及连续 1 小时 RSS 证据并达到预算。
