@@ -246,3 +246,30 @@ impl SecretStore for MemorySecretStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "mutates the current user's native credential store temporarily"]
+    fn native_secret_round_trip_smoke() {
+        let store = NativeSecretStore;
+        let account = format!(
+            "codex-smoke-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let secret = "zstock-credential-smoke-value";
+        store.delete(&account).expect("clean stale test credential");
+        store
+            .set(&account, secret)
+            .expect("write native credential");
+        assert_eq!(
+            store.get(&account).expect("read native credential"),
+            Some(secret.into())
+        );
+        store.delete(&account).expect("delete native credential");
+        assert_eq!(store.get(&account).expect("confirm deletion"), None);
+    }
+}

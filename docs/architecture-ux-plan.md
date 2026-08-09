@@ -652,18 +652,19 @@ cargo clippy --all-targets -- -D warnings          PASS (0 warnings)
 cargo check --all-targets --no-default-features    PASS (0 warnings)
 cargo clippy --all-targets --no-default-features -- -D warnings
                                                     PASS (0 warnings)
-cargo test --all-targets                           PASS (134 passed, 13 ignored)
+cargo test --all-targets                           PASS (134 passed, 14 ignored)
 cargo build --release                              PASS
 ```
 
-13 个 ignored 测试是联网 smoke tests，由 nightly workflow 串行执行；新增的 A 股财务 Provider 真实接口 smoke test已单独通过。质量矩阵使用 Linux x64、Windows x64、macOS 15 arm64 和 macOS 15 Intel x64 原生 runner；两种 macOS 架构均执行离线测试。
+14 个 ignored 测试是联网或原生凭据库 smoke tests，由 nightly workflow 串行执行；A 股财务 Provider 真实接口与 macOS Keychain 写入/读取/删除 smoke test均已单独通过。质量矩阵使用 Linux x64、Windows x64、macOS 15 arm64 和 macOS 15 Intel x64 原生 runner；两种 macOS 架构均执行离线测试。
 
 ### 14.4 发布验收清单
 
 以下项目尚未被标记为完成：
 
 - [ ] GitHub Actions 四平台/架构质量矩阵全绿。
-- [ ] macOS Keychain、Linux Secret Service、Windows DPAPI 的保存、读取、迁移和失败恢复实机通过。
+- [x] macOS Keychain 保存、读取、删除实机通过。
+- [ ] Linux Secret Service、Windows DPAPI 的保存、读取、删除实机通过。
 - [ ] Internal/Beta 连续运行至少 5 个交易日，无 P0/P1。
 - [x] A6 冷启动、任务切换、UI build 与 RSS 本地匿名测量链路及预算判定完成。
 - [ ] 累积 20 次缓存导航、GPU 图表帧 p95/p99 及连续 1 小时 RSS 证据并达到预算。
