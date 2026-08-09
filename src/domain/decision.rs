@@ -48,12 +48,23 @@ impl FactorContributions {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QualityEvidence {
+    pub label: String,
+    pub value: String,
+    pub unit: String,
+    pub reporting_period: String,
+    pub announced_on: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecisionInput {
     pub eligibility: Eligibility,
     pub factors: FactorContributions,
     pub completeness_pct: f64,
     pub supports: Vec<String>,
     pub risks: Vec<String>,
+    pub quality_evidence: Vec<QualityEvidence>,
     pub observation: Option<String>,
     pub invalidation: Option<String>,
     pub target: Option<String>,
@@ -73,6 +84,7 @@ pub struct DecisionCard {
     pub completeness_pct: f64,
     pub supports: Vec<String>,
     pub risks: Vec<String>,
+    pub quality_evidence: Vec<QualityEvidence>,
     pub observation: Option<String>,
     pub invalidation: Option<String>,
     pub target: Option<String>,
@@ -100,9 +112,10 @@ impl DecisionCard {
         } else {
             DecisionStatus::Waiting
         };
-        let mut risks = input.risks;
-        risks.extend(input.eligibility.blockers);
+        let mut risks = input.eligibility.blockers;
         risks.extend(input.eligibility.unknown);
+        risks.extend(input.risks);
+        risks.dedup();
         risks.truncate(2);
         let mut supports = input.supports;
         supports.truncate(3);
@@ -112,6 +125,7 @@ impl DecisionCard {
             completeness_pct,
             supports,
             risks,
+            quality_evidence: input.quality_evidence,
             observation: input.observation,
             invalidation: input.invalidation,
             target: input.target,
@@ -147,6 +161,7 @@ mod tests {
             completeness_pct: 100.0,
             supports: vec!["a".into(), "b".into(), "c".into(), "d".into()],
             risks: vec![],
+            quality_evidence: vec![],
             observation: Some("observe".into()),
             invalidation: Some("invalid".into()),
             target: None,

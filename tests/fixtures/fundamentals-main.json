@@ -1,0 +1,38 @@
+{
+  "main": {
+    "success": true,
+    "result": {
+      "data": [
+        {
+          "SECUCODE": "002027.SZ",
+          "REPORT_DATE": "2025-12-31 00:00:00",
+          "NOTICE_DATE": "2026-04-29 00:00:00",
+          "CURRENCY": "CNY",
+          "ROEJQ": 18.2,
+          "ROIC": 14.7,
+          "NCO_NETPROFIT": 0.92,
+          "ZCFZL": 32.1,
+          "TOTALOPERATEREVETZ": 8.4,
+          "PARENTNETPROFITTZ": 11.6
+        }
+      ]
+    }
+  },
+  "balance": {
+    "success": true,
+    "result": {
+      "data": [
+        {
+          "SECUCODE": "002027.SZ",
+          "REPORT_DATE": "2025-12-31 00:00:00",
+          "NOTICE_DATE": "2026-04-30 00:00:00",
+          "CURRENCY": "CNY",
+          "GOODWILL": 171821374.96,
+          "TOTAL_ASSETS": 20215330494.89,
+          "OPINION_TYPE": "标准无保留意见",
+          "OSOPINION_TYPE": null
+        }
+      ]
+    }
+  }
+}

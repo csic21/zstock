@@ -1,9 +1,12 @@
 use crate::controller::chart::ChartController;
 use crate::controller::discovery::DiscoveryController;
 use crate::controller::market::MarketController;
+use crate::controller::state::RequestSlot;
 use crate::domain::decision::DecisionCard;
+use crate::domain::fundamentals::FundamentalSnapshot;
 use crate::domain::market::KlineSeries;
 use crate::domain::money::Currency;
+use crate::services::fundamentals::FundamentalsProvider;
 use crate::services::task_metrics::{TaskMetric, TaskMetricsSink, TaskName};
 
 use std::sync::Arc;
@@ -11,6 +14,7 @@ use std::time::Instant;
 
 pub struct AppServices {
     pub market: MarketController,
+    pub fundamentals: Arc<dyn FundamentalsProvider>,
     pub task_metrics: Arc<dyn TaskMetricsSink>,
 }
 
@@ -18,6 +22,7 @@ impl Default for AppServices {
     fn default() -> Self {
         Self {
             market: MarketController::default(),
+            fundamentals: Arc::new(crate::infrastructure::market::eastmoney::EastmoneyProvider),
             task_metrics: Arc::new(
                 crate::infrastructure::task_metrics::LocalTaskMetrics::default(),
             ),
@@ -49,6 +54,7 @@ pub struct PortfolioState {
 #[derive(Default)]
 pub struct AnalysisState {
     pub decision_card: Option<DecisionCard>,
+    pub fundamentals: RequestSlot<FundamentalSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

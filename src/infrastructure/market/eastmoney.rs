@@ -1,7 +1,9 @@
 use crate::data;
+use crate::domain::fundamentals::{FundamentalSnapshot, ReportedMetric};
 use crate::domain::market::{
     Adjustment, Availability, CandleRecord, Freshness, KlineSeries, Market, QuoteRecord, SearchHit,
 };
+use crate::services::fundamentals::FundamentalsProvider;
 use crate::services::market_data::{
     KlineProvider, ProviderError, ProviderErrorKind, QuoteProvider, SearchProvider,
 };
@@ -10,6 +12,7 @@ use crate::services::market_data::{
 pub struct EastmoneyProvider;
 
 const PROVIDER: &str = "东方财富";
+const FUNDAMENTALS_SOURCE: &str = "东方财富财务数据中心";
 
 impl QuoteProvider for EastmoneyProvider {
     fn name(&self) -> &'static str {
@@ -100,6 +103,134 @@ impl SearchProvider for EastmoneyProvider {
             })
             .map_err(|error| provider_error(PROVIDER, error))
     }
+}
+
+impl FundamentalsProvider for EastmoneyProvider {
+    fn name(&self) -> &'static str {
+        FUNDAMENTALS_SOURCE
+    }
+
+    fn fetch_fundamentals(
+        &self,
+        code: &str,
+        report_limit: usize,
+    ) -> Result<FundamentalSnapshot, ProviderError> {
+        let market = Market::for_code(code).ok_or_else(|| {
+            ProviderError::new(
+                FUNDAMENTALS_SOURCE,
+                ProviderErrorKind::InvalidPayload,
+                "unknown market code",
+            )
+        })?;
+        if market != Market::AShare {
+            return Err(ProviderError::new(
+                FUNDAMENTALS_SOURCE,
+                ProviderErrorKind::Unavailable,
+                "point-in-time financial provider currently supports A shares only",
+            ));
+        }
+        let reports = data::eastmoney::fetch_fundamental_reports(code, report_limit)
+            .map_err(|error| provider_error(FUNDAMENTALS_SOURCE, error))?;
+        let currency = reports
+            .first()
+            .map(|report| report.currency)
+            .unwrap_or_else(|| market.currency());
+        let mut metrics = Vec::with_capacity(reports.len() * 8);
+        for report in reports {
+            let period = report.reporting_period;
+            let announced = report.announced_on;
+            append_metric(
+                &mut metrics,
+                "roe_pct",
+                report.roe_pct,
+                "%",
+                &period,
+                &announced,
+            );
+            append_metric(
+                &mut metrics,
+                "roic_pct",
+                report.roic_pct,
+                "%",
+                &period,
+                &announced,
+            );
+            append_metric(
+                &mut metrics,
+                "operating_cash_to_profit",
+                report.operating_cash_to_profit,
+                "ratio",
+                &period,
+                &announced,
+            );
+            append_metric(
+                &mut metrics,
+                "debt_ratio_pct",
+                report.debt_ratio_pct,
+                "%",
+                &period,
+                &announced,
+            );
+            append_metric(
+                &mut metrics,
+                "revenue_growth_pct",
+                report.revenue_growth_pct,
+                "%",
+                &period,
+                &announced,
+            );
+            append_metric(
+                &mut metrics,
+                "profit_growth_pct",
+                report.profit_growth_pct,
+                "%",
+                &period,
+                &announced,
+            );
+            append_metric(
+                &mut metrics,
+                "goodwill_ratio_pct",
+                report.goodwill_ratio_pct,
+                "%",
+                &period,
+                &announced,
+            );
+            append_metric(
+                &mut metrics,
+                "audit_risk_flag",
+                report.audit_risk_flag,
+                "bool",
+                &period,
+                &announced,
+            );
+        }
+        Ok(FundamentalSnapshot {
+            code: code.into(),
+            market,
+            currency,
+            fetched_at: now_millis(),
+            source: FUNDAMENTALS_SOURCE.into(),
+            metrics,
+        })
+    }
+}
+
+fn append_metric(
+    metrics: &mut Vec<ReportedMetric>,
+    name: &str,
+    value: Option<f64>,
+    unit: &str,
+    reporting_period: &str,
+    announced_on: &str,
+) {
+    metrics.push(ReportedMetric {
+        name: name.into(),
+        value,
+        unit: unit.into(),
+        reporting_period: reporting_period.into(),
+        announced_on: announced_on.into(),
+        source: FUNDAMENTALS_SOURCE.into(),
+    });
 }
 
 fn provider_error(provider: &str, error: anyhow::Error) -> ProviderError {

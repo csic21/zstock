@@ -1,4 +1,9 @@
-use crate::domain::decision::{DecisionCard, DecisionInput, Eligibility, FactorContributions};
+use crate::domain::decision::{
+    DecisionCard, DecisionInput, Eligibility, FactorContributions, QualityEvidence,
+};
+use crate::domain::fundamentals::{
+    QualityGate, REQUIRED_QUALITY_METRICS, metric_label, quality_gate,
+};
 use crate::domain::journal::{DecisionPlan, EvidenceSnapshot, PlanStatus};
 
 use super::StockApp;
@@ -9,6 +14,93 @@ impl StockApp {
         let levels = self.levels_cache.as_ref();
         let symbol = self.current_symbol();
         let name = symbol.map(|value| value.name.as_ref()).unwrap_or_default();
+        let data_as_of = self
+            .candles
+            .last()
+            .map(|candle| candle.date.to_string())
+            .unwrap_or_else(|| chrono::Local::now().date_naive().to_string());
+        let (fundamental_gate, fundamental_source, latest_financial_notice, quality_evidence) =
+            match &self.analysis_state.fundamentals.state {
+                crate::controller::state::RequestState::Ready(snapshot)
+                    if snapshot.code == self.selected.as_ref() =>
+                {
+                    let notice = snapshot
+                        .metrics
+                        .iter()
+                        .filter(|metric| metric.available_on(&data_as_of))
+                        .map(|metric| metric.announced_on.as_str())
+                        .max()
+                        .map(str::to_string);
+                    let evidence = REQUIRED_QUALITY_METRICS
+                        .iter()
+                        .filter_map(|name| {
+                            let metric = snapshot
+                                .metrics
+                                .iter()
+                                .filter(|metric| {
+                                    metric.name == *name && metric.available_on(&data_as_of)
+                                })
+                                .max_by(|left, right| {
+                                    (&left.reporting_period, &left.announced_on)
+                                        .cmp(&(&right.reporting_period, &right.announced_on))
+                                })?;
+                            let value = metric.value?;
+                            Some(QualityEvidence {
+                                label: metric_label(name).into(),
+                                value: if *name == "audit_risk_flag" {
+                                    if value < 1.0 {
+                                        "标准无保留".into()
+                                    } else {
+                                        "存在风险".into()
+                                    }
+                                } else {
+                                    format!("{value:.2}")
+                                },
+                                unit: metric.unit.clone(),
+                                reporting_period: metric.reporting_period.clone(),
+                                announced_on: metric.announced_on.clone(),
+                                source: metric.source.clone(),
+                            })
+                        })
+                        .collect();
+                    (
+                        quality_gate(&snapshot.metrics, &data_as_of),
+                        snapshot.source.clone(),
+                        notice,
+                        evidence,
+                    )
+                }
+                crate::controller::state::RequestState::Failed(message) => (
+                    QualityGate {
+                        passed: false,
+                        blockers: Vec::new(),
+                        unknown: vec![format!("基本面数据不可用：{message}")],
+                    },
+                    "基本面数据不可用".into(),
+                    None,
+                    Vec::new(),
+                ),
+                crate::controller::state::RequestState::Loading => (
+                    QualityGate {
+                        passed: false,
+                        blockers: Vec::new(),
+                        unknown: vec!["基本面质量数据加载中".into()],
+                    },
+                    "基本面加载中".into(),
+                    None,
+                    Vec::new(),
+                ),
+                _ => (
+                    QualityGate {
+                        passed: false,
+                        blockers: Vec::new(),
+                        unknown: vec!["基本面质量数据未知（未默认通过）".into()],
+                    },
+                    "基本面未知".into(),
+                    None,
+                    Vec::new(),
+                ),
+            };
         let mut blockers = Vec::new();
         if name.to_ascii_uppercase().contains("ST") {
             blockers.push("ST 风险门槛".into());
@@ -40,7 +132,7 @@ impl StockApp {
             volume: (positive * 0.15).clamp(0.0, 10.0),
             risk,
         };
-        let supports = signal
+        let mut supports: Vec<String> = signal
             .as_ref()
             .map(|value| {
                 value
@@ -50,6 +142,12 @@ impl StockApp {
                     .collect()
             })
             .unwrap_or_default();
+        if fundamental_gate.passed {
+            supports.push(format!(
+                "基本面质量门槛通过（公告截至 {}）",
+                latest_financial_notice.as_deref().unwrap_or("—")
+            ));
+        }
         let mut risks = Vec::new();
         if signal
             .as_ref()
@@ -76,29 +174,27 @@ impl StockApp {
         });
         DecisionCard::build(DecisionInput {
             eligibility: Eligibility {
-                passed: blockers.is_empty(),
-                blockers,
-                // A reliable point-in-time fundamentals provider is not yet
-                // configured. Unknown quality evidence must never default-pass.
-                unknown: vec!["基本面质量数据未知（未默认通过）".into()],
+                passed: blockers.is_empty() && fundamental_gate.passed,
+                blockers: blockers
+                    .into_iter()
+                    .chain(fundamental_gate.blockers)
+                    .collect(),
+                unknown: fundamental_gate.unknown,
             },
             factors,
             completeness_pct: completeness,
             supports,
             risks,
+            quality_evidence,
             observation,
             invalidation,
             target,
             risk_reward,
-            data_as_of: self
-                .candles
-                .last()
-                .map(|candle| candle.date.to_string())
-                .unwrap_or_else(|| "—".into()),
-            source: self.data_source.to_string(),
+            data_as_of,
+            source: format!("行情 {}；基本面 {fundamental_source}", self.data_source),
             adjustment: "前复权".into(),
             sample_size: self.candles.len(),
-            strategy_version: "technical-gate-v1".into(),
+            strategy_version: "technical-quality-gate-v2".into(),
             evidence_grade: if self.candles.len() >= 120 {
                 "样本内探索".into()
             } else {

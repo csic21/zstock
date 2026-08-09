@@ -453,6 +453,7 @@ impl StockApp {
     }
 
     pub(crate) fn refresh_all(&mut self, cx: &mut Context<Self>) {
+        self.reload_fundamentals(cx);
         let codes: Vec<String> = self.symbols.iter().map(|s| s.code.clone()).collect();
         let selected = self.selected.to_string();
         let bars = self.current_bars();
@@ -1097,6 +1098,33 @@ impl StockApp {
             ChartKind::Intraday => self.reload_minute(cx),
             ChartKind::DayK | ChartKind::MinuteK(_) => self.reload_klines(cx),
         }
+    }
+
+    pub(crate) fn reload_fundamentals(&mut self, cx: &mut Context<Self>) {
+        let code = self.selected.to_string();
+        let ticket = self.analysis_state.fundamentals.begin(code.clone());
+        self.analysis_state.decision_card = None;
+        let provider = std::sync::Arc::clone(&self.services.fundamentals);
+        cx.spawn(async move |this, cx| {
+            let request_code = code.clone();
+            let result = smol::unblock(move || provider.fetch_fundamentals(&code, 8)).await;
+            let _ = this.update(cx, |app, cx| {
+                let accepted = match result {
+                    Ok(snapshot) => app.analysis_state.fundamentals.apply(&ticket, snapshot),
+                    Err(error) => app
+                        .analysis_state
+                        .fundamentals
+                        .fail(&ticket, error.to_string()),
+                };
+                if !accepted || app.selected.as_ref() != request_code {
+                    return;
+                }
+                app.analysis_state.decision_card =
+                    (!app.candles.is_empty()).then(|| app.decision_card_view_model());
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn set_chart_kind(&mut self, kind: ChartKind, cx: &mut Context<Self>) {

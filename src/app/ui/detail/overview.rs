@@ -56,6 +56,37 @@ impl StockApp {
                             .child(format!("数据完整度 {:.0}%", card.completeness_pct)),
                     ),
             )
+            .when(!card.quality_evidence.is_empty(), |panel| {
+                panel.child(
+                    v_flex()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_semibold()
+                                .text_color(cx.theme().foreground)
+                                .child("基本面证据（point-in-time）"),
+                        )
+                        .children(card.quality_evidence.iter().map(|evidence| {
+                            let value = if evidence.unit == "bool" {
+                                evidence.value.clone()
+                            } else {
+                                format!("{}{}", evidence.value, evidence.unit)
+                            };
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!(
+                                    "{} {} · 报告期 {} · 公告 {} · {}",
+                                    evidence.label,
+                                    value,
+                                    evidence.reporting_period,
+                                    evidence.announced_on,
+                                    evidence.source
+                                ))
+                        })),
+                )
+            })
             .child(
                 h_flex()
                     .gap_3()

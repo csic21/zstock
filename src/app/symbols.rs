@@ -30,6 +30,7 @@ impl StockApp {
         self.selected = code;
         self.palette_open = false;
         self.schedule_persist(cx);
+        self.reload_fundamentals(cx);
         self.reload_chart(cx);
     }
 

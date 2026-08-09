@@ -7,6 +7,7 @@
 //!
 //! These are free for personal tooling but have no SLA; rate-limit politely.
 
+use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -34,6 +35,21 @@ pub struct QuoteTick {
     pub market_time: Option<String>,
     pub availability: Availability,
     pub freshness: Freshness,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FundamentalReportRow {
+    pub reporting_period: String,
+    pub announced_on: String,
+    pub currency: Currency,
+    pub roe_pct: Option<f64>,
+    pub roic_pct: Option<f64>,
+    pub operating_cash_to_profit: Option<f64>,
+    pub debt_ratio_pct: Option<f64>,
+    pub revenue_growth_pct: Option<f64>,
+    pub profit_growth_pct: Option<f64>,
+    pub goodwill_ratio_pct: Option<f64>,
+    pub audit_risk_flag: Option<f64>,
 }
 
 /// A 股行业板块的实时快照。
@@ -89,6 +105,160 @@ fn get_json(url: &str) -> Result<Value> {
         .into_string()
         .context("read body")?;
     serde_json::from_str(&body).context("parse json")
+}
+
+/// Point-in-time financial quality reports for A shares.
+///
+/// The main-finance and balance-sheet responses both carry `REPORT_DATE` and
+/// `NOTICE_DATE`. The later announcement date is retained when the two tables
+/// disagree, so no balance-sheet field can leak into an earlier signal date.
+pub fn fetch_fundamental_reports(
+    code: &str,
+    report_limit: usize,
+) -> Result<Vec<FundamentalReportRow>> {
+    let secu_code = finance_secu_code(code)?;
+    let limit = report_limit.clamp(1, 20);
+    let main = fetch_finance_table(
+        &secu_code,
+        "RPT_F10_FINANCE_MAINFINADATA",
+        "APP_F10_MAINFINADATA",
+        limit,
+    )?;
+    let balance = fetch_finance_table(
+        &secu_code,
+        "RPT_F10_FINANCE_GBALANCE",
+        "SECUCODE,REPORT_DATE,NOTICE_DATE,CURRENCY,GOODWILL,TOTAL_ASSETS,OPINION_TYPE,OSOPINION_TYPE",
+        limit,
+    )?;
+    parse_fundamental_reports(&main, &balance)
+}
+
+fn fetch_finance_table(secu_code: &str, report: &str, style: &str, limit: usize) -> Result<Value> {
+    let filter = urlencoding_minimal(&format!("(SECUCODE=\"{secu_code}\")"));
+    let url = format!(
+        "https://datacenter.eastmoney.com/securities/api/data/get?type={report}\
+         &sty={}&filter={filter}&p=1&ps={limit}&sr=-1&st=REPORT_DATE&source=HSF10&client=PC",
+        urlencoding_minimal(style)
+    );
+    let value = get_json(&url)?;
+    if !value
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!(
+            "financial endpoint failed: {}",
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown response")
+        );
+    }
+    Ok(value)
+}
+
+fn parse_fundamental_reports(main: &Value, balance: &Value) -> Result<Vec<FundamentalReportRow>> {
+    let balance_rows = response_rows(balance)?;
+    let mut balance_by_period = HashMap::new();
+    for row in balance_rows {
+        let period = iso_date(row.get("REPORT_DATE"), "balance REPORT_DATE")?;
+        let announced = iso_date(row.get("NOTICE_DATE"), "balance NOTICE_DATE")?;
+        let goodwill = optional_f64(row.get("GOODWILL"));
+        let total_assets = optional_f64(row.get("TOTAL_ASSETS"));
+        let goodwill_ratio_pct = goodwill
+            .zip(total_assets)
+            .and_then(|(goodwill, assets)| (assets > 0.0).then_some(goodwill / assets * 100.0));
+        let audit_opinion = row
+            .get("OPINION_TYPE")
+            .or_else(|| row.get("OSOPINION_TYPE"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty());
+        let audit_risk_flag = audit_opinion.map(|opinion| {
+            if opinion.contains("标准无保留") {
+                0.0
+            } else {
+                1.0
+            }
+        });
+        balance_by_period.insert(period, (announced, goodwill_ratio_pct, audit_risk_flag));
+    }
+
+    let mut reports = Vec::new();
+    for row in response_rows(main)? {
+        let reporting_period = iso_date(row.get("REPORT_DATE"), "main REPORT_DATE")?;
+        let main_announced = iso_date(row.get("NOTICE_DATE"), "main NOTICE_DATE")?;
+        let (announced_on, goodwill_ratio_pct, audit_risk_flag) = balance_by_period
+            .get(&reporting_period)
+            .map(|(balance_announced, goodwill, audit)| {
+                (
+                    main_announced.clone().max(balance_announced.clone()),
+                    *goodwill,
+                    *audit,
+                )
+            })
+            .unwrap_or((main_announced, None, None));
+        let currency = match row.get("CURRENCY").and_then(Value::as_str) {
+            Some("CNY") | None => Currency::Cny,
+            Some(other) => bail!("unsupported financial currency {other}"),
+        };
+        reports.push(FundamentalReportRow {
+            reporting_period,
+            announced_on,
+            currency,
+            roe_pct: optional_f64(row.get("ROEJQ")),
+            roic_pct: optional_f64(row.get("ROIC")),
+            operating_cash_to_profit: optional_f64(row.get("NCO_NETPROFIT")),
+            debt_ratio_pct: optional_f64(row.get("ZCFZL")),
+            revenue_growth_pct: optional_f64(row.get("TOTALOPERATEREVETZ")),
+            profit_growth_pct: optional_f64(row.get("PARENTNETPROFITTZ")),
+            goodwill_ratio_pct,
+            audit_risk_flag,
+        });
+    }
+    if reports.is_empty() {
+        bail!("financial endpoint returned no reports");
+    }
+    Ok(reports)
+}
+
+fn response_rows(value: &Value) -> Result<&Vec<Value>> {
+    value
+        .pointer("/result/data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("financial response missing result.data"))
+}
+
+fn finance_secu_code(code: &str) -> Result<String> {
+    let normalized = normalize_code(code)
+        .ok_or_else(|| anyhow!("point-in-time financial provider requires a valid code"))?;
+    if normalized.len() != 6 || !normalized.chars().all(|ch| ch.is_ascii_digit()) {
+        bail!("point-in-time financial provider currently supports A shares only");
+    }
+    let exchange = if normalized.starts_with('6') {
+        "SH"
+    } else {
+        "SZ"
+    };
+    Ok(format!("{normalized}.{exchange}"))
+}
+
+fn iso_date(value: Option<&Value>, field: &str) -> Result<String> {
+    let raw = value
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("financial response missing {field}"))?;
+    let date = raw.get(..10).unwrap_or(raw);
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .with_context(|| format!("invalid {field}"))?;
+    Ok(date.to_string())
+}
+
+fn optional_f64(value: Option<&Value>) -> Option<f64> {
+    let number = match value? {
+        Value::Number(number) => number.as_f64(),
+        Value::String(number) => number.parse().ok(),
+        _ => None,
+    }?;
+    number.is_finite().then_some(number)
 }
 
 /// Compact network errors for UI (avoid dumping full query strings).
@@ -660,5 +830,41 @@ mod universe_list_tests {
             "universe sample: {} {} mv={:.0}",
             rows[0].code, rows[0].name, rows[0].market_cap
         );
+    }
+}
+
+#[cfg(test)]
+mod fundamental_tests {
+    use super::*;
+
+    #[test]
+    fn point_in_time_fixture_keeps_later_notice_date_and_units() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/fundamentals-main.json"))
+                .unwrap();
+        let reports = parse_fundamental_reports(&fixture["main"], &fixture["balance"]).unwrap();
+        assert_eq!(reports.len(), 1);
+        let report = &reports[0];
+        assert_eq!(report.reporting_period, "2025-12-31");
+        assert_eq!(report.announced_on, "2026-04-30");
+        assert_eq!(report.currency, Currency::Cny);
+        assert_eq!(report.audit_risk_flag, Some(0.0));
+        assert!(report.goodwill_ratio_pct.is_some_and(|value| value < 1.0));
+    }
+
+    #[test]
+    fn hong_kong_financials_do_not_fall_through_to_a_share_endpoint() {
+        let error = finance_secu_code("00700").unwrap_err();
+        assert!(error.to_string().contains("A shares only"));
+    }
+
+    #[test]
+    #[ignore = "requires public financial-data network"]
+    fn fundamental_reports_smoke() {
+        let reports = fetch_fundamental_reports("600519", 2).expect("financial reports");
+        assert!(!reports.is_empty());
+        assert!(reports.iter().all(|report| {
+            !report.reporting_period.is_empty() && !report.announced_on.is_empty()
+        }));
     }
 }
