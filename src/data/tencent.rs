@@ -13,9 +13,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 
+use crate::domain::market::{Availability, Freshness};
+use crate::domain::money::Currency;
 use crate::model::{
-    Candle, MinutePeriod, MinutePoint, MinuteSeries, Symbol, board_for_code, is_hk_code, normalize_code,
-    shared,
+    Candle, MinutePeriod, MinutePoint, MinuteSeries, Symbol, board_for_code, is_hk_code,
+    normalize_code, shared,
 };
 
 use super::eastmoney::QuoteTick;
@@ -51,8 +53,7 @@ pub fn tencent_symbol(code: &str) -> String {
 }
 
 fn is_sh_market(code: &str) -> bool {
-    !is_hk_code(code)
-        && (code.starts_with('6') || code.starts_with('5') || code.starts_with('9'))
+    !is_hk_code(code) && (code.starts_with('6') || code.starts_with('5') || code.starts_with('9'))
 }
 
 fn is_bj_market(code: &str) -> bool {
@@ -148,17 +149,27 @@ fn parse_quote_body(body: &str) -> Result<Vec<QuoteTick>> {
         if code.is_empty() {
             continue;
         }
+        let Some(currency) = Currency::for_code(&code) else {
+            continue;
+        };
         let parse_f = |i: usize| -> f64 { f.get(i).and_then(|s| s.parse().ok()).unwrap_or(0.0) };
+        let last = parse_f(3);
         out.push(QuoteTick {
             code,
             name: f[1].trim().to_string(),
-            last: parse_f(3),
-            prev_close: parse_f(4),
-            open: parse_f(5),
+            last,
             volume: parse_f(6) as u64,
             change_pct: parse_f(32),
-            high: parse_f(33),
-            low: parse_f(34),
+            currency,
+            source: "腾讯财经".into(),
+            fetched_at: chrono::Utc::now().timestamp_millis(),
+            market_time: None,
+            availability: if last > 0.0 {
+                Availability::Available
+            } else {
+                Availability::Invalid
+            },
+            freshness: Freshness::Live,
         });
     }
     Ok(out)
@@ -256,9 +267,7 @@ fn parse_klines_response(
 pub fn fetch_minute_series(code: &str) -> Result<MinuteSeries> {
     let code = code.trim();
     let symbol = tencent_symbol(code);
-    let url = format!(
-        "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={symbol}"
-    );
+    let url = format!("https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={symbol}");
     let v = fetch_json(&url)?;
     let node = v
         .pointer(&format!("/data/{symbol}/data"))
@@ -271,7 +280,10 @@ pub fn fetch_minute_series(code: &str) -> Result<MinuteSeries> {
         .to_string();
     let prev_close = v
         .pointer(&format!("/data/{symbol}/qt/{symbol}/4"))
-        .and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse().ok())))
+        .and_then(|x| {
+            x.as_f64()
+                .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+        })
         .unwrap_or(0.0);
     let date = node
         .get("date")
@@ -302,12 +314,9 @@ fn parse_minute_rows(rows: &[Value]) -> Vec<MinutePoint> {
     for row in rows {
         let s = row.as_str().unwrap_or_default();
         let mut parts = s.split_whitespace();
-        let (Some(hhmm), Some(price), Some(cum_vol), Some(cum_amt)) = (
-            parts.next(),
-            parts.next(),
-            parts.next(),
-            parts.next(),
-        ) else {
+        let (Some(hhmm), Some(price), Some(cum_vol), Some(cum_amt)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
             continue;
         };
         let (Ok(price), Ok(cum_vol), Ok(cum_amt)) = (
@@ -333,11 +342,7 @@ fn parse_minute_rows(rows: &[Value]) -> Vec<MinutePoint> {
 }
 
 /// 分钟 K（`mkline`）：m1/m5/m15/m30/m60，单次上限约 320/800 根。
-pub fn fetch_minute_klines(
-    code: &str,
-    period: MinutePeriod,
-    limit: usize,
-) -> Result<Vec<Candle>> {
+pub fn fetch_minute_klines(code: &str, period: MinutePeriod, limit: usize) -> Result<Vec<Candle>> {
     let code = code.trim();
     let symbol = tencent_symbol(code);
     let limit = limit.clamp(5, period.bars());
@@ -420,17 +425,17 @@ pub fn search_symbols(query: &str, limit: usize) -> Result<Vec<Symbol>> {
     let mut out = parse_smartbox(&body, limit);
 
     // Fallback: pure 6-digit A / 5-digit HK / explicit hk prefix
-    if out.is_empty() {
-        if let Some(code) = normalize_code(q) {
-            out.push(Symbol {
-                code: code.clone(),
-                name: shared(code.clone()),
-                last: 0.0,
-                change_pct: 0.0,
-                volume: 0,
-                board: board_for_code(&code),
-            });
-        }
+    if out.is_empty()
+        && let Some(code) = normalize_code(q)
+    {
+        out.push(Symbol {
+            code: code.clone(),
+            name: shared(code.clone()),
+            last: 0.0,
+            change_pct: 0.0,
+            volume: 0,
+            board: board_for_code(&code),
+        });
     }
     Ok(out)
 }
@@ -521,22 +526,21 @@ fn decode_json_unicode_escapes(s: &str) -> String {
             it.next(); // consume 'u'
             let mut hex = String::with_capacity(4);
             for _ in 0..4 {
-                if let Some(h) = it.peek().copied() {
-                    if h.is_ascii_hexdigit() {
-                        hex.push(h);
-                        it.next();
-                        continue;
-                    }
+                if let Some(h) = it.peek().copied()
+                    && h.is_ascii_hexdigit()
+                {
+                    hex.push(h);
+                    it.next();
+                    continue;
                 }
                 break;
             }
-            if hex.len() == 4 {
-                if let Ok(cp) = u16::from_str_radix(&hex, 16) {
-                    if let Some(ch) = char::from_u32(cp as u32) {
-                        out.push(ch);
-                        continue;
-                    }
-                }
+            if hex.len() == 4
+                && let Ok(cp) = u16::from_str_radix(&hex, 16)
+                && let Some(ch) = char::from_u32(cp as u32)
+            {
+                out.push(ch);
+                continue;
             }
             // Incomplete escape — keep raw.
             out.push('\\');
@@ -663,6 +667,5 @@ mod tests {
         assert_eq!(ticks[0].code, "600519");
         assert!((ticks[0].last - 1420.97).abs() < 1e-6);
         assert!((ticks[0].change_pct - (-0.10)).abs() < 1e-6);
-        assert!((ticks[0].high - 1426.50).abs() < 1e-6);
     }
 }

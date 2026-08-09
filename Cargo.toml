@@ -5,6 +5,24 @@ edition = "2024"
 description = "A-share and Hong Kong stock analysis desktop app built with GPUI"
 license = "MIT"
 
+[features]
+default = [
+    "work-mode",
+    "architecture_v2",
+    "persistence_v2",
+    "portfolio_currency_v2",
+    "home_experience_v2",
+    "decision_card_v1",
+]
+work-mode = []
+architecture_v2 = []
+persistence_v2 = []
+portfolio_currency_v2 = []
+home_experience_v2 = []
+decision_card_v1 = []
+# Expected only because legacy objc 0.2 macros reference this historical cfg.
+cargo-clippy = []
+
 # Optional: cargo install cargo-bundle && cargo bundle --release
 [package.metadata.bundle]
 name = "ZStock"

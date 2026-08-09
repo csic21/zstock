@@ -4,6 +4,12 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::domain::journal::{DecisionPlan, PlanOutcome, PlanStatus, add_outcome_idempotently};
+use crate::model::Candle;
+
+pub const JOURNAL_SCHEMA_VERSION: u32 =
+    crate::infrastructure::storage::migrations::JOURNAL_SCHEMA_VERSION;
+
 /// 日记来源。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -60,6 +66,10 @@ pub struct JournalEntry {
     pub note: String,
     /// 本地时间 `YYYY-MM-DD HH:MM:SS`
     pub created_at: String,
+    #[serde(default)]
+    pub plan: Option<DecisionPlan>,
+    #[serde(default)]
+    pub outcomes: Vec<PlanOutcome>,
 }
 
 impl JournalEntry {
@@ -82,10 +92,25 @@ impl JournalEntry {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Journal {
+    #[serde(default = "current_schema_version")]
+    pub schema_version: u32,
     #[serde(default)]
     pub entries: Vec<JournalEntry>,
+}
+
+fn current_schema_version() -> u32 {
+    JOURNAL_SCHEMA_VERSION
+}
+
+impl Default for Journal {
+    fn default() -> Self {
+        Self {
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            entries: Vec::new(),
+        }
+    }
 }
 
 /// 最多保留条数，防止日记无限涨。
@@ -113,6 +138,87 @@ impl Journal {
         self.entries.retain(|e| e.id != id);
         self.entries.len() != before
     }
+
+    pub fn mark_due(&mut self, today: &str) -> usize {
+        let mut changed = 0;
+        for entry in &mut self.entries {
+            let Some(plan) = entry.plan.as_mut() else {
+                continue;
+            };
+            if plan.status == PlanStatus::Planned && plan.review_on.as_str() <= today {
+                plan.status = PlanStatus::DueForReview;
+                changed += 1;
+            }
+        }
+        changed
+    }
+
+    pub fn add_outcome(&mut self, entry_id: &str, outcome: PlanOutcome) -> bool {
+        self.entries
+            .iter_mut()
+            .find(|entry| entry.id == entry_id)
+            .is_some_and(|entry| add_outcome_idempotently(&mut entry.outcomes, outcome))
+    }
+
+    pub fn behavior_sample_size(&self) -> Option<usize> {
+        let reviewed = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.status == PlanStatus::Reviewed)
+            })
+            .count();
+        (reviewed >= 20).then_some(reviewed)
+    }
+
+    /// Fill deterministic 5/10/20-session outcomes once the corresponding
+    /// bars exist. Existing horizons are left untouched, so refreshes are
+    /// idempotent and retain the original evidence snapshot.
+    pub fn update_outcomes_for_series(&mut self, code: &str, candles: &[Candle]) -> usize {
+        let mut changed = 0;
+        for entry in self.entries.iter_mut().filter(|entry| entry.code == code) {
+            let Some(plan) = entry.plan.as_ref() else {
+                continue;
+            };
+            let Some(entry_index) = candles
+                .iter()
+                .position(|candle| candle.date.as_ref() >= plan.created_on.as_str())
+            else {
+                continue;
+            };
+            let base = candles[entry_index].close;
+            if !base.is_finite() || base <= 0.0 {
+                continue;
+            }
+            for horizon in [5_u16, 10, 20] {
+                let exit_index = entry_index + usize::from(horizon);
+                if exit_index >= candles.len() {
+                    continue;
+                }
+                let window = &candles[entry_index + 1..=exit_index];
+                let outcome = PlanOutcome {
+                    plan_id: plan.id.clone(),
+                    horizon_days: horizon,
+                    return_pct: (candles[exit_index].close / base - 1.0) * 100.0,
+                    maximum_favorable_excursion_pct: window
+                        .iter()
+                        .map(|candle| (candle.high / base - 1.0) * 100.0)
+                        .fold(f64::NEG_INFINITY, f64::max),
+                    maximum_adverse_excursion_pct: window
+                        .iter()
+                        .map(|candle| (candle.low / base - 1.0) * 100.0)
+                        .fold(f64::INFINITY, f64::min),
+                };
+                if add_outcome_idempotently(&mut entry.outcomes, outcome) {
+                    changed += 1;
+                }
+            }
+        }
+        changed
+    }
 }
 
 pub fn new_id() -> String {
@@ -137,14 +243,14 @@ pub fn note_for_alert(
     current: f64,
 ) -> String {
     let leg = kind.label(false);
-    format!(
-        "{leg}触发 · {code} {name} · 目标 {target:.2} · 现价 {current:.2} · 仅记录观察，未下单"
-    )
+    format!("{leg}触发 · {code} {name} · 目标 {target:.2} · 现价 {current:.2} · 仅记录观察，未下单")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::journal::{EvidenceSnapshot, PlanStatus};
+    use crate::model::shared;
 
     #[test]
     fn cap_trims_oldest() {
@@ -159,9 +265,94 @@ mod tests {
                 target: None,
                 note: "n".into(),
                 created_at: "t".into(),
+                plan: None,
+                outcomes: Vec::new(),
             });
         }
         assert_eq!(j.entries.len(), JOURNAL_CAP);
         assert_eq!(j.entries[0].id, format!("{}", JOURNAL_CAP + 4));
+    }
+
+    fn planned_entry(id: &str, created_on: &str, review_on: &str) -> JournalEntry {
+        JournalEntry {
+            id: id.into(),
+            code: "600519".into(),
+            name: "fixture".into(),
+            kind: JournalKind::FromPick,
+            price: Some(10.0),
+            target: Some(12.0),
+            note: "plan".into(),
+            created_at: format!("{created_on} 09:00:00"),
+            plan: Some(DecisionPlan {
+                id: id.into(),
+                code: "600519".into(),
+                created_on: created_on.into(),
+                review_on: review_on.into(),
+                trigger: "trigger".into(),
+                observation_range: "9.8-10.2".into(),
+                invalidation: "9.0".into(),
+                target: Some("12.0".into()),
+                risk_amount: None,
+                status: PlanStatus::Planned,
+                evidence: EvidenceSnapshot {
+                    strategy_version: "strategy-v1".into(),
+                    data_as_of: created_on.into(),
+                    source: "fixture".into(),
+                    payload_json: "{\"score\":61}".into(),
+                },
+                executed: None,
+                exit_reason: None,
+                followed_plan: None,
+            }),
+            outcomes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn due_transition_and_outcomes_are_idempotent_and_keep_evidence() {
+        let mut journal = Journal::default();
+        journal.push(planned_entry("p1", "2026-01-01", "2026-01-10"));
+        assert_eq!(journal.mark_due("2026-01-10"), 1);
+        assert_eq!(journal.mark_due("2026-01-10"), 0);
+
+        let candles = (0..25)
+            .map(|index| {
+                let price = 10.0 + index as f64 * 0.1;
+                Candle {
+                    date: shared(format!("2026-01-{:02}", index + 1)),
+                    open: price,
+                    high: price + 0.2,
+                    low: price - 0.2,
+                    close: price,
+                    volume: 1_000,
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(journal.update_outcomes_for_series("600519", &candles), 3);
+        assert_eq!(journal.update_outcomes_for_series("600519", &candles), 0);
+        assert_eq!(journal.entries[0].outcomes.len(), 3);
+        assert_eq!(
+            journal.entries[0]
+                .plan
+                .as_ref()
+                .unwrap()
+                .evidence
+                .strategy_version,
+            "strategy-v1"
+        );
+    }
+
+    #[test]
+    fn behavior_trends_stay_hidden_before_twenty_reviews() {
+        let mut journal = Journal::default();
+        for index in 0..20 {
+            let mut entry = planned_entry(&format!("p{index}"), "2026-01-01", "2026-01-10");
+            entry.plan.as_mut().unwrap().status = PlanStatus::Reviewed;
+            journal.push(entry);
+            if index < 19 {
+                assert_eq!(journal.behavior_sample_size(), None);
+            }
+        }
+        assert_eq!(journal.behavior_sample_size(), Some(20));
     }
 }

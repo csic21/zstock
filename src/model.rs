@@ -122,15 +122,6 @@ impl Symbol {
     pub fn is_up(&self) -> bool {
         self.change_pct >= 0.0
     }
-
-    pub fn ticker_label(&self) -> SharedString {
-        SharedString::from(self.code.clone())
-    }
-
-    /// Eastmoney `secid`: A 股 `1.600519` / `0.000001`，港股 `116.00700`。
-    pub fn secid(&self) -> String {
-        secid_for_code(&self.code)
-    }
 }
 
 /// Daily (or bar) OHLCV candle.
@@ -240,7 +231,8 @@ impl MinutePoint {
 
     /// Volume traded in this minute vs the previous point.
     pub fn minute_volume(&self, prev: Option<&MinutePoint>) -> u64 {
-        self.cum_volume.saturating_sub(prev.map(|p| p.cum_volume).unwrap_or(0))
+        self.cum_volume
+            .saturating_sub(prev.map(|p| p.cum_volume).unwrap_or(0))
     }
 }
 
@@ -469,11 +461,7 @@ pub fn default_watchlist_codes() -> Vec<String> {
 }
 
 pub fn format_price(v: f64) -> String {
-    if v >= 1000.0 {
-        format!("{v:.2}")
-    } else if v >= 100.0 {
-        format!("{v:.2}")
-    } else if v >= 10.0 {
+    if v >= 10.0 {
         format!("{v:.2}")
     } else {
         format!("{v:.3}")

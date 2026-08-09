@@ -81,9 +81,7 @@ impl BuyAlert {
     }
 
     pub fn any_armed(&self) -> bool {
-        self.is_valid()
-            || self.has_sell()
-            || self.has_stop()
+        self.is_valid() || self.has_sell() || self.has_stop()
     }
 }
 

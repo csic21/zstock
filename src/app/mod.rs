@@ -6,40 +6,43 @@
 //! - [`ui`] — render methods
 //! - [`helpers`] — pure formatting helpers
 
+mod alerts;
 mod chart_ctrl;
 mod helpers;
 mod labels;
-mod alerts;
 mod market;
 mod market_analysis;
 mod portfolio;
 mod prefs;
 mod series_cache;
+mod state;
 mod symbols;
 mod types;
 mod ui;
+mod view_models;
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use gpui::{
-    actions, div, point, px, size, App, AppContext, Bounds, Context, Entity, FocusHandle,
-    InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, KeyUpEvent, ParentElement, Pixels,
-    Point, Render, SharedString, Styled, Window, WindowBounds, WindowOptions,
-    prelude::FluentBuilder,
+    App, AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
+    KeyBinding, KeyDownEvent, KeyUpEvent, ParentElement, Pixels, Point, Render, SharedString,
+    Styled, Window, WindowBounds, WindowOptions, actions, div, point, prelude::FluentBuilder, px,
+    size,
 };
 use gpui_component::{
+    ActiveTheme, PixelsExt, Root, TITLE_BAR_HEIGHT, Theme, ThemeMode, TitleBar,
     input::{InputEvent, InputState},
     resizable::{h_resizable, resizable_panel, v_resizable},
-    v_flex, ActiveTheme, PixelsExt, Root, Theme, ThemeMode, TitleBar, TITLE_BAR_HEIGHT,
+    v_flex,
 };
 
 use crate::data::ai::AiConfig;
 use crate::data::alerts::BuyAlert;
 use crate::data::backtest::BacktestReport;
 use crate::data::groups::{FindMode, WatchTag};
-use crate::data::journal::Journal;
 use crate::data::indicators::{BollSeries, MaSeries, MacdSeries};
+use crate::data::journal::Journal;
 use crate::data::levels;
 use crate::data::market as market_data;
 use crate::data::market_analysis as market_analysis_data;
@@ -49,15 +52,22 @@ use crate::data::scout::ScoutPick;
 use crate::data::signals;
 use crate::data::treasure::TreasureHit;
 use crate::data::universe::{FinFilter, TreasurePool};
+use crate::domain::money::Currency;
 use crate::model::{
-    board_for_code, normalize_code, shared, Candle, IndexSnap, MinuteSeries, Symbol, TrendLine,
+    Candle, IndexSnap, MinuteSeries, Symbol, TrendLine, board_for_code, normalize_code, shared,
 };
 use crate::storage::{
-    self, clamp_quote_interval_secs, normalize_status_bar, ColorScheme, DockLayout, WatchlistSort,
-    WorkDensity,
+    self, ColorScheme, DockLayout, WatchlistSort, WorkDensity, clamp_quote_interval_secs,
+    normalize_status_bar,
 };
 use crate::update::UpdateState;
 
+#[cfg(feature = "work-mode")]
+use state::WorkModeFeature;
+use state::{
+    AnalysisState, AppServices, ChartState, DiscoveryState, MarketState, PortfolioState,
+    RuntimeState, UiState,
+};
 use types::{
     AiCacheEntry, AiPanelState, AiSource, ChartKind, ChartRange, DetailTab, LeftTab, MarketRegion,
     SettingsSection,
@@ -97,7 +107,23 @@ pub(crate) const PERSIST_DEBOUNCE: Duration = Duration::from_millis(400);
 /// Latched Map reveal auto-hides after this delay (hold-to-peek is separate).
 pub(crate) const WORK_IDENTITY_AUTO_HIDE: Duration = Duration::from_secs(6);
 
+/// GPUI lifecycle shell. Business/request state is held in explicit aggregates;
+/// `legacy` remains temporarily deref-compatible while controllers are adopted incrementally.
 pub struct StockApp {
+    services: AppServices,
+    market_state: MarketState,
+    chart_state: ChartState,
+    discovery_state: DiscoveryState,
+    portfolio_state: PortfolioState,
+    analysis_state: AnalysisState,
+    ui_state: UiState,
+    runtime_state: RuntimeState,
+    #[cfg(feature = "work-mode")]
+    work_mode_feature: WorkModeFeature,
+    legacy: AppState,
+}
+
+pub struct AppState {
     symbols: Vec<Symbol>,
     selected: SharedString,
     /// Code that currently loaded `candles` belong to (may lag `selected` while loading).
@@ -286,6 +312,7 @@ pub struct StockApp {
     journal_note_input: Entity<InputState>,
     /// 概览只看当前标的日记。
     journal_filter_selected: bool,
+    journal_delete_confirm_id: Option<String>,
     /// 上证综指（work 模式 cpu）。
     index_sh: Option<IndexSnap>,
     /// 沪深300（work 模式 mem）。
@@ -337,7 +364,19 @@ pub struct StockApp {
     _subscriptions: Vec<gpui::Subscription>,
 }
 
+impl std::ops::Deref for StockApp {
+    type Target = AppState;
 
+    fn deref(&self) -> &Self::Target {
+        &self.legacy
+    }
+}
+
+impl std::ops::DerefMut for StockApp {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.legacy
+    }
+}
 
 impl StockApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -374,24 +413,20 @@ impl StockApp {
                 .unwrap_or_else(|| shared("600519"))
         };
 
-        let palette_query = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("搜索代码 / 名称，回车添加自选…")
-        });
+        let palette_query =
+            cx.new(|cx| InputState::new(window, cx).placeholder("搜索代码 / 名称，回车添加自选…"));
         let palette_focus = cx.focus_handle();
         let filtered_local: Vec<usize> = (0..symbols.len()).collect();
 
         let ai_cfg = cfg.ai_api.clone();
-        let ai_base_url_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("https://api.openai.com/v1")
-        });
+        let ai_base_url_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("https://api.openai.com/v1"));
         let ai_model_input = cx.new(|cx| InputState::new(window, cx).placeholder("gpt-5-mini"));
-        let ai_api_key_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("sk-…")
-                .masked(true)
-        });
+        let ai_api_key_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("sk-…").masked(true));
         let ai_cli_bin_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("可选：CLI 绝对路径，如 /opt/homebrew/bin/claude")
+            InputState::new(window, cx)
+                .placeholder("可选：CLI 绝对路径，如 /opt/homebrew/bin/claude")
         });
         ai_base_url_input.update(cx, |state, cx| {
             state.set_value(ai_cfg.base_url.clone(), window, cx);
@@ -407,44 +442,48 @@ impl StockApp {
         });
 
         let portfolio = storage::load_portfolio();
-        let journal = storage::load_journal();
+        let mut journal = storage::load_journal();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        if journal.mark_due(&today) > 0
+            && let Err(error) = storage::save_journal(&journal)
+        {
+            storage::record_storage_error(format!("更新待复盘计划失败：{error:#}"));
+        }
         let trade_shares_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("股数，如 100"));
-        let trade_price_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("成交价"));
-        let trade_fee_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("手续费，可 0"));
-        let trade_note_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("备注（可选）"));
-        let portfolio_cash_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("现金余额"));
-        let alert_price_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("目标价，如 12.30")
-        });
+        let trade_price_input = cx.new(|cx| InputState::new(window, cx).placeholder("成交价"));
+        let trade_fee_input = cx.new(|cx| InputState::new(window, cx).placeholder("手续费，可 0"));
+        let trade_note_input = cx.new(|cx| InputState::new(window, cx).placeholder("备注（可选）"));
+        let portfolio_cash_input = cx.new(|cx| InputState::new(window, cx).placeholder("现金余额"));
+        let alert_price_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("目标价，如 12.30"));
         let journal_note_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("写一句观察 / 计划，如：回踩 MA20 再看…")
         });
         portfolio_cash_input.update(cx, |state, cx| {
-            state.set_value(format!("{:.2}", portfolio.cash), window, cx);
+            let currency = Currency::for_code(selected.as_ref()).unwrap_or(Currency::Cny);
+            state.set_value(
+                format!("{:.2}", portfolio.cash(currency).major()),
+                window,
+                cx,
+            );
         });
 
-        let work_alias_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("service tag · e.g. core-db")
-        });
+        let work_alias_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("service tag · e.g. core-db"));
 
         let _subscriptions = vec![
             cx.subscribe_in(&palette_query, window, {
-                move |this, state: &Entity<InputState>, event: &InputEvent, window, cx| {
-                    match event {
-                        InputEvent::Change => {
-                            let q = state.read(cx).value().to_string();
-                            this.on_palette_query_changed(&q, cx);
-                        }
-                        InputEvent::PressEnter { .. } => {
-                            this.palette_confirm(window, cx);
-                        }
-                        _ => {}
+                move |this, state: &Entity<InputState>, event: &InputEvent, window, cx| match event
+                {
+                    InputEvent::Change => {
+                        let q = state.read(cx).value().to_string();
+                        this.on_palette_query_changed(&q, cx);
                     }
+                    InputEvent::PressEnter { .. } => {
+                        this.palette_confirm(window, cx);
+                    }
+                    _ => {}
                 }
             }),
             cx.subscribe_in(&ai_base_url_input, window, {
@@ -485,11 +524,8 @@ impl StockApp {
             }),
             cx.subscribe_in(&work_alias_input, window, {
                 move |this, _state: &Entity<InputState>, event: &InputEvent, window, cx| {
-                    match event {
-                        InputEvent::PressEnter { .. } => {
-                            this.commit_work_alias(window, cx);
-                        }
-                        _ => {}
+                    if let InputEvent::PressEnter { .. } = event {
+                        this.commit_work_alias(window, cx);
                     }
                 }
             }),
@@ -502,7 +538,7 @@ impl StockApp {
             shared("选「长线」→ 开始搜罗历史低位；或切「短线」跑策略雷达")
         } else {
             shared(format!(
-                "长线缓存 {} 只 · {} · 可点「筛可买」或重扫",
+                "低位策略缓存 {} 只 · {} · 可运行规则筛选或重扫",
                 treasure_hits.len(),
                 if treasure_updated_at.is_empty() {
                     "—".into()
@@ -552,158 +588,179 @@ impl StockApp {
         );
 
         let mut app = Self {
-            symbols,
-            selected,
-            candles_code: None,
-            kline_gen: 0,
-            candles: Vec::new(),
-            signal_cache: None,
-            levels_cache: None,
-            ma: MaSeries::default(),
-            range,
-            chart_kind: ChartKind::from_label(&cfg.chart_kind),
-            minute: None,
-            minute_code: None,
-            minute_gen: 0,
-            show_ma5: cfg.show_ma5,
-            show_ma10: cfg.show_ma10,
-            show_ma20: cfg.show_ma20,
-            show_ma60: cfg.show_ma60,
-            show_volume: cfg.show_volume,
-            show_macd: cfg.show_macd,
-            show_boll: cfg.show_boll,
-            macd: MacdSeries::default(),
-            boll: BollSeries::default(),
-            hover_ix: None,
-            chart_view_start: 0,
-            chart_view_count: 0,
-            chart_width: 800.0,
-            chart_origin: Point::default(),
-            chart_bounds: Bounds::default(),
-            drawing_mode: false,
-            drawing_anchor: None,
-            draft_line: None,
-            chart_lines: cfg.chart_lines.clone(),
-            draw_color_ix: 0,
-            series_cache: series_cache::SeriesCache::new(),
-            status: shared("正在连接行情源…"),
-            loading: true,
-            refreshing: false,
-            data_source: shared(market_data::SRC_LABEL),
-            palette_open: false,
-            palette_index: 0,
-            settings_open: false,
-            market_analysis_open: false,
-            market_analysis_region: MarketRegion::AShare,
-            market_analysis_sectors: Vec::new(),
-            market_analysis_loading: false,
-            market_analysis_error: None,
-            market_analysis_source: shared(market_data::SRC_EASTMONEY),
-            market_analysis_updated: None,
-            market_analysis_gen: 0,
-            market_ai_panel: AiPanelState::Idle,
-            market_ai_picks: Vec::new(),
-            market_ai_gen: 0,
-            settings_section: SettingsSection::General,
-            update_state: UpdateState::Idle,
-            quote_interval_secs: clamp_quote_interval_secs(cfg.quote_interval_secs),
-            palette_query,
-            palette_focus,
-            palette_hits: Vec::new(),
-            filtered_local,
-            left_width: cfg.left_width,
-            bottom_height: cfg.bottom_height,
-            dock,
-            window_bounds,
-            color_scheme: cfg.color_scheme,
-            work_mode: cfg.work_mode,
-            work_density: cfg.work_density,
-            work_right_width: cfg.work_right_width,
-            work_restore_bounds: None,
-            work_identity_reveal: false,
-            work_identity_peek_held: false,
-            work_identity_map_latched: false,
-            work_identity_hide_gen: 0,
-            work_aliases: cfg.work_aliases.clone(),
-            work_alias_editing: false,
-            work_alias_input,
-            watchlist_sort: cfg.watchlist_sort,
-            quote_fail_streak: 0,
-            left_tab: LeftTab::from_label(&cfg.left_tab),
-            detail_tab: DetailTab::from_label(&cfg.detail_tab),
-            treasure_hits,
-            treasure_pool: TreasurePool::from_id(&cfg.treasure_pool),
-            treasure_fin: FinFilter::from_id(&cfg.treasure_fin),
-            treasure_scanning: false,
-            treasure_scan_silent: false,
-            treasure_done: 0,
-            treasure_total: 0,
-            treasure_status,
-            treasure_gen: 0,
-            scout_picks: Vec::new(),
-            scout_summary: shared(""),
-            scout_running: false,
-            scout_silent: false,
-            scout_done: 0,
-            scout_total: 0,
-            scout_gen: 0,
-            scout_source: shared(""),
-            // 默认只看「可关注」；若本轮为零会自动回退到「全部」。
-            scout_only_buy_watch: true,
-            treasure_list_expanded: false,
-            find_mode: FindMode::from_id(&cfg.find_mode),
-            treasure_updated_at,
-            radar_hits,
-            radar_updated_at,
-            radar_scanning: false,
-            radar_done: 0,
-            radar_total: 0,
-            radar_status,
-            radar_summary: shared(""),
-            radar_gen: 0,
-            radar_filter: None,
-            watch_tags,
-            watch_filter: WatchTag::from_id(&cfg.watch_filter),
-            sector_drill_code: None,
-            sector_drill_name: None,
-            sector_drill_quotes: Vec::new(),
-            sector_drill_loading: false,
-            sector_drill_error: None,
-            sector_drill_gen: 0,
-            backtest_report: None,
-            journal,
-            journal_note_input,
-            journal_filter_selected: true,
-            index_sh: None,
-            index_hs300: None,
-            index_cyb: None,
-            ai_config: ai_cfg,
-            ai_panel: AiPanelState::Idle,
-            ai_key: None,
-            ai_cache: HashMap::new(),
-            ai_gen: 0,
-            ai_base_url_input,
-            ai_model_input,
-            ai_api_key_input,
-            ai_cli_bin_input,
-            alert_price_input,
-            buy_alerts: cfg.buy_alerts.clone(),
-            portfolio,
-            trade_form_side: None,
-            trade_shares_input,
-            trade_price_input,
-            trade_fee_input,
-            trade_note_input,
-            portfolio_cash_input,
-            portfolio_ai_panel: AiPanelState::Idle,
-            portfolio_ai_key: None,
-            portfolio_ai_cache: HashMap::new(),
-            portfolio_ai_gen: 0,
-            status_bar_enabled,
-            status_bar_codes,
-            status_bar_active,
-            persist_gen: 0,
-            _subscriptions,
+            services: AppServices::default(),
+            market_state: MarketState::default(),
+            chart_state: ChartState::default(),
+            discovery_state: DiscoveryState::default(),
+            portfolio_state: PortfolioState {
+                selected_currency: Currency::for_code(selected.as_ref()),
+            },
+            analysis_state: AnalysisState::default(),
+            ui_state: UiState::default(),
+            runtime_state: RuntimeState::default(),
+            #[cfg(feature = "work-mode")]
+            work_mode_feature: WorkModeFeature::default(),
+            legacy: AppState {
+                symbols,
+                selected,
+                candles_code: None,
+                kline_gen: 0,
+                candles: Vec::new(),
+                signal_cache: None,
+                levels_cache: None,
+                ma: MaSeries::default(),
+                range,
+                chart_kind: ChartKind::from_label(&cfg.chart_kind),
+                minute: None,
+                minute_code: None,
+                minute_gen: 0,
+                show_ma5: cfg.show_ma5,
+                show_ma10: cfg.show_ma10,
+                show_ma20: cfg.show_ma20,
+                show_ma60: cfg.show_ma60,
+                show_volume: cfg.show_volume,
+                show_macd: cfg.show_macd,
+                show_boll: cfg.show_boll,
+                macd: MacdSeries::default(),
+                boll: BollSeries::default(),
+                hover_ix: None,
+                chart_view_start: 0,
+                chart_view_count: 0,
+                chart_width: 800.0,
+                chart_origin: Point::default(),
+                chart_bounds: Bounds::default(),
+                drawing_mode: false,
+                drawing_anchor: None,
+                draft_line: None,
+                chart_lines: cfg.chart_lines.clone(),
+                draw_color_ix: 0,
+                series_cache: series_cache::SeriesCache::new(),
+                status: shared("正在连接行情源…"),
+                loading: true,
+                refreshing: false,
+                data_source: shared(market_data::SRC_LABEL),
+                palette_open: false,
+                palette_index: 0,
+                settings_open: false,
+                market_analysis_open: false,
+                market_analysis_region: MarketRegion::AShare,
+                market_analysis_sectors: Vec::new(),
+                market_analysis_loading: false,
+                market_analysis_error: None,
+                market_analysis_source: shared(market_data::SRC_EASTMONEY),
+                market_analysis_updated: None,
+                market_analysis_gen: 0,
+                market_ai_panel: AiPanelState::Idle,
+                market_ai_picks: Vec::new(),
+                market_ai_gen: 0,
+                settings_section: SettingsSection::General,
+                update_state: UpdateState::Idle,
+                quote_interval_secs: clamp_quote_interval_secs(cfg.quote_interval_secs),
+                palette_query,
+                palette_focus,
+                palette_hits: Vec::new(),
+                filtered_local,
+                left_width: cfg.left_width,
+                bottom_height: cfg.bottom_height,
+                dock,
+                window_bounds,
+                color_scheme: cfg.color_scheme,
+                work_mode: cfg.work_mode,
+                work_density: cfg.work_density,
+                work_right_width: cfg.work_right_width,
+                work_restore_bounds: None,
+                work_identity_reveal: false,
+                work_identity_peek_held: false,
+                work_identity_map_latched: false,
+                work_identity_hide_gen: 0,
+                work_aliases: cfg.work_aliases.clone(),
+                work_alias_editing: false,
+                work_alias_input,
+                watchlist_sort: cfg.watchlist_sort,
+                quote_fail_streak: 0,
+                left_tab: LeftTab::from_label(&cfg.left_tab),
+                detail_tab: DetailTab::from_label(&cfg.detail_tab),
+                treasure_hits,
+                treasure_pool: TreasurePool::from_id(&cfg.treasure_pool),
+                treasure_fin: FinFilter::from_id(&cfg.treasure_fin),
+                treasure_scanning: false,
+                treasure_scan_silent: false,
+                treasure_done: 0,
+                treasure_total: 0,
+                treasure_status,
+                treasure_gen: 0,
+                scout_picks: Vec::new(),
+                scout_summary: shared(""),
+                scout_running: false,
+                scout_silent: false,
+                scout_done: 0,
+                scout_total: 0,
+                scout_gen: 0,
+                scout_source: shared(""),
+                // 默认只看「可关注」；若本轮为零会自动回退到「全部」。
+                scout_only_buy_watch: true,
+                treasure_list_expanded: false,
+                find_mode: FindMode::from_id(&cfg.find_mode),
+                treasure_updated_at,
+                radar_hits,
+                radar_updated_at,
+                radar_scanning: false,
+                radar_done: 0,
+                radar_total: 0,
+                radar_status,
+                radar_summary: shared(""),
+                radar_gen: 0,
+                radar_filter: None,
+                watch_tags,
+                watch_filter: WatchTag::from_id(&cfg.watch_filter),
+                sector_drill_code: None,
+                sector_drill_name: None,
+                sector_drill_quotes: Vec::new(),
+                sector_drill_loading: false,
+                sector_drill_error: None,
+                sector_drill_gen: 0,
+                backtest_report: None,
+                journal,
+                journal_note_input,
+                journal_filter_selected: true,
+                journal_delete_confirm_id: None,
+                index_sh: None,
+                index_hs300: None,
+                index_cyb: None,
+                ai_config: ai_cfg,
+                ai_panel: AiPanelState::Idle,
+                ai_key: None,
+                ai_cache: HashMap::new(),
+                ai_gen: 0,
+                ai_base_url_input,
+                ai_model_input,
+                ai_api_key_input,
+                ai_cli_bin_input,
+                alert_price_input,
+                buy_alerts: cfg.buy_alerts.clone(),
+                portfolio,
+                trade_form_side: None,
+                trade_shares_input,
+                trade_price_input,
+                trade_fee_input,
+                trade_note_input,
+                portfolio_cash_input,
+                portfolio_ai_panel: AiPanelState::Idle,
+                portfolio_ai_key: None,
+                portfolio_ai_cache: HashMap::new(),
+                portfolio_ai_gen: 0,
+                status_bar_enabled,
+                status_bar_codes,
+                status_bar_active,
+                persist_gen: 0,
+                _subscriptions,
+            },
+        };
+
+        app.ui_state.primary_task = match app.left_tab {
+            LeftTab::Portfolio => state::PrimaryTask::Portfolio,
+            LeftTab::Treasure => state::PrimaryTask::Opportunities,
+            LeftTab::Watchlist => state::PrimaryTask::Research,
         };
 
         // 历史持仓代码自动并入自选，便于行情轮询。
@@ -719,6 +776,10 @@ impl StockApp {
         }
         if app.symbols.len() != before {
             app.persist();
+        }
+
+        if let Some(error) = storage::take_storage_error() {
+            app.status = shared(error);
         }
 
         window.set_window_title(app.window_title());
@@ -748,7 +809,12 @@ impl Render for StockApp {
 
         let left_w = self.dock.main_h.first().copied().unwrap_or(self.left_width);
         let center_w = self.dock.main_h.get(1).copied().unwrap_or(0.0);
-        let bottom_h = self.dock.main_v.get(1).copied().unwrap_or(self.bottom_height);
+        let bottom_h = self
+            .dock
+            .main_v
+            .get(1)
+            .copied()
+            .unwrap_or(self.bottom_height);
         let work = self.work_mode;
 
         div()
@@ -811,9 +877,7 @@ impl Render for StockApp {
                 }
             }))
             .on_action(cx.listener(|this, _: &RemoveSelectedSymbol, _w, cx| {
-                if !this.palette_open
-                    && !this.settings_open
-                    && this.left_tab == LeftTab::Watchlist
+                if !this.palette_open && !this.settings_open && this.left_tab == LeftTab::Watchlist
                 {
                     this.remove_selected_from_watchlist(cx);
                 }
@@ -902,9 +966,8 @@ impl Render for StockApp {
                                                         });
                                                     })
                                                     .child(
-                                                        resizable_panel().child(
-                                                            self.render_chart_area(cx),
-                                                        ),
+                                                        resizable_panel()
+                                                            .child(self.render_chart_area(cx)),
                                                     )
                                                     .child(
                                                         resizable_panel()
@@ -938,12 +1001,10 @@ fn open_main_window(cx: &mut App) {
     let cfg = storage::load_config();
     let window_bounds = match cfg.dock.window {
         // Allow Mini focus footprint (~720×440) to restore across restarts.
-        Some((x, y, w, h)) if w >= 640.0 && h >= 400.0 => {
-            WindowBounds::Windowed(Bounds {
-                origin: point(px(x), px(y)),
-                size: size(px(w), px(h)),
-            })
-        }
+        Some((x, y, w, h)) if w >= 640.0 && h >= 400.0 => WindowBounds::Windowed(Bounds {
+            origin: point(px(x), px(y)),
+            size: size(px(w), px(h)),
+        }),
         _ => WindowBounds::centered(size(px(1320.), px(860.)), cx),
     };
     let window_options = WindowOptions {
@@ -1037,11 +1098,9 @@ pub fn run() {
     });
 }
 
-
-
 #[cfg(test)]
 mod keymap_tests {
-    use gpui::{actions, KeyBinding, KeyContext, Keymap, Keystroke};
+    use gpui::{KeyBinding, KeyContext, Keymap, Keystroke, actions};
 
     actions!(keymap_test, [InputBackspace, AppBackspace, AppZero]);
 
@@ -1069,20 +1128,31 @@ mod keymap_tests {
         let (bindings, _) = km.bindings_for_input(&keystrokes("backspace"), &input_focused);
         assert_eq!(bindings.len(), 1, "backspace while input focused");
         assert!(
-            bindings[0].action().as_any().downcast_ref::<InputBackspace>().is_some(),
+            bindings[0]
+                .action()
+                .as_any()
+                .downcast_ref::<InputBackspace>()
+                .is_some(),
             "input binding must win, got {}",
             bindings[0].action().name()
         );
 
         // 输入框聚焦：`0` 不再触发应用动作，按键落到文本输入。
         let (bindings, _) = km.bindings_for_input(&keystrokes("0"), &input_focused);
-        assert!(bindings.is_empty(), "0 binding must yield while input focused");
+        assert!(
+            bindings.is_empty(),
+            "0 binding must yield while input focused"
+        );
 
         // 无输入框聚焦：应用快捷键照常生效。
         let (bindings, _) = km.bindings_for_input(&keystrokes("backspace"), &no_input);
         assert_eq!(bindings.len(), 1);
         assert!(
-            bindings[0].action().as_any().downcast_ref::<AppBackspace>().is_some(),
+            bindings[0]
+                .action()
+                .as_any()
+                .downcast_ref::<AppBackspace>()
+                .is_some(),
             "app binding must win without input focus, got {}",
             bindings[0].action().name()
         );
@@ -1090,7 +1160,11 @@ mod keymap_tests {
         let (bindings, _) = km.bindings_for_input(&keystrokes("0"), &no_input);
         assert_eq!(bindings.len(), 1);
         assert!(
-            bindings[0].action().as_any().downcast_ref::<AppZero>().is_some(),
+            bindings[0]
+                .action()
+                .as_any()
+                .downcast_ref::<AppZero>()
+                .is_some(),
             "app 0 binding must win without input focus"
         );
     }
@@ -1100,18 +1174,14 @@ mod keymap_tests {
 mod layout_regression_tests {
     use super::StockApp;
     use gpui::{
-        px, size, AnyWindowHandle, AppContext, TestAppContext, VisualContext, VisualTestContext,
+        AnyWindowHandle, AppContext, TestAppContext, VisualContext, VisualTestContext, px, size,
     };
     use gpui_component::PixelsExt;
 
     /// Shared window/App setup for layout regression tests: isolated HOME and a
     /// deterministic default config (work mode off, fixed dock) so results do
     /// not depend on the developer's real `config.json`.
-    fn test_window(
-        cx: &mut TestAppContext,
-        w: f32,
-        h: f32,
-    ) -> VisualTestContext {
+    fn test_window(cx: &mut TestAppContext, w: f32, h: f32) -> VisualTestContext {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -1126,15 +1196,13 @@ mod layout_regression_tests {
             std::env::set_var("HOME", &tmp);
         }
         // Resolve config dir after HOME is set (macOS/Linux paths differ).
-        let cfg_dir = dirs::data_dir()
-            .expect("data_dir")
-            .join("stock-analysis");
+        let cfg_dir = dirs::data_dir().expect("data_dir").join("stock-analysis");
         std::fs::create_dir_all(&cfg_dir).expect("create temp config dir");
         let cfg = crate::storage::AppConfig::default();
         let json = serde_json::to_string_pretty(&cfg).expect("serialize test config");
         std::fs::write(cfg_dir.join("config.json"), json).expect("write test config");
 
-        cx.update(|cx| gpui_component::init(cx));
+        cx.update(gpui_component::init);
         let window = cx.update(|cx| {
             cx.open_window(
                 gpui::WindowOptions {
@@ -1223,14 +1291,15 @@ mod layout_regression_tests {
         let mut window = test_window(cx, 1320.0, 860.0);
         window.run_until_parked();
         let handle = window.window_handle();
-        window.cx.update_window(handle, |view, _window, cx| {
+        let update_result = window.cx.update_window(handle, |view, _window, cx| {
             view.downcast::<StockApp>()
                 .expect("window root view")
                 .update(cx, |this, cx| this.toggle_settings(cx));
         });
+        assert!(update_result.is_ok(), "settings update should succeed");
         window.run_until_parked();
         window.update(|window, cx| {
-            window.draw(cx);
+            let _arena_clear_needed = window.draw(cx);
         });
 
         let panel = window

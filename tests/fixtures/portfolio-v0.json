@@ -1,0 +1,28 @@
+{
+  "trades": [
+    {
+      "id": "legacy-a",
+      "code": "600519",
+      "name": "贵州茅台",
+      "side": "buy",
+      "shares": 100.0,
+      "price": 1500.0,
+      "fee": 5.0,
+      "time": "2026-01-02 09:31:00",
+      "note": ""
+    },
+    {
+      "id": "legacy-h",
+      "code": "00700",
+      "name": "腾讯控股",
+      "side": "buy",
+      "shares": 100.0,
+      "price": 400.0,
+      "fee": 10.0,
+      "time": "2026-01-02 09:32:00",
+      "note": ""
+    }
+  ],
+  "cash": 100000.0,
+  "track_cash": false
+}

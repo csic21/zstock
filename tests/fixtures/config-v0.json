@@ -1,0 +1,11 @@
+{
+  "watchlist": ["600519", "00700"],
+  "selected": "600519",
+  "range": "3M",
+  "show_ma5": true,
+  "show_ma10": true,
+  "show_ma20": true,
+  "left_width": 280.0,
+  "bottom_height": 168.0,
+  "ai_api": { "api_key": "legacy-secret" }
+}

@@ -1,11 +1,11 @@
 use gpui::{
-    div, px, size, AnyWindowHandle, AppContext, Context, InteractiveElement, IntoElement,
-    ParentElement, Render, StatefulInteractiveElement, Styled, TestAppContext, VisualTestContext,
-    Window,
+    AnyWindowHandle, Context, InteractiveElement, IntoElement, ParentElement, Render,
+    StatefulInteractiveElement, Styled, TestAppContext, VisualTestContext, Window, div, px, size,
 };
 use gpui_component::{
+    PixelsExt,
     resizable::{h_resizable, resizable_panel, v_resizable},
-    v_flex, PixelsExt,
+    v_flex,
 };
 
 /// Minimal reproduction of the app's root layout:
@@ -25,31 +25,19 @@ impl Render for TestApp {
                     .debug_selector(|| "title-bar".into()),
             )
             .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .overflow_hidden()
-                    .child(
-                        h_resizable("main-h")
-                            .child(
-                                resizable_panel()
-                                    .size(px(280.))
-                                    .size_range(px(200.)..px(440.))
-                                    .child(
-                                        div()
-                                            .size_full()
-                                            .debug_selector(|| "left-content".into()),
-                                    ),
-                            )
-                            .child(
-                                resizable_panel().child(
-                                    div()
-                                        .size_full()
-                                        .debug_selector(|| "main-content".into()),
-                                ),
-                            ),
-                    ),
+                div().flex_1().min_h_0().w_full().overflow_hidden().child(
+                    h_resizable("main-h")
+                        .child(
+                            resizable_panel()
+                                .size(px(280.))
+                                .size_range(px(200.)..px(440.))
+                                .child(div().size_full().debug_selector(|| "left-content".into())),
+                        )
+                        .child(
+                            resizable_panel()
+                                .child(div().size_full().debug_selector(|| "main-content".into())),
+                        ),
+                ),
             )
     }
 }
@@ -69,49 +57,44 @@ impl Render for RichApp {
                     .debug_selector(|| "title-bar".into()),
             )
             .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .overflow_hidden()
-                    .child(
-                        h_resizable("main-h")
-                            .child(
-                                resizable_panel()
-                                    .size(px(280.))
-                                    .size_range(px(200.)..px(440.))
-                                    .child(rich_left_panel()),
-                            )
-                            .child(
-                                resizable_panel().child(
-                                    v_resizable("main-v")
-                                        .child(
-                                            resizable_panel().child(
-                                                v_flex()
-                                                    .size_full()
-                                                    .child(div().h(px(90.)).w_full())
-                                                    .child(
-                                                        div()
-                                                            .flex_1()
-                                                            .min_h_0()
-                                                            .w_full()
-                                                            .debug_selector(|| "chart".into()),
-                                                    ),
-                                            ),
-                                        )
-                                        .child(
-                                            resizable_panel()
-                                                .size(px(411.))
-                                                .size_range(px(140.)..px(420.))
+                div().flex_1().min_h_0().w_full().overflow_hidden().child(
+                    h_resizable("main-h")
+                        .child(
+                            resizable_panel()
+                                .size(px(280.))
+                                .size_range(px(200.)..px(440.))
+                                .child(rich_left_panel()),
+                        )
+                        .child(
+                            resizable_panel().child(
+                                v_resizable("main-v")
+                                    .child(
+                                        resizable_panel().child(
+                                            v_flex()
+                                                .size_full()
+                                                .child(div().h(px(90.)).w_full())
                                                 .child(
                                                     div()
-                                                        .size_full()
-                                                        .debug_selector(|| "details".into()),
+                                                        .flex_1()
+                                                        .min_h_0()
+                                                        .w_full()
+                                                        .debug_selector(|| "chart".into()),
                                                 ),
                                         ),
-                                ),
+                                    )
+                                    .child(
+                                        resizable_panel()
+                                            .size(px(411.))
+                                            .size_range(px(140.)..px(420.))
+                                            .child(
+                                                div()
+                                                    .size_full()
+                                                    .debug_selector(|| "details".into()),
+                                            ),
+                                    ),
                             ),
-                    ),
+                        ),
+                ),
             )
     }
 }
@@ -119,7 +102,12 @@ impl Render for RichApp {
 fn rich_left_panel() -> impl IntoElement {
     v_flex()
         .size_full()
-        .child(div().h(px(36.)).w_full().debug_selector(|| "left-tabs".into()))
+        .child(
+            div()
+                .h(px(36.))
+                .w_full()
+                .debug_selector(|| "left-tabs".into()),
+        )
         .child(
             v_flex()
                 .flex_1()
@@ -132,9 +120,9 @@ fn rich_left_panel() -> impl IntoElement {
                         .id("watchlist-scroll")
                         .flex_1()
                         .overflow_y_scroll()
-                        .children((0..6usize).map(|ix| {
-                            div().h(px(48.)).w_full().id(("wl-row", ix))
-                        })),
+                        .children(
+                            (0..6usize).map(|ix| div().h(px(48.)).w_full().id(("wl-row", ix))),
+                        ),
                 )
                 .child(div().h(px(32.)).w_full()),
         )
@@ -142,7 +130,7 @@ fn rich_left_panel() -> impl IntoElement {
 
 #[gpui::test]
 fn resizable_panels_should_fill_the_available_height(cx: &mut TestAppContext) {
-    cx.update(|cx| gpui_component::init(cx));
+    cx.update(gpui_component::init);
     let window = cx.add_window(|_window, _cx| TestApp);
     let window: AnyWindowHandle = window.into();
     let mut window = VisualTestContext::from_window(window, cx);
@@ -175,7 +163,7 @@ fn resizable_panels_should_fill_the_available_height(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn rich_content_panels_should_fill_the_available_height(cx: &mut TestAppContext) {
-    cx.update(|cx| gpui_component::init(cx));
+    cx.update(gpui_component::init);
     let window = cx.add_window(|_window, _cx| RichApp);
     let window: AnyWindowHandle = window.into();
     let mut window = VisualTestContext::from_window(window, cx);
@@ -186,9 +174,7 @@ fn rich_content_panels_should_fill_the_available_height(cx: &mut TestAppContext)
     let chart = window.debug_bounds("chart").expect("chart bounds");
     let details = window.debug_bounds("details").expect("details bounds");
 
-    eprintln!(
-        "tabs: {tabs:?}, chart: {chart:?}, details: {details:?}"
-    );
+    eprintln!("tabs: {tabs:?}, chart: {chart:?}, details: {details:?}");
 
     assert!(
         (tabs.origin.y.as_f32() - 34.0).abs() < 2.0,
@@ -204,4 +190,24 @@ fn rich_content_panels_should_fill_the_available_height(cx: &mut TestAppContext)
         (details.origin.y.as_f32() + details.size.height.as_f32() - 860.0).abs() < 2.0,
         "details panel should reach the bottom of the window, got {details:?}"
     );
+}
+
+#[gpui::test]
+fn reference_window_sizes_keep_all_primary_regions_paintable(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    for (width, height) in [(720.0, 440.0), (920.0, 580.0), (1280.0, 800.0)] {
+        let window = cx.add_window(|_window, _cx| RichApp);
+        let window: AnyWindowHandle = window.into();
+        let mut window = VisualTestContext::from_window(window, cx);
+        window.simulate_resize(size(px(width), px(height)));
+        window.run_until_parked();
+
+        for selector in ["left-tabs", "chart", "details"] {
+            let bounds = window.debug_bounds(selector).expect("reference region");
+            assert!(
+                bounds.size.width.as_f32() > 0.0 && bounds.size.height.as_f32() > 0.0,
+                "{selector} collapsed at {width}x{height}: {bounds:?}"
+            );
+        }
+    }
 }

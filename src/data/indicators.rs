@@ -313,8 +313,8 @@ mod tests {
     #[test]
     fn boll_narrow_when_flat() {
         let mut candles: Vec<Candle> = (0..60).map(|_| candle(10.0)).collect();
-        for i in 30..60 {
-            candles[i].close = 20.0;
+        for candle in candles.iter_mut().take(60).skip(30) {
+            candle.close = 20.0;
         }
         let boll = BollSeries::from_candles(&candles);
         // In the flat region std ≈ 0 → bands collapse onto the mid.

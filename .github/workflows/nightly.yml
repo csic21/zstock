@@ -1,0 +1,21 @@
+name: Nightly network smoke tests
+
+on:
+  schedule:
+    - cron: "20 18 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Run ignored network smoke tests
+        run: cargo test --all-targets -- --ignored --test-threads=1

@@ -9,60 +9,32 @@ pub(crate) struct L;
 impl L {
     // —— Left tabs ——
     pub(crate) fn left_watchlist(work: bool) -> &'static str {
-        if work {
-            "List"
-        } else {
-            "自选"
-        }
+        if work { "List" } else { "自选" }
     }
 
     pub(crate) fn left_portfolio(work: bool) -> &'static str {
-        if work {
-            "Book"
-        } else {
-            "持仓"
-        }
+        if work { "Book" } else { "持仓" }
     }
 
     pub(crate) fn left_treasure(work: bool) -> &'static str {
-        if work {
-            "Find"
-        } else {
-            "🔍 找"
-        }
+        if work { "Find" } else { "🔍 找" }
     }
 
     pub(crate) fn find_long(work: bool) -> &'static str {
-        if work {
-            "Long"
-        } else {
-            "长线"
-        }
+        if work { "Long" } else { "长线" }
     }
 
     pub(crate) fn find_short(work: bool) -> &'static str {
-        if work {
-            "Short"
-        } else {
-            "短线"
-        }
+        if work { "Short" } else { "短线" }
     }
 
     // —— Detail (analysis dock) tabs ——
     pub(crate) fn detail_overview(work: bool) -> &'static str {
-        if work {
-            "Overview"
-        } else {
-            "概览"
-        }
+        if work { "Overview" } else { "概览" }
     }
 
     pub(crate) fn detail_strategy(work: bool) -> &'static str {
-        if work {
-            "Signal"
-        } else {
-            "策略"
-        }
+        if work { "Signal" } else { "策略" }
     }
 
     pub(crate) fn detail_ai(_work: bool) -> &'static str {
@@ -70,36 +42,20 @@ impl L {
     }
 
     pub(crate) fn detail_portfolio(work: bool) -> &'static str {
-        if work {
-            "Book"
-        } else {
-            "持仓"
-        }
+        if work { "Book" } else { "持仓" }
     }
 
     pub(crate) fn detail_treasure(work: bool) -> &'static str {
-        if work {
-            "Scan"
-        } else {
-            "寻宝"
-        }
+        if work { "Scan" } else { "机会" }
     }
 
     pub(crate) fn detail_indicators(work: bool) -> &'static str {
-        if work {
-            "Tech"
-        } else {
-            "指标"
-        }
+        if work { "Tech" } else { "指标" }
     }
 
     // —— Command palette ——
     pub(crate) fn palette_section_local(work: bool) -> &'static str {
-        if work {
-            "List"
-        } else {
-            "自选"
-        }
+        if work { "List" } else { "自选" }
     }
 
     pub(crate) fn palette_section_remote(work: bool) -> &'static str {
@@ -127,11 +83,7 @@ impl L {
     }
 
     pub(crate) fn palette_add(work: bool) -> &'static str {
-        if work {
-            "attach"
-        } else {
-            "添加"
-        }
+        if work { "attach" } else { "添加" }
     }
 
     // —— Chart loading ——
@@ -160,28 +112,16 @@ impl L {
     }
 
     pub(crate) fn loading_short(work: bool) -> &'static str {
-        if work {
-            "Loading…"
-        } else {
-            "加载中…"
-        }
+        if work { "Loading…" } else { "加载中…" }
     }
 
     // —— Quick links ——
     pub(crate) fn quick_links(work: bool) -> &'static str {
-        if work {
-            "Quick"
-        } else {
-            "快捷"
-        }
+        if work { "Quick" } else { "快捷" }
     }
 
     pub(crate) fn goto_strategy(work: bool) -> &'static str {
-        if work {
-            "Signal →"
-        } else {
-            "策略 →"
-        }
+        if work { "Signal →" } else { "策略 →" }
     }
 
     pub(crate) fn goto_ai(_work: bool) -> &'static str {
@@ -189,26 +129,14 @@ impl L {
     }
 
     pub(crate) fn goto_portfolio(work: bool) -> &'static str {
-        if work {
-            "Book →"
-        } else {
-            "持仓 →"
-        }
+        if work { "Book →" } else { "持仓 →" }
     }
 
     pub(crate) fn goto_treasure(work: bool) -> &'static str {
-        if work {
-            "Scan →"
-        } else {
-            "寻宝 →"
-        }
+        if work { "Scan →" } else { "机会 →" }
     }
 
     pub(crate) fn goto_indicators(work: bool) -> &'static str {
-        if work {
-            "Tech →"
-        } else {
-            "指标 →"
-        }
+        if work { "Tech →" } else { "指标 →" }
     }
 }

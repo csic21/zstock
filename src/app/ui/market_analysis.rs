@@ -1199,10 +1199,7 @@ impl StockApp {
             .as_ref()
             .map(|s| s.to_string())
             .unwrap_or_else(|| "板块成分".into());
-        let code = self
-            .sector_drill_code
-            .clone()
-            .unwrap_or_default();
+        let code = self.sector_drill_code.clone().unwrap_or_default();
 
         v_flex()
             .gap_2()
@@ -1254,12 +1251,7 @@ impl StockApp {
                 )
             })
             .when_some(self.sector_drill_error.clone(), |col, err| {
-                col.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().red)
-                        .child(err),
-                )
+                col.child(div().text_xs().text_color(cx.theme().red).child(err))
             })
             .child(
                 v_flex()

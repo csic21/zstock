@@ -10,9 +10,11 @@
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 
+use crate::domain::market::{Availability, Freshness};
+use crate::domain::money::Currency;
 use crate::model::{
     Candle, Symbol, board_for_code, is_hk_code, normalize_code, secid_for_code, shared,
 };
@@ -26,10 +28,12 @@ pub struct QuoteTick {
     pub last: f64,
     pub change_pct: f64,
     pub volume: u64,
-    pub high: f64,
-    pub low: f64,
-    pub open: f64,
-    pub prev_close: f64,
+    pub currency: Currency,
+    pub source: String,
+    pub fetched_at: i64,
+    pub market_time: Option<String>,
+    pub availability: Availability,
+    pub freshness: Freshness,
 }
 
 /// A 股行业板块的实时快照。
@@ -108,7 +112,7 @@ pub fn short_http_err(msg: &str) -> String {
         if prefix.is_empty() {
             return "HTTP 请求失败".into();
         }
-        return format!("{prefix}");
+        return prefix.to_string();
     }
     let s = msg.chars().take(80).collect::<String>();
     if msg.len() > 80 { format!("{s}…") } else { s }
@@ -121,7 +125,14 @@ pub fn fetch_quotes(codes: &[String]) -> Result<Vec<QuoteTick>> {
     }
     let secids: Vec<String> = codes.iter().map(|c| secid_for_code(c)).collect();
     let prefer_hk = codes.iter().any(|c| is_hk_code(c));
-    fetch_quotes_by_secids_with_hosts(&secids, if prefer_hk { PUSH2_HOSTS_HK } else { PUSH2_HOSTS })
+    fetch_quotes_by_secids_with_hosts(
+        &secids,
+        if prefer_hk {
+            PUSH2_HOSTS_HK
+        } else {
+            PUSH2_HOSTS
+        },
+    )
 }
 
 /// Quotes by raw Eastmoney `secid` list (e.g. `1.000001` 上证指数).
@@ -137,10 +148,7 @@ pub fn fetch_quotes_by_secids(secids: &[String]) -> Result<Vec<QuoteTick>> {
     )
 }
 
-fn fetch_quotes_by_secids_with_hosts(
-    secids: &[String],
-    hosts: &[&str],
-) -> Result<Vec<QuoteTick>> {
+fn fetch_quotes_by_secids_with_hosts(secids: &[String], hosts: &[&str]) -> Result<Vec<QuoteTick>> {
     if secids.is_empty() {
         return Ok(vec![]);
     }
@@ -279,6 +287,10 @@ fn parse_quote_diff(v: Value) -> Result<Vec<QuoteTick>> {
         if code.is_empty() {
             continue;
         }
+        let Some(currency) = Currency::for_code(&code) else {
+            continue;
+        };
+        let last = num_f64(item.get("f2"));
         out.push(QuoteTick {
             code,
             name: item
@@ -286,13 +298,19 @@ fn parse_quote_diff(v: Value) -> Result<Vec<QuoteTick>> {
                 .and_then(|x| x.as_str())
                 .unwrap_or("--")
                 .to_string(),
-            last: num_f64(item.get("f2")),
+            last,
             change_pct: num_f64(item.get("f3")),
             volume: num_f64(item.get("f5")) as u64,
-            high: num_f64(item.get("f15")),
-            low: num_f64(item.get("f16")),
-            open: num_f64(item.get("f17")),
-            prev_close: num_f64(item.get("f18")),
+            currency,
+            source: "东方财富".into(),
+            fetched_at: chrono::Utc::now().timestamp_millis(),
+            market_time: None,
+            availability: if last > 0.0 {
+                Availability::Available
+            } else {
+                Availability::Invalid
+            },
+            freshness: Freshness::Live,
         });
     }
     Ok(out)
@@ -396,10 +414,7 @@ pub fn search_symbols(query: &str, limit: usize) -> Result<Vec<Symbol>> {
                 .and_then(|x| x.as_str())
                 .unwrap_or("");
             let mkt = mkt_num_str(it.get("MktNum"));
-            let classify = it
-                .get("Classify")
-                .and_then(|x| x.as_str())
-                .unwrap_or("");
+            let classify = it.get("Classify").and_then(|x| x.as_str()).unwrap_or("");
             let jys = it.get("JYS").and_then(|x| x.as_str()).unwrap_or("");
             let is_hk = mkt == "116"
                 || classify.eq_ignore_ascii_case("HK")
@@ -447,17 +462,17 @@ pub fn search_symbols(query: &str, limit: usize) -> Result<Vec<Symbol>> {
     }
 
     // Fallback: pure 6-digit A / 5-digit HK / hk-prefixed
-    if out.is_empty() {
-        if let Some(code) = normalize_code(q) {
-            return Ok(vec![Symbol {
-                code: code.clone(),
-                name: shared(code.clone()),
-                last: 0.0,
-                change_pct: 0.0,
-                volume: 0,
-                board: board_for_code(&code),
-            }]);
-        }
+    if out.is_empty()
+        && let Some(code) = normalize_code(q)
+    {
+        return Ok(vec![Symbol {
+            code: code.clone(),
+            name: shared(code.clone()),
+            last: 0.0,
+            change_pct: 0.0,
+            volume: 0,
+            board: board_for_code(&code),
+        }]);
     }
 
     Ok(out)
@@ -513,7 +528,6 @@ pub struct UniverseRow {
     /// 总市值（元），接口字段 f20。
     pub market_cap: f64,
     /// 成交额（元），接口字段 f6；休市时常为 0。
-    pub amount: f64,
     /// 市盈率（动态，f9），可能为 0 / 缺失。
     pub pe: Option<f64>,
     /// 市净率（f23），可能为 0 / 缺失。
@@ -609,7 +623,6 @@ fn parse_clist_universe(v: &Value) -> Result<Vec<UniverseRow>> {
             code,
             name,
             market_cap: num_f64(item.get("f20")),
-            amount: num_f64(item.get("f6")),
             pe: pos_fin(num_f64(item.get("f9"))),
             pb: pos_fin(num_f64(item.get("f23"))),
         });
@@ -648,34 +661,4 @@ mod universe_list_tests {
             rows[0].code, rows[0].name, rows[0].market_cap
         );
     }
-}
-
-/// Build Symbol list from codes using quote API (fills name/last).
-pub fn hydrate_symbols(codes: &[String]) -> Result<Vec<Symbol>> {
-    let quotes = fetch_quotes(codes)?;
-    let mut map: std::collections::HashMap<String, QuoteTick> =
-        quotes.into_iter().map(|q| (q.code.clone(), q)).collect();
-    let mut out = Vec::with_capacity(codes.len());
-    for code in codes {
-        if let Some(q) = map.remove(code) {
-            out.push(Symbol {
-                code: code.clone(),
-                name: shared(q.name),
-                last: q.last,
-                change_pct: q.change_pct,
-                volume: q.volume,
-                board: board_for_code(code),
-            });
-        } else {
-            out.push(Symbol {
-                code: code.clone(),
-                name: shared(code.clone()),
-                last: 0.0,
-                change_pct: 0.0,
-                volume: 0,
-                board: board_for_code(code),
-            });
-        }
-    }
-    Ok(out)
 }

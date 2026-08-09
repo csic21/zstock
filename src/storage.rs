@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -12,7 +13,32 @@ use crate::data::journal::Journal;
 use crate::data::portfolio::Portfolio;
 use crate::data::radar::RadarCache;
 use crate::data::treasure::TreasureCache;
+use crate::infrastructure::credential_store::NativeSecretStore;
+use crate::infrastructure::storage::json_store::{self, LoadError};
+use crate::infrastructure::storage::migrations::DocumentKind;
 use crate::model::{TrendLine, default_watchlist_codes};
+use crate::services::secrets::SecretStore;
+
+pub const CONFIG_SCHEMA_VERSION: u32 =
+    crate::infrastructure::storage::migrations::CONFIG_SCHEMA_VERSION;
+
+const AI_API_KEY_ACCOUNT: &str = "ai-api-key";
+static LAST_STORAGE_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+pub fn record_storage_error(message: impl Into<String>) {
+    *LAST_STORAGE_ERROR
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(message.into());
+}
+
+pub fn take_storage_error() -> Option<String> {
+    LAST_STORAGE_ERROR
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
 
 /// Serializable window bounds (x, y, width, height in logical pixels).
 pub type WindowBounds = (f32, f32, f32, f32);
@@ -95,7 +121,12 @@ impl WatchlistSort {
     }
 
     pub fn all() -> [Self; 4] {
-        [Self::Manual, Self::ChangeDesc, Self::ChangeAsc, Self::CodeAsc]
+        [
+            Self::Manual,
+            Self::ChangeDesc,
+            Self::ChangeAsc,
+            Self::CodeAsc,
+        ]
     }
 }
 
@@ -196,6 +227,8 @@ mod work_density_tests {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
+    #[serde(default = "current_config_schema_version")]
+    pub schema_version: u32,
     /// Pure A-share codes in watchlist order.
     pub watchlist: Vec<String>,
     pub selected: String,
@@ -292,6 +325,10 @@ fn default_true() -> bool {
     true
 }
 
+fn current_config_schema_version() -> u32 {
+    CONFIG_SCHEMA_VERSION
+}
+
 fn default_chart_kind() -> String {
     "day".into()
 }
@@ -333,8 +370,12 @@ pub fn clamp_quote_interval_secs(secs: u64) -> u64 {
 impl Default for AppConfig {
     fn default() -> Self {
         let watchlist = default_watchlist_codes();
-        let selected = watchlist.first().cloned().unwrap_or_else(|| "600519".into());
+        let selected = watchlist
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "600519".into());
         Self {
+            schema_version: CONFIG_SCHEMA_VERSION,
             watchlist,
             selected,
             range: "3M".into(),
@@ -404,7 +445,7 @@ pub fn normalize_status_bar(
 
 #[cfg(test)]
 mod status_bar_tests {
-    use super::{normalize_status_bar, STATUS_BAR_MAX_CODES};
+    use super::{STATUS_BAR_MAX_CODES, normalize_status_bar};
 
     #[test]
     fn drops_codes_not_in_watchlist_and_caps() {
@@ -459,21 +500,62 @@ pub fn journal_path() -> PathBuf {
 
 pub fn load_config() -> AppConfig {
     let path = config_path();
-    match fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-        Err(_) => AppConfig::default(),
+    match json_store::load::<AppConfig>(&path, DocumentKind::Config) {
+        Ok(mut loaded) => {
+            let secrets = NativeSecretStore;
+            if let Some(secret) = loaded.migration.legacy_api_key.take() {
+                if let Err(error) = secrets.set(AI_API_KEY_ACCOUNT, &secret) {
+                    record_storage_error(format!(
+                        "配置升级暂停：API Key 尚未写入系统凭据库（{error}）；原文件保持不变"
+                    ));
+                    loaded.value.ai_api.api_key = secret;
+                    return loaded.value;
+                }
+                loaded.value.ai_api.api_key = secret;
+            } else {
+                match secrets.get(AI_API_KEY_ACCOUNT) {
+                    Ok(Some(secret)) => loaded.value.ai_api.api_key = secret,
+                    Ok(None) => {}
+                    Err(error) => record_storage_error(format!("系统凭据库读取失败：{error}")),
+                }
+            }
+            if loaded.migration.migrated {
+                let migrated =
+                    json_store::backup_before_migration(&path, loaded.migration.from_version)
+                        .and_then(|_| json_store::save(&path, &loaded.value));
+                if let Err(error) = migrated {
+                    record_storage_error(format!("配置迁移未落盘，原文件保持不变：{error:#}"));
+                }
+            }
+            loaded.value
+        }
+        Err(LoadError::NotFound) => AppConfig::default(),
+        Err(error) => {
+            let backups = json_store::latest_backups(&path).unwrap_or_default();
+            record_storage_error(format!(
+                "配置进入恢复模式：{error}；可用备份 {} 份",
+                backups.len()
+            ));
+            AppConfig::default()
+        }
     }
 }
 
 pub fn save_config(cfg: &AppConfig) -> Result<()> {
     let path = config_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+    let secrets = NativeSecretStore;
+    if cfg.ai_api.api_key.trim().is_empty() {
+        secrets
+            .delete(AI_API_KEY_ACCOUNT)
+            .map_err(anyhow::Error::new)
+            .context("delete API key from credential store")?;
+    } else {
+        secrets
+            .set(AI_API_KEY_ACCOUNT, cfg.ai_api.api_key.trim())
+            .map_err(anyhow::Error::new)
+            .context("save API key to credential store")?;
     }
-    let s = serde_json::to_string_pretty(cfg)?;
-    fs::write(&path, s).with_context(|| format!("write {}", path.display()))?;
-    Ok(())
+    json_store::save(&path, cfg)
 }
 
 pub fn load_treasure_cache() -> TreasureCache {
@@ -485,14 +567,7 @@ pub fn load_treasure_cache() -> TreasureCache {
 }
 
 pub fn save_treasure_cache(cache: &TreasureCache) -> Result<()> {
-    let path = treasure_cache_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
-    }
-    let s = serde_json::to_string_pretty(cache)?;
-    fs::write(&path, s).with_context(|| format!("write {}", path.display()))?;
-    Ok(())
+    json_store::save(&treasure_cache_path(), cache)
 }
 
 pub fn load_radar_cache() -> RadarCache {
@@ -504,50 +579,64 @@ pub fn load_radar_cache() -> RadarCache {
 }
 
 pub fn save_radar_cache(cache: &RadarCache) -> Result<()> {
-    let path = radar_cache_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
-    }
-    let s = serde_json::to_string_pretty(cache)?;
-    fs::write(&path, s).with_context(|| format!("write {}", path.display()))?;
-    Ok(())
+    json_store::save(&radar_cache_path(), cache)
 }
 
 pub fn load_portfolio() -> Portfolio {
     let path = portfolio_path();
-    match fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-        Err(_) => Portfolio::default(),
+    match json_store::load::<Portfolio>(&path, DocumentKind::Portfolio) {
+        Ok(loaded) => {
+            if loaded.migration.migrated {
+                let result =
+                    json_store::backup_before_migration(&path, loaded.migration.from_version)
+                        .and_then(|_| json_store::save(&path, &loaded.value));
+                if let Err(error) = result {
+                    record_storage_error(format!("持仓迁移未落盘，原文件保持不变：{error:#}"));
+                }
+            }
+            loaded.value
+        }
+        Err(LoadError::NotFound) => Portfolio::default(),
+        Err(error) => {
+            record_storage_error(format!("持仓进入恢复模式：{error}"));
+            Portfolio::default()
+        }
     }
 }
 
 pub fn save_portfolio(portfolio: &Portfolio) -> Result<()> {
-    let path = portfolio_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
-    }
-    let s = serde_json::to_string_pretty(portfolio)?;
-    fs::write(&path, s).with_context(|| format!("write {}", path.display()))?;
-    Ok(())
+    json_store::save(&portfolio_path(), portfolio)
 }
 
 pub fn load_journal() -> Journal {
     let path = journal_path();
-    match fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-        Err(_) => Journal::default(),
+    match json_store::load::<Journal>(&path, DocumentKind::Journal) {
+        Ok(loaded) => {
+            if loaded.migration.migrated {
+                let result =
+                    json_store::backup_before_migration(&path, loaded.migration.from_version)
+                        .and_then(|_| json_store::save(&path, &loaded.value));
+                if let Err(error) = result {
+                    record_storage_error(format!("日记迁移未落盘，原文件保持不变：{error:#}"));
+                }
+            }
+            loaded.value
+        }
+        Err(LoadError::NotFound) => Journal::default(),
+        Err(error) => {
+            record_storage_error(format!("日记进入恢复模式：{error}"));
+            Journal::default()
+        }
     }
 }
 
 pub fn save_journal(journal: &Journal) -> Result<()> {
-    let path = journal_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
-    }
-    let s = serde_json::to_string_pretty(journal)?;
-    fs::write(&path, s).with_context(|| format!("write {}", path.display()))?;
-    Ok(())
+    json_store::save(&journal_path(), journal)
+}
+
+pub fn export_journal(journal: &Journal) -> Result<PathBuf> {
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let path = app_data_dir().join(format!("journal-export-{stamp}.json"));
+    json_store::save(&path, journal)?;
+    Ok(path)
 }

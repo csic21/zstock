@@ -4,14 +4,17 @@
 //! Daily K: Eastmoney (前复权) → Tencent (前复权, ≤~640；港股东财常空，腾讯可拉)  
 //! Search: Eastmoney → Tencent SmartBox（A 股 + 港股）
 
+use std::sync::{Mutex, OnceLock};
+
 use anyhow::{Result, anyhow};
 
+use crate::infrastructure::market::service::MarketDataService;
 use crate::model::{
     Candle, MinutePeriod, MinuteSeries, Symbol, board_for_code, is_hk_code, shared,
 };
 
-use super::eastmoney::{self, QuoteTick};
 pub use super::eastmoney::SectorTick;
+use super::eastmoney::{self, QuoteTick};
 use super::tencent;
 
 /// 行业板块成分股（东财）。
@@ -41,12 +44,7 @@ pub const SRC_EASTMONEY: &str = "东方财富";
 pub const SRC_TENCENT: &str = "腾讯财经";
 pub const SRC_LABEL: &str = "东财 / 腾讯 · 自动切换";
 
-fn quotes_usable(ticks: &[QuoteTick], requested: usize) -> bool {
-    if requested == 0 {
-        return true;
-    }
-    ticks.iter().any(|t| t.last > 0.0 || !t.name.is_empty())
-}
+static QUOTE_SERVICE: OnceLock<Mutex<MarketDataService>> = OnceLock::new();
 
 /// 上证 / 沪深300 / 创业板 — Eastmoney only (indices).
 pub fn fetch_major_indices() -> Result<Sourced<Vec<QuoteTick>>> {
@@ -60,71 +58,63 @@ pub fn fetch_major_indices() -> Result<Sourced<Vec<QuoteTick>>> {
     }
 }
 
-/// Batch quotes: Eastmoney → Tencent.
-///
-/// 纯港股列表优先腾讯（`qt.gtimg.cn/q=hk…` 更稳）；混仓 / 纯 A 仍东财优先。
+/// Batch quotes through the per-code provider orchestrator.
 pub fn fetch_quotes(codes: &[String]) -> Result<Sourced<Vec<QuoteTick>>> {
-    let n = codes.len();
-    let hk_only = !codes.is_empty() && codes.iter().all(|c| is_hk_code(c));
-    if hk_only {
-        match tencent::fetch_quotes(codes) {
-            Ok(data) if quotes_usable(&data, n) => {
-                return Ok(Sourced {
-                    data,
-                    source: SRC_TENCENT,
-                });
-            }
-            Ok(_) | Err(_) => {
-                // fall through to Eastmoney
-            }
-        }
-        match eastmoney::fetch_quotes(codes) {
-            Ok(data) if quotes_usable(&data, n) => {
-                return Ok(Sourced {
-                    data,
-                    source: SRC_EASTMONEY,
-                });
-            }
-            Ok(_) => return Err(anyhow!("行情为空（腾讯与东财均无有效港股数据）")),
-            Err(e) => return Err(anyhow!("港股行情失败: {e}")),
-        }
+    if codes.is_empty() {
+        return Ok(Sourced {
+            data: Vec::new(),
+            source: SRC_LABEL,
+        });
     }
-
-    match eastmoney::fetch_quotes(codes) {
-        Ok(data) if quotes_usable(&data, n) => Ok(Sourced {
-            data,
-            source: SRC_EASTMONEY,
-        }),
-        Ok(empty) => match tencent::fetch_quotes(codes) {
-            Ok(data) if quotes_usable(&data, n) => Ok(Sourced {
-                data,
-                source: SRC_TENCENT,
-            }),
-            Ok(_) if !empty.is_empty() => Ok(Sourced {
-                data: empty,
-                source: SRC_EASTMONEY,
-            }),
-            Ok(_) => Err(anyhow!("行情为空（东财与腾讯均无有效数据）")),
-            Err(e2) => {
-                if !empty.is_empty() {
-                    Ok(Sourced {
-                        data: empty,
-                        source: SRC_EASTMONEY,
-                    })
-                } else {
-                    Err(anyhow!("行情失败: 东财无数据; 腾讯: {e2}"))
-                }
+    let mut service = QUOTE_SERVICE
+        .get_or_init(|| Mutex::new(MarketDataService::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let batch = service.fetch_quotes(codes);
+    let data: Vec<_> = batch
+        .records
+        .into_iter()
+        .filter(|record| record.usable())
+        .map(|record| {
+            let price = record.price.unwrap_or_default();
+            QuoteTick {
+                code: record.code,
+                name: record.name,
+                last: price,
+                change_pct: record.change_pct.unwrap_or_default(),
+                volume: record.volume.unwrap_or_default(),
+                currency: record.currency,
+                source: record.source,
+                fetched_at: record.fetched_at,
+                market_time: record.market_time,
+                availability: record.availability,
+                freshness: record.freshness,
             }
-        },
-        Err(e1) => match tencent::fetch_quotes(codes) {
-            Ok(data) if quotes_usable(&data, n) => Ok(Sourced {
-                data,
-                source: SRC_TENCENT,
-            }),
-            Ok(_) => Err(anyhow!("行情失败: 东财: {e1}; 腾讯无有效数据")),
-            Err(e2) => Err(anyhow!("行情失败: 东财: {e1}; 腾讯: {e2}")),
-        },
+        })
+        .collect();
+    if data.is_empty() {
+        let detail = batch
+            .errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(anyhow!(if detail.is_empty() {
+            "行情为空（主备源均无有效数据）".into()
+        } else {
+            format!("行情失败: {detail}")
+        }));
     }
+    let all_eastmoney = data.iter().all(|record| record.source == SRC_EASTMONEY);
+    let all_tencent = data.iter().all(|record| record.source == SRC_TENCENT);
+    let source = if all_eastmoney {
+        SRC_EASTMONEY
+    } else if all_tencent {
+        SRC_TENCENT
+    } else {
+        SRC_LABEL
+    };
+    Ok(Sourced { data, source })
 }
 
 fn try_klines_chain(

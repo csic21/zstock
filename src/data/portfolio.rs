@@ -4,7 +4,14 @@
 //! - 不追踪融资/融券；股数为 `f64` 以便兼容 ETF 等非整手场景。
 //! - 全部本地 JSON 持久化，不上传。
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+
+use crate::domain::money::{Currency, Money};
+
+pub const PORTFOLIO_SCHEMA_VERSION: u32 =
+    crate::infrastructure::storage::migrations::PORTFOLIO_SCHEMA_VERSION;
 
 /// 买卖方向。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +45,8 @@ pub struct Trade {
     pub code: String,
     pub name: String,
     pub side: TradeSide,
+    /// Currency is fixed when the trade is created and never inferred during arithmetic.
+    pub currency: Currency,
     /// 股数（> 0）。
     pub shares: f64,
     /// 成交价（元）。
@@ -58,25 +67,47 @@ impl Trade {
     }
 
     /// 买入现金流出 / 卖出现金流入（含费）。
-    pub fn cash_delta(&self) -> f64 {
-        match self.side {
+    pub fn cash_delta(&self) -> Money {
+        let major = match self.side {
             TradeSide::Buy => -(self.notional() + self.fee),
             TradeSide::Sell => self.notional() - self.fee,
-        }
+        };
+        Money::from_major(self.currency, major).unwrap_or_else(|| Money::zero(self.currency))
     }
 }
 
-/// 用户投资组合：全部成交流水 + 可选现金。
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// 用户投资组合：全部成交流水 + 分币种现金。
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Portfolio {
+    #[serde(default = "current_schema_version")]
+    pub schema_version: u32,
     #[serde(default)]
     pub trades: Vec<Trade>,
-    /// 现金余额（元）。`track_cash` 为 false 时仅作展示用，不强制校验。
+    /// Cash is never collapsed across currencies.
     #[serde(default)]
-    pub cash: f64,
+    pub cash_balances: BTreeMap<Currency, Money>,
+    /// Legacy records with an unrecognizable code wait for explicit confirmation.
+    #[serde(default)]
+    pub pending_currency_codes: Vec<String>,
     /// 是否启用现金约束（买入时检查余额，卖出回补）。
     #[serde(default)]
     pub track_cash: bool,
+}
+
+fn current_schema_version() -> u32 {
+    PORTFOLIO_SCHEMA_VERSION
+}
+
+impl Default for Portfolio {
+    fn default() -> Self {
+        Self {
+            schema_version: PORTFOLIO_SCHEMA_VERSION,
+            trades: Vec::new(),
+            cash_balances: BTreeMap::new(),
+            pending_currency_codes: Vec::new(),
+            track_cash: false,
+        }
+    }
 }
 
 /// 单标的当前持仓（由流水重放得出）。
@@ -84,6 +115,7 @@ pub struct Portfolio {
 pub struct Position {
     pub code: String,
     pub name: String,
+    pub currency: Currency,
     /// 当前持股。
     pub shares: f64,
     /// 每股平均成本（含买入手续费摊入）。
@@ -143,15 +175,22 @@ impl PositionMark {
 #[derive(Debug, Clone, Default)]
 pub struct PortfolioSummary {
     pub positions: Vec<PositionMark>,
+    pub by_currency: BTreeMap<Currency, CurrencyTotals>,
+    pub pending_currency_codes: Vec<String>,
+    pub track_cash: bool,
+    /// 开仓标的只数。
+    pub open_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct CurrencyTotals {
+    pub currency: Currency,
     pub total_cost: f64,
     pub total_market_value: f64,
     pub total_unrealized_pnl: f64,
     pub total_unrealized_pnl_pct: f64,
     pub total_realized_pnl: f64,
-    pub cash: f64,
-    pub track_cash: bool,
-    /// 开仓标的只数。
-    pub open_count: usize,
+    pub cash: Money,
 }
 
 /// 录单错误。
@@ -160,6 +199,7 @@ pub enum TradeError {
     InvalidShares,
     InvalidPrice,
     InvalidFee,
+    UnknownCurrency,
     InsufficientShares { have: String, want: String },
     InsufficientCash { have: String, need: String },
     EmptyCode,
@@ -171,6 +211,7 @@ impl std::fmt::Display for TradeError {
             Self::InvalidShares => write!(f, "股数须大于 0"),
             Self::InvalidPrice => write!(f, "价格须大于 0"),
             Self::InvalidFee => write!(f, "手续费不能为负"),
+            Self::UnknownCurrency => write!(f, "无法识别代码币种，请确认市场"),
             Self::InsufficientShares { have, want } => {
                 write!(f, "可卖不足：持有 {have} 股，尝试卖出 {want} 股")
             }
@@ -183,6 +224,17 @@ impl std::fmt::Display for TradeError {
 }
 
 impl std::error::Error for TradeError {}
+
+pub struct TradeDraft<'a> {
+    pub code: &'a str,
+    pub name: &'a str,
+    pub side: TradeSide,
+    pub shares: f64,
+    pub price: f64,
+    pub fee: f64,
+    pub note: &'a str,
+    pub time: Option<String>,
+}
 
 /// 新建交易 id。
 pub fn new_trade_id() -> String {
@@ -202,6 +254,19 @@ pub fn now_time_string() -> String {
 }
 
 impl Portfolio {
+    pub fn cash(&self, currency: Currency) -> Money {
+        self.cash_balances
+            .get(&currency)
+            .copied()
+            .unwrap_or_else(|| Money::zero(currency))
+    }
+
+    pub fn set_cash(&mut self, currency: Currency, major: f64) -> Result<(), TradeError> {
+        let money = Money::from_major(currency, major).ok_or(TradeError::InvalidPrice)?;
+        self.cash_balances.insert(currency, money);
+        Ok(())
+    }
+
     /// 所有出现过的代码（含已清仓）。
     pub fn all_codes(&self) -> Vec<String> {
         let mut out = Vec::new();
@@ -224,23 +289,25 @@ impl Portfolio {
 
     /// 按代码重放流水 → 持仓列表（仅开仓，按 code 排序）。
     pub fn positions(&self) -> Vec<Position> {
-        let mut map: std::collections::BTreeMap<String, PositionState> =
-            std::collections::BTreeMap::new();
+        let mut map: BTreeMap<(Currency, String), PositionState> = BTreeMap::new();
         for t in &self.trades {
-            let st = map.entry(t.code.clone()).or_insert_with(|| PositionState {
-                name: t.name.clone(),
-                shares: 0.0,
-                cost_basis: 0.0,
-                realized_pnl: 0.0,
-                trade_count: 0,
-            });
+            let st = map
+                .entry((t.currency, t.code.clone()))
+                .or_insert_with(|| PositionState {
+                    name: t.name.clone(),
+                    currency: t.currency,
+                    shares: 0.0,
+                    cost_basis: 0.0,
+                    realized_pnl: 0.0,
+                    trade_count: 0,
+                });
             if !t.name.is_empty() && t.name != t.code {
                 st.name = t.name.clone();
             }
             st.apply(t);
         }
         map.into_iter()
-            .filter_map(|(code, st)| {
+            .filter_map(|((currency, code), st)| {
                 if st.shares <= 1e-9 {
                     return None;
                 }
@@ -252,6 +319,7 @@ impl Portfolio {
                 Some(Position {
                     code,
                     name: st.name,
+                    currency,
                     shares: st.shares,
                     avg_cost: avg,
                     total_cost: st.cost_basis,
@@ -276,6 +344,7 @@ impl Portfolio {
                 continue;
             }
             found = true;
+            st.currency = t.currency;
             if !t.name.is_empty() {
                 st.name = t.name.clone();
             }
@@ -292,6 +361,7 @@ impl Portfolio {
         Some(Position {
             code: code.to_string(),
             name: st.name,
+            currency: st.currency,
             shares: st.shares,
             avg_cost: avg,
             total_cost: st.cost_basis,
@@ -314,22 +384,43 @@ impl Portfolio {
     {
         let positions = self.positions();
         let mut marks = Vec::with_capacity(positions.len());
-        let mut total_cost = 0.0;
-        let mut total_mv = 0.0;
-        let mut total_realized = 0.0;
+        let mut by_currency: BTreeMap<Currency, CurrencyTotals> = BTreeMap::new();
 
         for mut pos in positions {
             let (last, day_chg, name_hint) = quote_fn(&pos.code);
-            if pos.name.is_empty() || pos.name == pos.code {
-                if !name_hint.is_empty() {
-                    pos.name = name_hint;
-                }
+            if (pos.name.is_empty() || pos.name == pos.code) && !name_hint.is_empty() {
+                pos.name = name_hint;
             }
             let mark = PositionMark::from_position(pos, last, day_chg);
-            total_cost += mark.position.total_cost;
-            total_mv += mark.market_value;
-            total_realized += mark.position.realized_pnl;
+            let totals = by_currency
+                .entry(mark.position.currency)
+                .or_insert_with(|| CurrencyTotals {
+                    currency: mark.position.currency,
+                    total_cost: 0.0,
+                    total_market_value: 0.0,
+                    total_unrealized_pnl: 0.0,
+                    total_unrealized_pnl_pct: 0.0,
+                    total_realized_pnl: 0.0,
+                    cash: self.cash(mark.position.currency),
+                });
+            totals.total_cost += mark.position.total_cost;
+            totals.total_market_value += mark.market_value;
+            totals.total_realized_pnl += mark.position.realized_pnl;
             marks.push(mark);
+        }
+
+        for (currency, cash) in &self.cash_balances {
+            by_currency
+                .entry(*currency)
+                .or_insert_with(|| CurrencyTotals {
+                    currency: *currency,
+                    total_cost: 0.0,
+                    total_market_value: 0.0,
+                    total_unrealized_pnl: 0.0,
+                    total_unrealized_pnl_pct: 0.0,
+                    total_realized_pnl: 0.0,
+                    cash: *cash,
+                });
         }
 
         // 按浮动盈亏比例降序，便于扫一眼风险。
@@ -339,39 +430,37 @@ impl Portfolio {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let total_unrealized = total_mv - total_cost;
-        let total_unrealized_pct = if total_cost > 1e-9 {
-            total_unrealized / total_cost * 100.0
-        } else {
-            0.0
-        };
+        for totals in by_currency.values_mut() {
+            totals.total_unrealized_pnl = totals.total_market_value - totals.total_cost;
+            totals.total_unrealized_pnl_pct = if totals.total_cost > 1e-9 {
+                totals.total_unrealized_pnl / totals.total_cost * 100.0
+            } else {
+                0.0
+            };
+        }
         let open_count = marks.len();
 
         PortfolioSummary {
             positions: marks,
-            total_cost,
-            total_market_value: total_mv,
-            total_unrealized_pnl: total_unrealized,
-            total_unrealized_pnl_pct: total_unrealized_pct,
-            total_realized_pnl: total_realized,
-            cash: self.cash,
+            by_currency,
+            pending_currency_codes: self.pending_currency_codes.clone(),
             track_cash: self.track_cash,
             open_count,
         }
     }
 
     /// 录一笔买卖。成功返回 trade id。
-    pub fn record_trade(
-        &mut self,
-        code: &str,
-        name: &str,
-        side: TradeSide,
-        shares: f64,
-        price: f64,
-        fee: f64,
-        note: &str,
-        time: Option<String>,
-    ) -> Result<String, TradeError> {
+    pub fn record_trade(&mut self, draft: TradeDraft<'_>) -> Result<String, TradeError> {
+        let TradeDraft {
+            code,
+            name,
+            side,
+            shares,
+            price,
+            fee,
+            note,
+            time,
+        } = draft;
         let code = code.trim();
         if code.is_empty() {
             return Err(TradeError::EmptyCode);
@@ -385,6 +474,7 @@ impl Portfolio {
         if !fee.is_finite() || fee < 0.0 {
             return Err(TradeError::InvalidFee);
         }
+        let currency = Currency::for_code(code).ok_or(TradeError::UnknownCurrency)?;
 
         if side == TradeSide::Sell {
             let have = self.position_of(code).map(|p| p.shares).unwrap_or(0.0);
@@ -398,9 +488,10 @@ impl Portfolio {
 
         if self.track_cash && side == TradeSide::Buy {
             let need = shares * price + fee;
-            if need > self.cash + 1e-6 {
+            let available = self.cash(currency).major();
+            if need > available + 1e-6 {
                 return Err(TradeError::InsufficientCash {
-                    have: format!("{:.2}", self.cash),
+                    have: format!("{available:.2} {}", currency.symbol()),
                     need: format!("{need:.2}"),
                 });
             }
@@ -412,6 +503,7 @@ impl Portfolio {
             code: code.to_string(),
             name: name.trim().to_string(),
             side,
+            currency,
             shares,
             price,
             fee,
@@ -420,10 +512,11 @@ impl Portfolio {
         };
 
         if self.track_cash {
-            self.cash += trade.cash_delta();
-            if self.cash < 0.0 && self.cash.abs() < 1e-6 {
-                self.cash = 0.0;
-            }
+            let next = self
+                .cash(currency)
+                .checked_add(trade.cash_delta())
+                .expect("trade cash flow has the trade currency");
+            self.cash_balances.insert(currency, next);
         }
 
         self.trades.push(trade);
@@ -438,13 +531,21 @@ impl Portfolio {
         let trade = self.trades.remove(ix);
         if self.track_cash {
             // 撤销 = 反向现金流
-            self.cash -= trade.cash_delta();
+            let current = self.cash(trade.currency);
+            let restored = current
+                .checked_sub(trade.cash_delta())
+                .expect("trade cash flow has the trade currency");
+            self.cash_balances.insert(trade.currency, restored);
         }
         // 撤销后可能出现「卖出 > 持仓」的历史状态；由调用方负责校验或允许负持仓回放失败。
         // 这里做一次一致性检查：若某标的重放后股数为负，拒绝撤销并还原。
         if self.has_negative_position() {
             if self.track_cash {
-                self.cash += trade.cash_delta();
+                let current = self.cash(trade.currency);
+                let reverted = current
+                    .checked_add(trade.cash_delta())
+                    .expect("trade cash flow has the trade currency");
+                self.cash_balances.insert(trade.currency, reverted);
             }
             self.trades.insert(ix, trade);
             return false;
@@ -481,28 +582,41 @@ impl Portfolio {
         if pos.shares <= 1e-9 {
             return Ok(None);
         }
-        let id = self.record_trade(
+        let id = self.record_trade(TradeDraft {
             code,
-            &pos.name,
-            TradeSide::Sell,
-            pos.shares,
+            name: &pos.name,
+            side: TradeSide::Sell,
+            shares: pos.shares,
             price,
             fee,
-            if note.is_empty() { "清仓" } else { note },
-            None,
-        )?;
+            note: if note.is_empty() { "清仓" } else { note },
+            time: None,
+        })?;
         Ok(Some(id))
     }
 }
 
-#[derive(Default)]
 struct PositionState {
     name: String,
+    currency: Currency,
     shares: f64,
     /// 当前持仓总成本（含买入费摊入）。
     cost_basis: f64,
     realized_pnl: f64,
     trade_count: usize,
+}
+
+impl Default for PositionState {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            currency: Currency::Cny,
+            shares: 0.0,
+            cost_basis: 0.0,
+            realized_pnl: 0.0,
+            trade_count: 0,
+        }
+    }
 }
 
 impl PositionState {
@@ -564,13 +678,31 @@ mod tests {
     use super::*;
 
     fn buy(p: &mut Portfolio, code: &str, shares: f64, price: f64, fee: f64) {
-        p.record_trade(code, "测试", TradeSide::Buy, shares, price, fee, "", None)
-            .unwrap();
+        p.record_trade(TradeDraft {
+            code,
+            name: "测试",
+            side: TradeSide::Buy,
+            shares,
+            price,
+            fee,
+            note: "",
+            time: None,
+        })
+        .unwrap();
     }
 
     fn sell(p: &mut Portfolio, code: &str, shares: f64, price: f64, fee: f64) {
-        p.record_trade(code, "测试", TradeSide::Sell, shares, price, fee, "", None)
-            .unwrap();
+        p.record_trade(TradeDraft {
+            code,
+            name: "测试",
+            side: TradeSide::Sell,
+            shares,
+            price,
+            fee,
+            note: "",
+            time: None,
+        })
+        .unwrap();
     }
 
     #[test]
@@ -608,7 +740,16 @@ mod tests {
         let mut p = Portfolio::default();
         buy(&mut p, "600519", 100.0, 10.0, 0.0);
         let err = p
-            .record_trade("600519", "x", TradeSide::Sell, 150.0, 11.0, 0.0, "", None)
+            .record_trade(TradeDraft {
+                code: "600519",
+                name: "x",
+                side: TradeSide::Sell,
+                shares: 150.0,
+                price: 11.0,
+                fee: 0.0,
+                note: "",
+                time: None,
+            })
             .unwrap_err();
         assert!(matches!(err, TradeError::InsufficientShares { .. }));
     }
@@ -635,34 +776,44 @@ mod tests {
             _ => (0.0, 0.0, String::new()),
         });
         assert_eq!(sum.open_count, 2);
-        assert!((sum.total_cost - 2000.0).abs() < 1e-9);
+        let cny = &sum.by_currency[&Currency::Cny];
+        assert!((cny.total_cost - 2000.0).abs() < 1e-9);
         // 600519: 1200, 000001: 800 → 2000
-        assert!((sum.total_market_value - 2000.0).abs() < 1e-9);
-        assert!((sum.total_unrealized_pnl).abs() < 1e-9);
+        assert!((cny.total_market_value - 2000.0).abs() < 1e-9);
+        assert!(cny.total_unrealized_pnl.abs() < 1e-9);
     }
 
     #[test]
     fn cash_tracking_on_buy_sell() {
         let mut p = Portfolio {
-            cash: 10_000.0,
             track_cash: true,
             ..Default::default()
         };
+        p.set_cash(Currency::Cny, 10_000.0).unwrap();
         buy(&mut p, "600519", 100.0, 10.0, 5.0); // -1005
-        assert!((p.cash - 8995.0).abs() < 1e-6);
+        assert!((p.cash(Currency::Cny).major() - 8995.0).abs() < 1e-6);
         sell(&mut p, "600519", 50.0, 12.0, 2.0); // +598
-        assert!((p.cash - 9593.0).abs() < 1e-6);
+        assert!((p.cash(Currency::Cny).major() - 9593.0).abs() < 1e-6);
     }
 
     #[test]
     fn cash_blocks_overbuy() {
         let mut p = Portfolio {
-            cash: 100.0,
             track_cash: true,
             ..Default::default()
         };
+        p.set_cash(Currency::Cny, 100.0).unwrap();
         let err = p
-            .record_trade("600519", "x", TradeSide::Buy, 100.0, 10.0, 0.0, "", None)
+            .record_trade(TradeDraft {
+                code: "600519",
+                name: "x",
+                side: TradeSide::Buy,
+                shares: 100.0,
+                price: 10.0,
+                fee: 0.0,
+                note: "",
+                time: None,
+            })
             .unwrap_err();
         assert!(matches!(err, TradeError::InsufficientCash { .. }));
     }
@@ -671,7 +822,16 @@ mod tests {
     fn remove_trade_rolls_back() {
         let mut p = Portfolio::default();
         let id = p
-            .record_trade("600519", "x", TradeSide::Buy, 100.0, 10.0, 0.0, "", None)
+            .record_trade(TradeDraft {
+                code: "600519",
+                name: "x",
+                side: TradeSide::Buy,
+                shares: 100.0,
+                price: 10.0,
+                fee: 0.0,
+                note: "",
+                time: None,
+            })
             .unwrap();
         assert!(p.remove_trade(&id));
         assert!(p.position_of("600519").is_none());
@@ -682,10 +842,28 @@ mod tests {
     fn remove_trade_rejects_breaking_history() {
         let mut p = Portfolio::default();
         let buy_id = p
-            .record_trade("600519", "x", TradeSide::Buy, 100.0, 10.0, 0.0, "", None)
+            .record_trade(TradeDraft {
+                code: "600519",
+                name: "x",
+                side: TradeSide::Buy,
+                shares: 100.0,
+                price: 10.0,
+                fee: 0.0,
+                note: "",
+                time: None,
+            })
             .unwrap();
-        p.record_trade("600519", "x", TradeSide::Sell, 100.0, 11.0, 0.0, "", None)
-            .unwrap();
+        p.record_trade(TradeDraft {
+            code: "600519",
+            name: "x",
+            side: TradeSide::Sell,
+            shares: 100.0,
+            price: 11.0,
+            fee: 0.0,
+            note: "",
+            time: None,
+        })
+        .unwrap();
         // 撤销买入会使卖出变成裸卖 → 拒绝
         assert!(!p.remove_trade(&buy_id));
         assert_eq!(p.trades.len(), 2);
@@ -694,15 +872,36 @@ mod tests {
     #[test]
     fn serde_roundtrip() {
         let mut p = Portfolio {
-            cash: 2000.0,
             track_cash: true,
             ..Default::default()
         };
+        p.set_cash(Currency::Cny, 2000.0).unwrap();
         buy(&mut p, "600519", 100.0, 10.0, 1.0);
         let s = serde_json::to_string(&p).unwrap();
         let p2: Portfolio = serde_json::from_str(&s).unwrap();
         assert_eq!(p2.trades.len(), 1);
-        assert!((p2.cash - p.cash).abs() < 1e-9);
-        assert!((p2.cash - 999.0).abs() < 1e-9);
+        assert_eq!(p2.cash(Currency::Cny), p.cash(Currency::Cny));
+        assert!((p2.cash(Currency::Cny).major() - 999.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mixed_portfolio_has_separate_cny_and_hkd_totals() {
+        let mut p = Portfolio::default();
+        buy(&mut p, "600519", 100.0, 10.0, 0.0);
+        buy(&mut p, "00700", 100.0, 20.0, 0.0);
+        let summary = p.summarize_with(|code| match code {
+            "600519" => (11.0, 1.0, String::new()),
+            "00700" => (19.0, -1.0, String::new()),
+            _ => unreachable!(),
+        });
+        assert_eq!(summary.by_currency.len(), 2);
+        assert_eq!(
+            summary.by_currency[&Currency::Cny].total_market_value,
+            1100.0
+        );
+        assert_eq!(
+            summary.by_currency[&Currency::Hkd].total_market_value,
+            1900.0
+        );
     }
 }

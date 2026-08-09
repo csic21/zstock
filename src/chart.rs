@@ -1,8 +1,6 @@
 //! Interactive chart: candlesticks (normal) or area/line (work mode), with MA + volume + crosshair.
 
-use gpui::{
-    fill, point, px, size, Bounds, Hsla, PathBuilder, Pixels, Window,
-};
+use gpui::{Bounds, Hsla, PathBuilder, Pixels, Window, fill, point, px, size};
 use gpui_component::PixelsExt;
 
 use crate::data::indicators::MaSeries;
@@ -173,11 +171,19 @@ pub fn chart_layout(data: &ChartPaintData, bounds: Bounds<Pixels>) -> ChartLayou
 
     let mut y_min = match data.style {
         ChartStyle::Candles => data.candles.iter().map(|c| c.low).fold(f64::MAX, f64::min),
-        ChartStyle::Area => data.candles.iter().map(|c| c.close).fold(f64::MAX, f64::min),
+        ChartStyle::Area => data
+            .candles
+            .iter()
+            .map(|c| c.close)
+            .fold(f64::MAX, f64::min),
     };
     let mut y_max = match data.style {
         ChartStyle::Candles => data.candles.iter().map(|c| c.high).fold(f64::MIN, f64::max),
-        ChartStyle::Area => data.candles.iter().map(|c| c.close).fold(f64::MIN, f64::max),
+        ChartStyle::Area => data
+            .candles
+            .iter()
+            .map(|c| c.close)
+            .fold(f64::MIN, f64::max),
     };
     for series in [
         data.ma.ma5.as_slice(),
@@ -191,16 +197,22 @@ pub fn chart_layout(data: &ChartPaintData, bounds: Bounds<Pixels>) -> ChartLayou
         }
     }
     if let Some(boll) = &data.boll {
-        for v in boll.upper.iter().flatten().chain(boll.lower.iter().flatten()) {
+        for v in boll
+            .upper
+            .iter()
+            .flatten()
+            .chain(boll.lower.iter().flatten())
+        {
             y_min = y_min.min(*v);
             y_max = y_max.max(*v);
         }
     }
-    if let Some(cost) = data.cost_line {
-        if cost.is_finite() && cost > 0.0 {
-            y_min = y_min.min(cost);
-            y_max = y_max.max(cost);
-        }
+    if let Some(cost) = data.cost_line
+        && cost.is_finite()
+        && cost > 0.0
+    {
+        y_min = y_min.min(cost);
+        y_max = y_max.max(cost);
     }
     if (y_max - y_min).abs() < 1e-6 {
         y_max += 1.0;
@@ -279,7 +291,10 @@ pub fn paint_chart(bounds: Bounds<Pixels>, data: &ChartPaintData, window: &mut W
         // Right edge tick mark (visual price guide without font path)
         let mut tick = PathBuilder::stroke(px(1.));
         tick.move_to(point(origin.x + px(PAD_L + plot_w), origin.y + px(gy)));
-        tick.line_to(point(origin.x + px(PAD_L + plot_w + 5.0), origin.y + px(gy)));
+        tick.line_to(point(
+            origin.x + px(PAD_L + plot_w + 5.0),
+            origin.y + px(gy),
+        ));
         if let Ok(p) = tick.build() {
             window.paint_path(p, data.axis_color.opacity(0.7));
         }
@@ -299,7 +314,15 @@ pub fn paint_chart(bounds: Bounds<Pixels>, data: &ChartPaintData, window: &mut W
 
     match data.style {
         ChartStyle::Area => {
-            paint_area_series(candles, origin, &x_center, &y_of, PAD_T + price_h, data, window);
+            paint_area_series(
+                candles,
+                origin,
+                &x_center,
+                &y_of,
+                PAD_T + price_h,
+                data,
+                window,
+            );
         }
         ChartStyle::Candles => {
             paint_candles(candles, origin, &x_center, &y_of, body_w, data, window);
@@ -352,26 +375,27 @@ pub fn paint_chart(bounds: Bounds<Pixels>, data: &ChartPaintData, window: &mut W
     paint_trend_lines(data, origin, &x_center, &y_of, window);
 
     // Portfolio average cost (dashed horizontal)
-    if let Some(cost) = data.cost_line {
-        if cost.is_finite() && cost > 0.0 {
-            let y = y_of(cost);
-            paint_dashed_hline(
-                origin,
-                PAD_L,
-                PAD_L + plot_w,
-                y,
-                data.cost_line_color,
-                window,
-            );
-            // Right gutter marker
-            window.paint_quad(fill(
-                Bounds {
-                    origin: point(origin.x + px(PAD_L + plot_w + 5.0), origin.y + px(y - 2.0)),
-                    size: size(px(5.), px(5.)),
-                },
-                data.cost_line_color,
-            ));
-        }
+    if let Some(cost) = data.cost_line
+        && cost.is_finite()
+        && cost > 0.0
+    {
+        let y = y_of(cost);
+        paint_dashed_hline(
+            origin,
+            PAD_L,
+            PAD_L + plot_w,
+            y,
+            data.cost_line_color,
+            window,
+        );
+        // Right gutter marker
+        window.paint_quad(fill(
+            Bounds {
+                origin: point(origin.x + px(PAD_L + plot_w + 5.0), origin.y + px(y - 2.0)),
+                size: size(px(5.), px(5.)),
+            },
+            data.cost_line_color,
+        ));
     }
 
     // Volume pane
@@ -379,7 +403,10 @@ pub fn paint_chart(bounds: Bounds<Pixels>, data: &ChartPaintData, window: &mut W
         let vol_top = layout.vol_top;
         // Separator
         let mut sep = PathBuilder::stroke(px(1.));
-        sep.move_to(point(origin.x + px(PAD_L), origin.y + px(vol_top - VOL_GAP * 0.5)));
+        sep.move_to(point(
+            origin.x + px(PAD_L),
+            origin.y + px(vol_top - VOL_GAP * 0.5),
+        ));
         sep.line_to(point(
             origin.x + px(PAD_L + plot_w),
             origin.y + px(vol_top - VOL_GAP * 0.5),
@@ -388,12 +415,7 @@ pub fn paint_chart(bounds: Bounds<Pixels>, data: &ChartPaintData, window: &mut W
             window.paint_path(p, data.border.opacity(0.55));
         }
 
-        let max_vol = candles
-            .iter()
-            .map(|c| c.volume)
-            .max()
-            .unwrap_or(0)
-            .max(1) as f64;
+        let max_vol = candles.iter().map(|c| c.volume).max().unwrap_or(0).max(1) as f64;
 
         for (i, c) in candles.iter().enumerate() {
             let cx = x_center(i);
@@ -421,41 +443,41 @@ pub fn paint_chart(bounds: Bounds<Pixels>, data: &ChartPaintData, window: &mut W
     }
 
     // Crosshair (full height including volume / MACD panes)
-    if let Some(ix) = data.hover_ix {
-        if ix < candles.len() {
-            let cx = x_center(ix);
-            let c = &candles[ix];
-            let cy = y_of(c.close);
-            let full_bottom = if show_macd {
-                layout.macd_top + macd_h
-            } else if show_vol {
-                layout.vol_top + vol_h
-            } else {
-                PAD_T + price_h
-            };
+    if let Some(ix) = data.hover_ix
+        && ix < candles.len()
+    {
+        let cx = x_center(ix);
+        let c = &candles[ix];
+        let cy = y_of(c.close);
+        let full_bottom = if show_macd {
+            layout.macd_top + macd_h
+        } else if show_vol {
+            layout.vol_top + vol_h
+        } else {
+            PAD_T + price_h
+        };
 
-            let mut vline = PathBuilder::stroke(px(1.));
-            vline.move_to(point(origin.x + px(cx), origin.y + px(PAD_T)));
-            vline.line_to(point(origin.x + px(cx), origin.y + px(full_bottom)));
-            if let Ok(p) = vline.build() {
-                window.paint_path(p, data.crosshair);
-            }
-
-            let mut hline = PathBuilder::stroke(px(1.));
-            hline.move_to(point(origin.x + px(PAD_L), origin.y + px(cy)));
-            hline.line_to(point(origin.x + px(PAD_L + plot_w), origin.y + px(cy)));
-            if let Ok(p) = hline.build() {
-                window.paint_path(p, data.crosshair);
-            }
-
-            window.paint_quad(fill(
-                Bounds {
-                    origin: point(origin.x + px(cx - 2.5), origin.y + px(cy - 2.5)),
-                    size: size(px(5.), px(5.)),
-                },
-                data.crosshair,
-            ));
+        let mut vline = PathBuilder::stroke(px(1.));
+        vline.move_to(point(origin.x + px(cx), origin.y + px(PAD_T)));
+        vline.line_to(point(origin.x + px(cx), origin.y + px(full_bottom)));
+        if let Ok(p) = vline.build() {
+            window.paint_path(p, data.crosshair);
         }
+
+        let mut hline = PathBuilder::stroke(px(1.));
+        hline.move_to(point(origin.x + px(PAD_L), origin.y + px(cy)));
+        hline.line_to(point(origin.x + px(PAD_L + plot_w), origin.y + px(cy)));
+        if let Ok(p) = hline.build() {
+            window.paint_path(p, data.crosshair);
+        }
+
+        window.paint_quad(fill(
+            Bounds {
+                origin: point(origin.x + px(cx - 2.5), origin.y + px(cy - 2.5)),
+                size: size(px(5.), px(5.)),
+            },
+            data.crosshair,
+        ));
     }
 }
 
@@ -520,7 +542,10 @@ fn paint_macd_pane(
 
     // Separator line
     let mut sep = PathBuilder::stroke(px(1.));
-    sep.move_to(point(origin.x + px(PAD_L), origin.y + px(top - MACD_GAP * 0.5)));
+    sep.move_to(point(
+        origin.x + px(PAD_L),
+        origin.y + px(top - MACD_GAP * 0.5),
+    ));
     sep.line_to(point(
         origin.x + px(PAD_L + layout.plot_w),
         origin.y + px(top - MACD_GAP * 0.5),
@@ -544,7 +569,10 @@ fn paint_macd_pane(
     // Zero line
     let mut zero = PathBuilder::stroke(px(1.));
     zero.move_to(point(origin.x + px(PAD_L), origin.y + px(y_of(0.0))));
-    zero.line_to(point(origin.x + px(PAD_L + layout.plot_w), origin.y + px(y_of(0.0))));
+    zero.line_to(point(
+        origin.x + px(PAD_L + layout.plot_w),
+        origin.y + px(y_of(0.0)),
+    ));
     if let Ok(p) = zero.build() {
         window.paint_path(p, data.border.opacity(0.7));
     }
@@ -554,13 +582,22 @@ fn paint_macd_pane(
         let gy = y_of(f * extent);
         let mut g = PathBuilder::stroke(px(1.));
         g.move_to(point(origin.x + px(PAD_L), origin.y + px(gy)));
-        g.line_to(point(origin.x + px(PAD_L + layout.plot_w), origin.y + px(gy)));
+        g.line_to(point(
+            origin.x + px(PAD_L + layout.plot_w),
+            origin.y + px(gy),
+        ));
         if let Ok(p) = g.build() {
             window.paint_path(p, data.border.opacity(0.25));
         }
         let mut tick = PathBuilder::stroke(px(1.));
-        tick.move_to(point(origin.x + px(PAD_L + layout.plot_w), origin.y + px(gy)));
-        tick.line_to(point(origin.x + px(PAD_L + layout.plot_w + 5.0), origin.y + px(gy)));
+        tick.move_to(point(
+            origin.x + px(PAD_L + layout.plot_w),
+            origin.y + px(gy),
+        ));
+        tick.line_to(point(
+            origin.x + px(PAD_L + layout.plot_w + 5.0),
+            origin.y + px(gy),
+        ));
         if let Ok(p) = tick.build() {
             window.paint_path(p, macd.axis_color.opacity(0.7));
         }
@@ -581,7 +618,11 @@ fn paint_macd_pane(
         let cx = x_center(i);
         let y0 = y_of(0.0);
         let y1 = y_of(h);
-        let (top_y, h_px) = if y1 < y0 { (y1, y0 - y1) } else { (y0, y1 - y0) };
+        let (top_y, h_px) = if y1 < y0 {
+            (y1, y0 - y1)
+        } else {
+            (y0, y1 - y0)
+        };
         window.paint_quad(fill(
             Bounds {
                 origin: point(origin.x + px(cx - body_w / 2.0), origin.y + px(top_y)),
@@ -667,7 +708,10 @@ fn paint_minute_chart(bounds: Bounds<Pixels>, data: &MinutePaintData, window: &m
         }
         let mut tick = PathBuilder::stroke(px(1.));
         tick.move_to(point(origin.x + px(PAD_L + plot_w), origin.y + px(gy)));
-        tick.line_to(point(origin.x + px(PAD_L + plot_w + 5.0), origin.y + px(gy)));
+        tick.line_to(point(
+            origin.x + px(PAD_L + plot_w + 5.0),
+            origin.y + px(gy),
+        ));
         if let Ok(p) = tick.build() {
             window.paint_path(p, data.axis_color.opacity(0.7));
         }
@@ -688,7 +732,10 @@ fn paint_minute_chart(bounds: Bounds<Pixels>, data: &MinutePaintData, window: &m
         let up = data.prices[i + 1] >= data.prev_close;
         let color = if up { data.bullish } else { data.bearish };
         let mut seg = PathBuilder::stroke(px(1.5));
-        seg.move_to(point(origin.x + px(x_of(i)), origin.y + px(y_of(data.prices[i]))));
+        seg.move_to(point(
+            origin.x + px(x_of(i)),
+            origin.y + px(y_of(data.prices[i])),
+        ));
         seg.line_to(point(
             origin.x + px(x_of(i + 1)),
             origin.y + px(y_of(data.prices[i + 1])),
@@ -720,7 +767,10 @@ fn paint_minute_chart(bounds: Bounds<Pixels>, data: &MinutePaintData, window: &m
     // Volume pane: per-minute bars colored vs prev close
     let vol_top = PAD_T + price_h + VOL_GAP;
     let mut sep = PathBuilder::stroke(px(1.));
-    sep.move_to(point(origin.x + px(PAD_L), origin.y + px(vol_top - VOL_GAP * 0.5)));
+    sep.move_to(point(
+        origin.x + px(PAD_L),
+        origin.y + px(vol_top - VOL_GAP * 0.5),
+    ));
     sep.line_to(point(
         origin.x + px(PAD_L + plot_w),
         origin.y + px(vol_top - VOL_GAP * 0.5),
@@ -750,34 +800,34 @@ fn paint_minute_chart(bounds: Bounds<Pixels>, data: &MinutePaintData, window: &m
     }
 
     // Crosshair
-    if let Some(ix) = data.hover_ix {
-        if ix < n {
-            let cx = x_of(ix);
-            let cy = y_of(data.prices[ix]);
-            let full_bottom = PAD_T + price_h + VOL_GAP + vol_h;
+    if let Some(ix) = data.hover_ix
+        && ix < n
+    {
+        let cx = x_of(ix);
+        let cy = y_of(data.prices[ix]);
+        let full_bottom = PAD_T + price_h + VOL_GAP + vol_h;
 
-            let mut vline = PathBuilder::stroke(px(1.));
-            vline.move_to(point(origin.x + px(cx), origin.y + px(PAD_T)));
-            vline.line_to(point(origin.x + px(cx), origin.y + px(full_bottom)));
-            if let Ok(p) = vline.build() {
-                window.paint_path(p, data.crosshair);
-            }
-
-            let mut hline = PathBuilder::stroke(px(1.));
-            hline.move_to(point(origin.x + px(PAD_L), origin.y + px(cy)));
-            hline.line_to(point(origin.x + px(PAD_L + plot_w), origin.y + px(cy)));
-            if let Ok(p) = hline.build() {
-                window.paint_path(p, data.crosshair);
-            }
-
-            window.paint_quad(fill(
-                Bounds {
-                    origin: point(origin.x + px(cx - 2.5), origin.y + px(cy - 2.5)),
-                    size: size(px(5.), px(5.)),
-                },
-                data.crosshair,
-            ));
+        let mut vline = PathBuilder::stroke(px(1.));
+        vline.move_to(point(origin.x + px(cx), origin.y + px(PAD_T)));
+        vline.line_to(point(origin.x + px(cx), origin.y + px(full_bottom)));
+        if let Ok(p) = vline.build() {
+            window.paint_path(p, data.crosshair);
         }
+
+        let mut hline = PathBuilder::stroke(px(1.));
+        hline.move_to(point(origin.x + px(PAD_L), origin.y + px(cy)));
+        hline.line_to(point(origin.x + px(PAD_L + plot_w), origin.y + px(cy)));
+        if let Ok(p) = hline.build() {
+            window.paint_path(p, data.crosshair);
+        }
+
+        window.paint_quad(fill(
+            Bounds {
+                origin: point(origin.x + px(cx - 2.5), origin.y + px(cy - 2.5)),
+                size: size(px(5.), px(5.)),
+            },
+            data.crosshair,
+        ));
     }
 }
 
@@ -877,9 +927,7 @@ pub fn paint_sparkline(
         let t = ((v - y_min) / (y_max - y_min)) as f32;
         pad_y + plot_h * (1.0 - t)
     };
-    let x_of = |i: usize| -> f32 {
-        pad_x + plot_w * (i as f32 / (closes.len() - 1) as f32)
-    };
+    let x_of = |i: usize| -> f32 { pad_x + plot_w * (i as f32 / (closes.len() - 1) as f32) };
 
     // faint baseline
     let mut grid = PathBuilder::stroke(px(1.));

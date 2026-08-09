@@ -1,10 +1,13 @@
-//! 轻量规则回测：在历史日 K 上模拟简单触发，建立对策略的信任感。
-//!
-//! 不是专业回测引擎：无滑点/手续费精细模型，只给可解释统计。
+//! Reproducible local strategy evidence over the visible point-in-time series.
 
 use serde::Serialize;
 
 use crate::data::indicators::MaSeries;
+use crate::domain::backtest::{
+    BacktestConfig, CostModel, EvidenceGrade, EvidenceReport, ValidationMethod, run_next_open,
+};
+use crate::domain::market::CandleRecord;
+use crate::domain::money::Currency;
 use crate::model::Candle;
 
 /// 可回测的本地规则。
@@ -39,22 +42,14 @@ impl BacktestRule {
 pub struct BacktestReport {
     pub rule: String,
     pub hold_days: usize,
-    pub trades: usize,
-    /// 平均持有期收益 %。
-    pub avg_return_pct: f64,
-    /// 胜率 0–100。
-    pub win_rate_pct: f64,
-    /// 单笔最差 %。
-    pub worst_pct: f64,
-    /// 单笔最好 %。
-    pub best_pct: f64,
     pub sample_bars: usize,
+    pub evidence: EvidenceReport,
     pub notes: Vec<String>,
 }
 
 impl BacktestReport {
     pub fn summary_line(&self, work: bool) -> String {
-        if self.trades == 0 {
+        if self.evidence.trades.is_empty() {
             return if work {
                 format!("{} · no trades in sample", self.rule)
             } else {
@@ -63,20 +58,65 @@ impl BacktestReport {
         }
         if work {
             format!(
-                "{} · n={} · avg {:+.1}% · win {:.0}% · worst {:+.1}%",
-                self.rule, self.trades, self.avg_return_pct, self.win_rate_pct, self.worst_pct
+                "{} · n={} (OOS {}) · net avg {:+.1}% · excess {:+.1}% · MDD {:+.1}%",
+                self.rule,
+                self.evidence.trades.len(),
+                self.evidence.out_of_sample_trades,
+                self.evidence.average_net_return_pct,
+                self.evidence.excess_return_pct,
+                self.evidence.max_drawdown_pct
             )
         } else {
             format!(
-                "{} · {} 次 · 均 {:+.1}% · 胜 {:.0}% · 最差 {:+.1}%",
-                self.rule, self.trades, self.avg_return_pct, self.win_rate_pct, self.worst_pct
+                "{} · {} 笔（样本外 {}）· 扣费均值 {:+.1}% · 超额 {:+.1}% · 最大回撤 {:+.1}%",
+                self.rule,
+                self.evidence.trades.len(),
+                self.evidence.out_of_sample_trades,
+                self.evidence.average_net_return_pct,
+                self.evidence.excess_return_pct,
+                self.evidence.max_drawdown_pct
             )
         }
     }
+
+    pub fn evidence_line(&self, work: bool) -> String {
+        let grade = match (self.evidence.evidence_grade, work) {
+            (EvidenceGrade::None, true) => "No evidence",
+            (EvidenceGrade::None, false) => "无证据",
+            (EvidenceGrade::InsufficientSample, true) => "Insufficient sample",
+            (EvidenceGrade::InsufficientSample, false) => "样本不足",
+            (EvidenceGrade::InSampleExploration, true) => "In-sample exploration",
+            (EvidenceGrade::InSampleExploration, false) => "样本内探索",
+            (EvidenceGrade::OutOfSampleObservation, true) => "OOS observation",
+            (EvidenceGrade::OutOfSampleObservation, false) => "样本外观察",
+            (EvidenceGrade::MultiPeriodStable, true) => "Multi-period stable",
+            (EvidenceGrade::MultiPeriodStable, false) => "多阶段稳定",
+        };
+        let interval = self
+            .evidence
+            .confidence_interval_95_pct
+            .map(|(low, high)| format!("95% CI [{low:+.1}%, {high:+.1}%]"))
+            .unwrap_or_else(|| "95% CI —".into());
+        format!(
+            "{grade} · {interval} · 基准 {} {:+.1}% · 成本 {} · 策略 {} · 数据 {}",
+            self.evidence.benchmark_name,
+            self.evidence.benchmark_return_pct,
+            self.evidence.cost_model.version,
+            self.evidence.strategy_version,
+            self.evidence.dataset_version
+        )
+    }
 }
 
-/// 在 `candles` 上跑规则；`hold_days` 默认 10。
-pub fn run(candles: &[Candle], rule: BacktestRule, hold_days: usize) -> Option<BacktestReport> {
+/// Run a versioned rule with next-session-open execution, explicit costs and
+/// a 70/30 chronological holdout. The current symbol's buy-and-hold return is
+/// the local benchmark when no index series is available.
+pub fn run(
+    candles: &[Candle],
+    rule: BacktestRule,
+    hold_days: usize,
+    currency: Currency,
+) -> Option<BacktestReport> {
     let hold_days = hold_days.clamp(3, 40);
     if candles.len() < 60 {
         return None;
@@ -88,63 +128,66 @@ pub fn run(candles: &[Candle], rule: BacktestRule, hold_days: usize) -> Option<B
         BacktestRule::Breakout20 => signals_breakout20(candles),
     };
 
-    let mut rets = Vec::new();
-    let mut i = 0usize;
-    while i < signals.len() {
-        if !signals[i] {
-            i += 1;
-            continue;
-        }
-        let exit = (i + hold_days).min(candles.len() - 1);
-        if exit <= i {
-            break;
-        }
-        let entry = candles[i].close;
-        let exit_px = candles[exit].close;
-        if entry > 0.0 && exit_px.is_finite() {
-            rets.push((exit_px / entry - 1.0) * 100.0);
-        }
-        // 不重叠持仓
-        i = exit + 1;
-    }
-
-    let trades = rets.len();
-    let (avg, win, worst, best) = if trades == 0 {
-        (0.0, 0.0, 0.0, 0.0)
-    } else {
-        let sum: f64 = rets.iter().sum();
-        let avg = sum / trades as f64;
-        let wins = rets.iter().filter(|r| **r > 0.0).count();
-        let win = wins as f64 / trades as f64 * 100.0;
-        let worst = rets
-            .iter()
-            .cloned()
-            .fold(f64::INFINITY, f64::min);
-        let best = rets
-            .iter()
-            .cloned()
-            .fold(f64::NEG_INFINITY, f64::max);
-        (avg, win, worst, best)
+    let records = candles
+        .iter()
+        .map(|candle| CandleRecord {
+            time: candle.date.to_string(),
+            open: candle.open,
+            high: candle.high,
+            low: candle.low,
+            close: candle.close,
+            volume: candle.volume,
+        })
+        .collect::<Vec<_>>();
+    let costs = match currency {
+        Currency::Cny => CostModel::default(),
+        Currency::Hkd => CostModel {
+            commission_bps_each_side: 3.0,
+            sell_tax_bps: 0.0,
+            slippage_bps_each_side: 8.0,
+            other_fees_bps_each_side: 10.0,
+            version: "hk-equity-costs-v1".into(),
+        },
     };
-
-    let mut notes = vec![
-        format!("持有 {hold_days} 个交易日平仓"),
-        "未计滑点与印花税；样本外可能失效".into(),
+    let dataset_version = format!(
+        "visible-series-v1:{}:{}:{}",
+        records
+            .first()
+            .map(|candle| candle.time.as_str())
+            .unwrap_or("empty"),
+        records
+            .last()
+            .map(|candle| candle.time.as_str())
+            .unwrap_or("empty"),
+        records.len()
+    );
+    let config = BacktestConfig {
+        hold_days,
+        costs,
+        strategy_version: format!("{}-v1", rule.label(true).replace(' ', "-")),
+        dataset_version,
+        benchmark_name: "当前标的同期买入持有".into(),
+        minimum_trades: 20,
+        validation: ValidationMethod::Holdout {
+            train_fraction_pct: 70,
+        },
+    };
+    let evidence = run_next_open(&records, &records, &config, |history, index| {
+        debug_assert_eq!(history.len(), index + 1);
+        signals.get(index).copied().unwrap_or(false)
+    });
+    let notes = vec![
+        evidence.execution_rule.clone(),
+        "报告包含双边成本、滑点、基准、时间切分、区间和版本；幸存者偏差需由数据集清单另行审计"
+            .into(),
         "仅供学习研究，不构成投资建议".into(),
     ];
-    if trades < 5 {
-        notes.insert(0, "触发次数偏少，统计不稳定".into());
-    }
 
     Some(BacktestReport {
         rule: rule.label(false).into(),
         hold_days,
-        trades,
-        avg_return_pct: avg,
-        win_rate_pct: win,
-        worst_pct: if trades == 0 { 0.0 } else { worst },
-        best_pct: if trades == 0 { 0.0 } else { best },
         sample_bars: candles.len(),
+        evidence,
         notes,
     })
 }
@@ -249,7 +292,30 @@ mod tests {
                 }
             })
             .collect();
-        let report = run(&candles, BacktestRule::Ma20CrossUp, 10);
+        let report = run(&candles, BacktestRule::Ma20CrossUp, 10, Currency::Cny);
         assert!(report.is_some());
+    }
+
+    #[test]
+    fn all_rules_produce_versioned_evidence_reports() {
+        let candles: Vec<_> = (0..160)
+            .map(|i| {
+                let px = 10.0 + (i as f64 / 4.0).sin() + i as f64 * 0.01;
+                Candle {
+                    date: shared(format!("d{i:03}")),
+                    open: px * 0.999,
+                    high: px * 1.02,
+                    low: px * 0.98,
+                    close: px,
+                    volume: 10_000,
+                }
+            })
+            .collect();
+        for rule in BacktestRule::all() {
+            let report = run(&candles, rule, 10, Currency::Cny).unwrap();
+            assert!(!report.evidence.execution_rule.is_empty());
+            assert!(!report.evidence.cost_model.version.is_empty());
+            assert_eq!(report.sample_bars, candles.len());
+        }
     }
 }

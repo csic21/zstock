@@ -1,65 +1,16 @@
 //! Portfolio trades, cash, and position AI advice.
 
-#![allow(unused_imports)]
+use gpui::{Context, Timer, Window};
 
-use std::collections::HashMap;
-use std::time::Duration;
+use crate::data::ai::{self};
+use crate::data::portfolio::{PortfolioSummary, TradeDraft, TradeSide, format_shares};
+use crate::domain::money::Currency;
+use crate::domain::portfolio::{PortfolioRiskView, RiskItem};
+use crate::model::{Symbol, board_for_code, format_price, normalize_code, shared};
+use crate::storage::{self, AppConfig};
 
-use gpui::{
-    canvas, div, point, px, size, App, AppContext, Bounds, Context, Entity, FocusHandle,
-    InteractiveElement, IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, Timer, Window, WindowBounds, WindowOptions,
-    prelude::FluentBuilder,
-};
-use gpui_component::{
-    button::{Button, ButtonVariants},
-    h_flex,
-    IconName,
-    input::{Input, InputEvent, InputState},
-    resizable::{h_resizable, resizable_panel, v_resizable, ResizableState},
-    v_flex, ActiveTheme, Disableable, PixelsExt, Root, Sizable, StyledExt, Theme, ThemeMode,
-    TitleBar, TITLE_BAR_HEIGHT,
-};
-use gpui_component::tooltip::Tooltip;
-
-use crate::chart::{
-    chart_layout, index_from_x, paint_chart, paint_sparkline, price_from_y, BollPaintData,
-    ChartPaintData, ChartStyle, MacdPaintData, MinutePaintData,
-};
-use crate::data::ai::{self, AiCliProvider, AiConfig, AiKind, AiTransport};
-use crate::data::levels;
-use crate::data::portfolio::{
-    self, format_money, format_shares, Portfolio, PortfolioSummary, TradeSide,
-};
-use crate::data::scout::{self, ScoutPick, ScoutVerdict, SCOUT_CANDIDATE_N};
-use crate::data::treasure::{self, fmt_dd, fmt_pos, TreasureHit, TREASURE_KLINE_LIMIT};
-use crate::data::universe::{self, FinFilter, TreasurePool, TREASURE_SCAN_CAP, TREASURE_TOP_N};
-use crate::data::{
-    indicators::{BollSeries, MaSeries, MacdSeries},
-    market, session, signals,
-};
-use crate::data::market::Sourced;
-use crate::data::session::{filter_codes_in_session, idle_delay_secs, open_markets_now, MarketSet};
-use crate::model::{
-    board_for_code, disguise_index, disguise_label, format_index, format_pct, format_price,
-    format_volume, normalize_code, shared, Candle, IndexSnap, MinutePeriod, MinuteSeries,
-    QuoteSnapshot, Symbol, TrendLine,
-};
-use crate::storage::{
-    self, clamp_quote_interval_secs, normalize_status_bar, AppConfig, ColorScheme, DockLayout,
-    WatchlistSort, STATUS_BAR_MAX_CODES,
-};
-use crate::update::{self, UpdateState};
-
-use super::{
-    AiCacheEntry, AiPanelState, AiSource, ChartKind, ChartRange, DetailTab, LeftTab, SettingsSection,
-    StockApp, CHART_MIN_VISIBLE, QUOTE_INTERVAL_ERR_MAX, QUOTE_INTERVAL_PRESETS, TITLE_NORMAL,
-    TITLE_WORK, TREASURE_SCAN_GAP,
-};
 use super::helpers::*;
-
-
+use super::{AiCacheEntry, AiPanelState, AiSource, DetailTab, LeftTab, StockApp};
 
 impl StockApp {
     /// Write config.json immediately (structural changes: add/remove symbol, trades).
@@ -67,6 +18,7 @@ impl StockApp {
         let mut dock = self.dock.clone();
         dock.window = self.window_bounds;
         let cfg = AppConfig {
+            schema_version: crate::storage::CONFIG_SCHEMA_VERSION,
             watchlist: self.symbols.iter().map(|s| s.code.clone()).collect(),
             selected: self.selected.to_string(),
             range: self.range.label().into(),
@@ -107,7 +59,9 @@ impl StockApp {
                 .collect(),
             watch_filter: self.watch_filter.id().into(),
         };
-        let _ = storage::save_config(&cfg);
+        if let Err(error) = storage::save_config(&cfg) {
+            storage::record_storage_error(format!("保存配置失败：{error:#}"));
+        }
     }
 
     /// Debounced config write — collapses rapid UI thrash (resize, typing, tab flips).
@@ -126,22 +80,87 @@ impl StockApp {
     }
 
     pub(crate) fn persist_portfolio(&self) {
-        let _ = storage::save_portfolio(&self.portfolio);
+        if let Err(error) = storage::save_portfolio(&self.portfolio) {
+            storage::record_storage_error(format!("保存持仓失败：{error:#}"));
+        }
     }
 
     /// 组合汇总：现价优先取自选行情，否则用成本占位。
     pub(crate) fn portfolio_summary(&self) -> PortfolioSummary {
         self.portfolio.summarize_with(|code| {
             if let Some(sym) = self.symbols.iter().find(|s| s.code == code) {
-                (
-                    sym.last,
-                    sym.change_pct,
-                    sym.name.to_string(),
-                )
+                (sym.last, sym.change_pct, sym.name.to_string())
             } else {
                 (0.0, 0.0, String::new())
             }
         })
+    }
+
+    /// A risk projection built from current holdings and deterministic alert
+    /// invalidation prices. Weights are calculated inside each currency group;
+    /// there is deliberately no cross-currency total without an FX contract.
+    pub(crate) fn portfolio_risk_view(&self, summary: &PortfolioSummary) -> PortfolioRiskView {
+        let items = summary
+            .positions
+            .iter()
+            .map(|mark| {
+                let currency = mark.position.currency;
+                let group_value = summary
+                    .by_currency
+                    .get(&currency)
+                    .map(|totals| totals.total_market_value)
+                    .unwrap_or_default();
+                let position_weight_pct = if group_value > 0.0 {
+                    mark.market_value / group_value * 100.0
+                } else {
+                    0.0
+                };
+                let contract = match &self.services.market.quotes.state {
+                    crate::controller::state::RequestState::Ready(records) => records
+                        .iter()
+                        .find(|record| record.code == mark.position.code),
+                    _ => None,
+                };
+                let raw_quote = contract
+                    .filter(|record| record.usable())
+                    .and_then(|record| record.price)
+                    .or_else(|| {
+                        self.symbols
+                            .iter()
+                            .find(|symbol| symbol.code == mark.position.code)
+                            .map(|symbol| symbol.last)
+                            .filter(|price| price.is_finite() && *price > 0.0)
+                    });
+                let quote_stale = contract.is_none_or(|record| {
+                    !record.usable() || record.freshness == crate::domain::market::Freshness::Stale
+                });
+                let stop = self
+                    .buy_alerts
+                    .get(&mark.position.code)
+                    .and_then(|alert| alert.stop_price)
+                    .filter(|price| price.is_finite() && *price > 0.0);
+                let risk_amount = raw_quote.zip(stop).and_then(|(last, stop)| {
+                    crate::domain::money::Money::from_major(
+                        currency,
+                        (last - stop).max(0.0) * mark.position.shares,
+                    )
+                });
+                RiskItem {
+                    code: mark.position.code.clone(),
+                    currency,
+                    position_weight_pct,
+                    risk_amount,
+                    // No point-in-time sector contract is available yet. Keeping
+                    // this unknown is safer than deriving a false concentration.
+                    industry: None,
+                    quote_stale,
+                    invalidation_breached: raw_quote
+                        .zip(stop)
+                        .is_some_and(|(last, stop)| last <= stop),
+                }
+            })
+            .collect();
+        PortfolioRiskView::from_items(items)
     }
 
     /// 确保代码在自选中（持仓需要行情）。
@@ -213,7 +232,12 @@ impl StockApp {
     }
 
     /// 打开买入/卖出表单，默认填充现价与（卖出时）全部可卖股数。
-    pub(crate) fn open_trade_form(&mut self, side: TradeSide, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_trade_form(
+        &mut self,
+        side: TradeSide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let code = self.selected.to_string();
         let last = self
             .symbols
@@ -293,16 +317,16 @@ impl StockApp {
             return;
         };
 
-        match self.portfolio.record_trade(
-            &code,
-            &name,
+        match self.portfolio.record_trade(TradeDraft {
+            code: &code,
+            name: &name,
             side,
             shares,
             price,
             fee,
-            &note,
-            None,
-        ) {
+            note: &note,
+            time: None,
+        }) {
             Ok(_) => {
                 self.ensure_in_watchlist(&code, &name, price);
                 self.persist_portfolio();
@@ -350,9 +374,7 @@ impl StockApp {
             .find(|s| s.code == code)
             .map(|s| s.last)
             .filter(|p| *p > 0.0)
-            .or_else(|| {
-                self.candles.last().map(|c| c.close).filter(|p| *p > 0.0)
-            })
+            .or_else(|| self.candles.last().map(|c| c.close).filter(|p| *p > 0.0))
             .unwrap_or(0.0);
         if price <= 0.0 {
             self.status = shared(if self.work_mode {
@@ -441,12 +463,17 @@ impl StockApp {
             cx.notify();
             return;
         }
-        self.portfolio.cash = v;
+        let currency = Currency::for_code(self.selected.as_ref()).unwrap_or(Currency::Cny);
+        if self.portfolio.set_cash(currency, v).is_err() {
+            self.status = shared("现金金额超出范围");
+            cx.notify();
+            return;
+        }
         self.persist_portfolio();
         self.status = shared(if self.work_mode {
-            format!("Cash = {v:.2}")
+            format!("Cash = {v:.2} {}", currency.symbol())
         } else {
-            format!("现金已设为 {v:.2} 元")
+            format!("现金已设为 {v:.2} {}", currency.symbol())
         });
         cx.notify();
     }
@@ -493,14 +520,12 @@ impl StockApp {
             .map(|s| s.last)
             .filter(|p| *p > 0.0)
             .unwrap_or_else(|| self.candles.last().map(|c| c.close).unwrap_or(0.0));
-        let date = self.candles.last().map(|c| c.date.to_string()).unwrap_or_default();
-        let cache_key = format!(
-            "pos:{}@{}:{:.4}:{:.4}",
-            code,
-            date,
-            shares,
-            avg_cost
-        );
+        let date = self
+            .candles
+            .last()
+            .map(|c| c.date.to_string())
+            .unwrap_or_default();
+        let cache_key = format!("pos:{}@{}:{:.4}:{:.4}", code, date, shares, avg_cost);
 
         if let Some(hit) = self.portfolio_ai_cache.get(&cache_key).cloned() {
             self.portfolio_ai_panel = AiPanelState::Ready {
@@ -606,5 +631,4 @@ impl StockApp {
         .detach();
         cx.notify();
     }
-
 }

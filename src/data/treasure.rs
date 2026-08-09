@@ -86,18 +86,6 @@ impl TreasureTag {
             Self::ThinLiquidity => "流动性弱",
         }
     }
-
-    pub fn hint(self) -> &'static str {
-        match self {
-            Self::MultiYearLow => "全样本价格位置靠近区间底部",
-            Self::DualLow => "近一年与近三年都处在相对低位",
-            Self::UptrendPullback => "一年内偏低，但多年位置仍高，更像上涨中的回撤",
-            Self::DeepDrawdown => "相对多年高点回撤幅度较大",
-            Self::SampleShort => "可用历史较短，分数已降权",
-            Self::StRisk => "名称含 ST，需单独风控",
-            Self::ThinLiquidity => "近20日均量偏低",
-        }
-    }
 }
 
 /// 从日 K 计算多窗口指标与分数。`name` 用于 ST 检测。
@@ -154,10 +142,10 @@ pub fn analyze(code: &str, name: &str, candles: &[Candle], source: &str) -> Opti
     }
 
     // 上行中继：短窗低、长窗仍高
-    let uptrend_pullback = match (pos_1y, pos_3y.or(pos_all)) {
-        (Some(p1), Some(pl)) if p1 <= 0.18 && pl >= 0.45 => true,
-        _ => false,
-    };
+    let uptrend_pullback = matches!(
+        (pos_1y, pos_3y.or(pos_all)),
+        (Some(p1), Some(pl)) if p1 <= 0.18 && pl >= 0.45
+    );
     if uptrend_pullback {
         tags.push(TreasureTag::UptrendPullback);
     }
@@ -179,7 +167,12 @@ pub fn analyze(code: &str, name: &str, candles: &[Candle], source: &str) -> Opti
     }
 
     let score = composite_score(
-        pos_1y, pos_3y, pos_all, pctile_1y, pctile_3y, pctile_all, dd_all, &tags,
+        ScoreInputs {
+            positions: [pos_1y, pos_3y, pos_all],
+            percentiles: [pctile_1y, pctile_3y, pctile_all],
+            drawdown_all: dd_all,
+        },
+        &tags,
     );
 
     Some(TreasureHit {
@@ -207,16 +200,15 @@ pub fn analyze(code: &str, name: &str, candles: &[Candle], source: &str) -> Opti
 /// 合成分数 0–100。
 ///
 /// **长窗口权重大于短窗口**，避免「两年大涨后一年回调」被刷成高分。
-fn composite_score(
-    pos_1y: Option<f64>,
-    pos_3y: Option<f64>,
-    pos_all: Option<f64>,
-    pctile_1y: Option<f64>,
-    pctile_3y: Option<f64>,
-    pctile_all: Option<f64>,
-    dd_all: Option<f64>,
-    tags: &[TreasureTag],
-) -> f64 {
+struct ScoreInputs {
+    positions: [Option<f64>; 3],
+    percentiles: [Option<f64>; 3],
+    drawdown_all: Option<f64>,
+}
+
+fn composite_score(inputs: ScoreInputs, tags: &[TreasureTag]) -> f64 {
+    let [pos_1y, pos_3y, pos_all] = inputs.positions;
+    let [pctile_1y, pctile_3y, pctile_all] = inputs.percentiles;
     // (weight, low_is_good value in 0..1)
     let mut parts: Vec<(f64, f64)> = Vec::new();
 
@@ -248,7 +240,7 @@ fn composite_score(
     let mut score: f64 = parts.iter().map(|(w, v)| w * v).sum::<f64>() / w_sum * 100.0;
 
     // 深回撤轻微加分（已在位置里体现，只做小 bonus）
-    if let Some(dd) = dd_all {
+    if let Some(dd) = inputs.drawdown_all {
         if dd <= -0.60 {
             score += 4.0;
         } else if dd <= -0.40 {
@@ -480,5 +472,20 @@ mod tests {
         let st = analyze("600002", "*ST测试", &series, "t").unwrap();
         assert!(st.tags.contains(&TreasureTag::StRisk));
         assert!(st.score < normal.score);
+    }
+
+    #[test]
+    fn scoring_one_thousand_symbols_stays_inside_local_budget() {
+        let series = multi_year_low_series();
+        let started = std::time::Instant::now();
+        let scored = (0..1_000)
+            .filter_map(|index| analyze(&format!("{index:06}"), "测试", &series, "fixture"))
+            .count();
+        let elapsed = started.elapsed();
+        assert_eq!(scored, 1_000);
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "1,000-symbol scoring took {elapsed:?}"
+        );
     }
 }
