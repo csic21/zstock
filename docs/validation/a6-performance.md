@@ -21,18 +21,24 @@ these values around `window.draw(cx); window.present();`, so they cover CPU draw
 submission. They do not claim to measure when the GPU has physically completed execution. The
 UI-build metric remains separate and is not used as a substitute for chart-frame duration.
 
-## Preliminary release run
+## Accepted release evidence
 
-One macOS arm64 release launch on 2026-08-09 produced:
+Two isolated macOS arm64 release runs on 2026-08-09 completed the local A6 budget. The frame run
+used commit `b74c968e2cc6189f53f01e29149d78c3751d1dc0`; the long RSS/navigation run used commit
+`7019e755b5b379fb7347344d1af2e6fb685fe41b`. Only the performance report service, its persistence
+test and this document changed between those commits; `src/app` and the render path did not.
 
-| Metric | Result | Budget | Evidence status |
+Environment: macOS 26.5.2 (25F84), arm64, Rust 1.93.1. The machine-readable result is preserved in
+`docs/validation/a6-performance-evidence.json`.
+
+| Metric | Result | Budget | Status |
 |---|---:|---:|---|
-| First interactive render | 327.76 ms | ≤ 1,500 ms | preliminary pass; one sample |
-| UI build | 0.74 ms | p95 ≤ 16.7 ms, p99 ≤ 33 ms | preliminary pass; two samples |
-| RSS | 101,548,032 bytes | ≤ 250 MiB | preliminary pass; one sample |
-| Cached navigation | — | p95 ≤ 100 ms | awaiting user navigation samples |
-| Chart interaction frame | — | p95 ≤ 16.7 ms, p99 ≤ 33 ms | awaiting rendered-frame samples |
-| One-hour RSS growth | — | ≤ 10% | awaiting a continuous one-hour run |
+| First interactive render | 135.71 ms | ≤ 1,500 ms | pass |
+| Cached navigation | p95 39.39 ms, 25 samples | p95 ≤ 100 ms, ≥ 20 samples | pass |
+| UI build | p95 1.01 ms, p99 1.22 ms, 608 samples | p95 ≤ 16.7 ms, p99 ≤ 33 ms | pass |
+| GPUI chart-interaction frames | p95 8.1445 ms, p99 8.7571 ms, 128 samples | p95 ≤ 16.7 ms, p99 ≤ 33 ms, ≥ 100 samples | pass |
+| Final RSS | 90,144,768 bytes (85.97 MiB) | ≤ 250 MiB | pass |
+| One-hour settled RSS growth | -15.69%, baseline 60 s, window 3,600 s, 62 samples | ≤ 10%, full window | pass |
 
 ## Beta acceptance procedure
 

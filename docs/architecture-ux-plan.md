@@ -625,7 +625,7 @@ UX：
 | A3 | 代码完成 | `Currency`/`Money`、交易与持仓币种、分币种现金和汇总、旧数据迁移、未知币种待确认、风险中心不跨币种伪合计 | 混合币种 Beta 数据复核 |
 | A4 | v2 路径完成 | `StockApp` 顶层收敛为 9 个聚合对象加一个兼容状态；Market/Chart/Discovery 请求槽接入真实异步路径；Watchlist/Preferences controllers 与领域边界就位 | `legacy AppState` 按 A6 要求保留到一个稳定版本周期后删除；继续把剩余兼容方法迁出 `impl StockApp` |
 | A5 | 代码完成 | Work Mode feature/presenter/state/config/view 隔离；无默认 feature 零告警构建；detail/left/chrome 拆为子 View；移除 11 个宽泛 unused allow | 无默认 feature 的三平台 CI/启动检查 |
-| A6 | 测量能力完成 | 100 条行情 apply < 50ms、1,000 条本地评分 < 200ms 的固定预算测试；冷启动首帧、缓存任务切换、UI build p95/p99、每分钟 RSS 与满一小时增长的匿名本地报告；架构 flags 默认开启。release 单次实测：首帧 327.76ms、UI build 0.74ms、RSS 101,548,032 bytes | 20 次导航样本、GPU 帧耗时、1 小时 RSS、5 个交易日 Beta、稳定版后删除旧实现 |
+| A6 | 本地性能预算完成 | 100 条行情 apply < 50ms、1,000 条本地评分 < 200ms 的固定预算测试；冷启动首帧、缓存任务切换、UI build p95/p99、GPUI draw/present 图表帧、每分钟 RSS 与稳定态满一小时增长的匿名本地报告；架构 flags 默认开启。release 实测：首帧 135.71ms；25 次导航 p95 39.39ms；128 帧 p95/p99 8.1445/8.7571ms；最终 RSS 90,144,768 bytes，3,600 秒增长 -15.69% | 5 个交易日 Beta、稳定版后删除旧实现 |
 
 依赖方向已经建立为 `ui → controller → domain/services ← infrastructure`；`domain` 不依赖 GPUI、HTTP 或文件系统。UI 子模块没有直接进行 HTTP、文件系统写入或调用具体行情 Provider。
 
@@ -652,11 +652,11 @@ cargo clippy --all-targets -- -D warnings          PASS (0 warnings)
 cargo check --all-targets --no-default-features    PASS (0 warnings)
 cargo clippy --all-targets --no-default-features -- -D warnings
                                                     PASS (0 warnings)
-cargo test --all-targets                           PASS (141 passed, 17 ignored)
+cargo test --all-targets                           PASS (143 passed, 17 ignored)
 cargo build --release                              PASS
 ```
 
-17 个 ignored 测试是联网或原生凭据库 smoke tests，由 nightly workflow 串行执行；A 股/港股完整基本面 Provider 真实接口与 macOS Keychain 写入/读取/删除 smoke test 均已单独通过。U5 数据语义和实测证据见 `docs/validation/u5-fundamentals.md`。质量矩阵使用 Linux x64、Windows x64、macOS 15 arm64 和 macOS 15 Intel x64 原生 runner；两种 macOS 架构均执行离线测试。
+17 个 ignored 测试是联网或原生凭据库 smoke tests，由 nightly workflow 串行执行；A 股/港股完整基本面 Provider 真实接口与 macOS Keychain 写入/读取/删除 smoke test 均已单独通过。U5 数据语义和实测证据见 `docs/validation/u5-fundamentals.md`；A6 本地性能实测见 `docs/validation/a6-performance.md` 和 `docs/validation/a6-performance-evidence.json`。质量矩阵使用 Linux x64、Windows x64、macOS 15 arm64 和 macOS 15 Intel x64 原生 runner；两种 macOS 架构均执行离线测试。
 
 ### 14.4 发布验收清单
 
@@ -667,7 +667,7 @@ cargo build --release                              PASS
 - [ ] Linux Secret Service、Windows DPAPI 的保存、读取、删除实机通过（三平台独立 credential-smoke workflow 已就绪，待远端运行）。
 - [ ] Internal/Beta 连续运行至少 5 个交易日，无 P0/P1。
 - [x] A6 冷启动、任务切换、UI build 与 RSS 本地匿名测量链路及预算判定完成。
-- [ ] 累积 20 次缓存导航、GPU 图表帧 p95/p99 及连续 1 小时 RSS 证据并达到预算。
+- [x] 累积 20 次缓存导航、GPUI draw/present 图表帧 p95/p99 及连续 1 小时 RSS 证据并达到预算。
 - [ ] 至少 5 名目标用户完成首次导航、保存候选、决策判断、组合风险识别和建计划测试。
 - [x] A 股 point-in-time 财务 Provider 接入，并满足 U5 的来源、单位、报告期和公告日覆盖。
 - [x] 港股公告日、A/H 分红连续性及 PE/PB 三年历史分位接入可追溯数据源；缺失值保持未知。
