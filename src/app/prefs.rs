@@ -11,14 +11,17 @@ use gpui_component::{
 };
 
 use crate::data::ai::{self, AiCliProvider, AiKind, AiTransport};
-use crate::model::{Symbol, disguise_label, format_pct, format_price, sanitize_work_alias, shared};
+#[cfg(target_os = "macos")]
+use crate::model::{Symbol, format_pct, format_price};
+use crate::model::{disguise_label, sanitize_work_alias, shared};
 use crate::storage::{
     ColorScheme, STATUS_BAR_MAX_CODES, WatchlistSort, WorkDensity, clamp_quote_interval_secs,
     normalize_status_bar,
 };
 use crate::update::{self, UpdateState};
 
-use super::helpers::*;
+#[cfg(target_os = "macos")]
+use super::helpers::short_status_name;
 use super::{
     AiCacheEntry, AiPanelState, AiSource, SettingsSection, StockApp, WORK_IDENTITY_AUTO_HIDE,
 };
