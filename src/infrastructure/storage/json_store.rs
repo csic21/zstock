@@ -1,4 +1,6 @@
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -105,7 +107,14 @@ pub fn backup_before_migration(path: &Path, from_version: u32) -> Result<Option<
         .as_millis();
     let backup = parent.join(format!("{file_name}.bak.v{from_version}.{stamp}"));
     fs::copy(path, &backup).with_context(|| format!("backup {}", path.display()))?;
-    let file = File::open(&backup).with_context(|| format!("open {}", backup.display()))?;
+    #[cfg(windows)]
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&backup)
+        .with_context(|| format!("open {}", backup.display()))?;
+    #[cfg(not(windows))]
+    let file = fs::File::open(&backup).with_context(|| format!("open {}", backup.display()))?;
     file.sync_all()
         .with_context(|| format!("sync {}", backup.display()))?;
     retain_latest_backups(path, 3)?;
