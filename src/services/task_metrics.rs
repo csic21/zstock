@@ -7,6 +7,7 @@ pub enum TaskName {
     Research,
     Opportunities,
     Portfolio,
+    StrategyLab,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

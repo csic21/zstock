@@ -2,12 +2,17 @@
 
 use serde::Serialize;
 
-use crate::data::indicators::MaSeries;
 use crate::domain::backtest::{
-    BacktestConfig, CostModel, EvidenceGrade, EvidenceReport, ValidationMethod, run_next_open,
+    BacktestConfig, CostModel, DatasetHashMetadata, EvidenceGrade, EvidenceReport,
+    ValidationMethod, dataset_content_id, run_next_open,
 };
-use crate::domain::market::CandleRecord;
+use crate::domain::market::{Adjustment, CandleRecord, Market};
 use crate::domain::money::Currency;
+use crate::domain::strategy::expression::{
+    CompareOperator, Comparison, Crossing, Expression, IndicatorRef, ValueExpression,
+};
+use crate::domain::strategy::spec::{ExitRule, StrategySpec};
+use crate::domain::strategy::{CompiledStrategy, LocalTemplate};
 use crate::model::Candle;
 
 /// 可回测的本地规则。
@@ -111,8 +116,9 @@ impl BacktestReport {
 /// Run a versioned rule with next-session-open execution, explicit costs and
 /// a 70/30 chronological holdout. The current symbol's buy-and-hold return is
 /// the local benchmark when no index series is available.
-pub fn run(
+pub fn run_for_instrument(
     candles: &[Candle],
+    instrument_code: &str,
     rule: BacktestRule,
     hold_days: usize,
     currency: Currency,
@@ -121,12 +127,6 @@ pub fn run(
     if candles.len() < 60 {
         return None;
     }
-
-    let signals = match rule {
-        BacktestRule::Ma20CrossUp => signals_ma20_cross(candles),
-        BacktestRule::RsiOversoldExit => signals_rsi_exit(candles),
-        BacktestRule::Breakout20 => signals_breakout20(candles),
-    };
 
     let records = candles
         .iter()
@@ -143,28 +143,33 @@ pub fn run(
         Currency::Cny => CostModel::default(),
         Currency::Hkd => CostModel {
             commission_bps_each_side: 3.0,
+            minimum_commission: 0.0,
             sell_tax_bps: 0.0,
             slippage_bps_each_side: 8.0,
             other_fees_bps_each_side: 10.0,
             version: "hk-equity-costs-v1".into(),
         },
     };
-    let dataset_version = format!(
-        "visible-series-v1:{}:{}:{}",
-        records
-            .first()
-            .map(|candle| candle.time.as_str())
-            .unwrap_or("empty"),
-        records
-            .last()
-            .map(|candle| candle.time.as_str())
-            .unwrap_or("empty"),
-        records.len()
+    let dataset_version = dataset_content_id(
+        &records,
+        &DatasetHashMetadata {
+            market: match currency {
+                Currency::Cny => Market::AShare,
+                Currency::Hkd => Market::HongKong,
+            },
+            instrument_code: instrument_code.into(),
+            source: "visible-kline-provider".into(),
+            adjustment: Adjustment::Forward,
+        },
     );
+    let spec = legacy_strategy_spec(rule, &dataset_version, hold_days as u16);
+    let compiled = CompiledStrategy::compile(spec)
+        .expect("built-in legacy strategy definitions must always validate");
+    let signals = compiled.entry_signals(&records);
     let config = BacktestConfig {
         hold_days,
         costs,
-        strategy_version: format!("{}-v1", rule.label(true).replace(' ', "-")),
+        strategy_version: compiled.strategy_id().into(),
         dataset_version,
         benchmark_name: "当前标的同期买入持有".into(),
         minimum_trades: 20,
@@ -192,84 +197,39 @@ pub fn run(
     })
 }
 
-fn signals_ma20_cross(candles: &[Candle]) -> Vec<bool> {
-    let ma = MaSeries::from_candles(candles);
-    let mut out = vec![false; candles.len()];
-    for i in 1..candles.len() {
-        let (_, _, m_prev, _) = ma.value_at(i - 1);
-        let (_, _, m_now, _) = ma.value_at(i);
-        let (Some(mp), Some(mn)) = (m_prev, m_now) else {
-            continue;
-        };
-        let prev_below = candles[i - 1].close < mp;
-        let now_above = candles[i].close >= mn;
-        out[i] = prev_below && now_above;
-    }
-    out
-}
-
-fn signals_rsi_exit(candles: &[Candle]) -> Vec<bool> {
-    let rsi = rsi_series(candles, 14);
-    let mut out = vec![false; candles.len()];
-    for i in 1..candles.len() {
-        let (Some(prev), Some(now)) = (rsi[i - 1], rsi[i]) else {
-            continue;
-        };
-        out[i] = prev <= 30.0 && now > 30.0;
-    }
-    out
-}
-
-fn signals_breakout20(candles: &[Candle]) -> Vec<bool> {
-    let mut out = vec![false; candles.len()];
-    for i in 20..candles.len() {
-        let window = &candles[i - 20..i];
-        let prior_high = window
-            .iter()
-            .map(|c| c.high)
-            .fold(f64::NEG_INFINITY, f64::max);
-        if prior_high.is_finite() && candles[i].close > prior_high {
-            out[i] = true;
-        }
-    }
-    out
-}
-
-fn rsi_series(candles: &[Candle], period: usize) -> Vec<Option<f64>> {
-    let n = candles.len();
-    let mut out = vec![None; n];
-    if n < period + 1 {
-        return out;
-    }
-    let mut gains = 0.0;
-    let mut losses = 0.0;
-    for i in 1..=period {
-        let d = candles[i].close - candles[i - 1].close;
-        if d >= 0.0 {
-            gains += d;
-        } else {
-            losses -= d;
-        }
-    }
-    let mut avg_gain = gains / period as f64;
-    let mut avg_loss = losses / period as f64;
-    out[period] = Some(rsi_from_avg(avg_gain, avg_loss));
-    for i in (period + 1)..n {
-        let d = candles[i].close - candles[i - 1].close;
-        let (g, l) = if d >= 0.0 { (d, 0.0) } else { (0.0, -d) };
-        avg_gain = (avg_gain * (period as f64 - 1.0) + g) / period as f64;
-        avg_loss = (avg_loss * (period as f64 - 1.0) + l) / period as f64;
-        out[i] = Some(rsi_from_avg(avg_gain, avg_loss));
-    }
-    out
-}
-
-fn rsi_from_avg(avg_gain: f64, avg_loss: f64) -> f64 {
-    if avg_loss < 1e-12 {
-        return 100.0;
-    }
-    let rs = avg_gain / avg_loss;
-    100.0 - 100.0 / (1.0 + rs)
+fn legacy_strategy_spec(rule: BacktestRule, universe_id: &str, hold_days: u16) -> StrategySpec {
+    let mut spec = match rule {
+        BacktestRule::Ma20CrossUp => LocalTemplate::MaTrendPullback.build(universe_id),
+        BacktestRule::RsiOversoldExit => LocalTemplate::RsiOversoldRecovery.build(universe_id),
+        BacktestRule::Breakout20 => LocalTemplate::NDayHighBreakout.build(universe_id),
+    };
+    spec.name = rule.label(false).into();
+    spec.hypothesis = format!("兼容既有 {} 轻量回测规则", rule.label(false));
+    spec.entry = match rule {
+        BacktestRule::Ma20CrossUp => Expression::CrossesAbove {
+            crosses_above: Crossing {
+                left: ValueExpression::Indicator(IndicatorRef::Close { lag: 0 }),
+                right: ValueExpression::Indicator(IndicatorRef::Sma { period: 20, lag: 0 }),
+            },
+        },
+        BacktestRule::RsiOversoldExit => Expression::CrossesAbove {
+            crosses_above: Crossing {
+                left: ValueExpression::Indicator(IndicatorRef::Rsi { period: 14, lag: 0 }),
+                right: ValueExpression::Constant { constant: 30.0 },
+            },
+        },
+        BacktestRule::Breakout20 => Expression::Compare {
+            compare: Comparison {
+                left: ValueExpression::Indicator(IndicatorRef::Close { lag: 0 }),
+                op: CompareOperator::Above,
+                right: ValueExpression::Indicator(IndicatorRef::NDayHigh { period: 20, lag: 0 }),
+            },
+        },
+    };
+    spec.exit = ExitRule::HoldDays { hold_days };
+    spec.position.size_pct = 100.0;
+    spec.position.max_positions = 1;
+    spec
 }
 
 #[cfg(test)]
@@ -292,7 +252,13 @@ mod tests {
                 }
             })
             .collect();
-        let report = run(&candles, BacktestRule::Ma20CrossUp, 10, Currency::Cny);
+        let report = run_for_instrument(
+            &candles,
+            "600000",
+            BacktestRule::Ma20CrossUp,
+            10,
+            Currency::Cny,
+        );
         assert!(report.is_some());
     }
 
@@ -312,7 +278,7 @@ mod tests {
             })
             .collect();
         for rule in BacktestRule::all() {
-            let report = run(&candles, rule, 10, Currency::Cny).unwrap();
+            let report = run_for_instrument(&candles, "600000", rule, 10, Currency::Cny).unwrap();
             assert!(!report.evidence.execution_rule.is_empty());
             assert!(!report.evidence.cost_model.version.is_empty());
             assert_eq!(report.sample_bars, candles.len());

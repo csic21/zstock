@@ -69,6 +69,7 @@ pub enum PrimaryTask {
     Research,
     Opportunities,
     Portfolio,
+    StrategyLab,
 }
 
 pub struct UiState {
@@ -146,6 +147,7 @@ impl super::StockApp {
             PrimaryTask::Research => TaskName::Research,
             PrimaryTask::Opportunities => TaskName::Opportunities,
             PrimaryTask::Portfolio => TaskName::Portfolio,
+            PrimaryTask::StrategyLab => TaskName::StrategyLab,
         };
         let metric = TaskMetric {
             task: previous,
@@ -176,6 +178,9 @@ impl super::StockApp {
                 self.market_analysis_open = false;
                 self.left_tab = super::LeftTab::Portfolio;
             }
+            PrimaryTask::StrategyLab => {
+                self.market_analysis_open = false;
+            }
         }
         self.schedule_persist(cx);
         cx.notify();
@@ -203,6 +208,7 @@ impl super::StockApp {
                 PrimaryTask::Research,
                 PrimaryTask::Opportunities,
                 PrimaryTask::Portfolio,
+                PrimaryTask::StrategyLab,
             ];
             for index in 0..24 {
                 if this

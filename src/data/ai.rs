@@ -14,17 +14,17 @@
 //! The app always shows the local commentary first and upgrades it with the
 //! LLM result when configured; a failed LLM call falls back to the local text.
 
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
-
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::data::levels::{self, ReferenceLevels};
 use crate::data::signals;
+use crate::infrastructure::ai::HttpLlmConfig;
+use crate::infrastructure::ai::cli::{CliLlmClient, CliLlmConfig, CliProvider};
+use crate::infrastructure::ai::compatible_chat::CompatibleChatClient;
+use crate::infrastructure::ai::openai::OpenAiResponsesClient;
 use crate::model::Candle;
+use crate::services::llm::{LlmClient, LlmRequest};
 
 /// How the optional LLM is invoked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -787,11 +787,40 @@ pub fn llm_complete(cfg: &AiConfig, system: &str, user: &str) -> Result<String> 
     if !cfg.enabled {
         bail!("AI 分析未开启（设置 → AI 分析）");
     }
-    let out = match cfg.transport {
-        AiTransport::Api => api_complete(cfg, system, user)?,
-        AiTransport::Cli => cli_complete(cfg, system, user)?,
+    let request = LlmRequest {
+        system: system.into(),
+        user: user.into(),
+        max_output_tokens: cfg.max_tokens,
     };
-    let trimmed = out.trim();
+    let response = match cfg.transport {
+        AiTransport::Api => {
+            let adapter_config = HttpLlmConfig {
+                base_url: cfg.base_url.clone(),
+                model: cfg.model.clone(),
+                api_key: cfg.api_key.clone(),
+                timeout_secs: cfg.timeout_secs,
+                max_response_bytes: 1024 * 1024,
+            };
+            match cfg.kind {
+                AiKind::Responses => OpenAiResponsesClient::new(adapter_config).complete(&request),
+                AiKind::Chat => CompatibleChatClient::new(adapter_config).complete(&request),
+            }
+        }
+        AiTransport::Cli => CliLlmClient::new(CliLlmConfig {
+            provider: match cfg.cli_provider {
+                AiCliProvider::Grok => CliProvider::Grok,
+                AiCliProvider::Chatgpt => CliProvider::Chatgpt,
+                AiCliProvider::Opencode => CliProvider::Opencode,
+                AiCliProvider::Claude => CliProvider::Claude,
+            },
+            binary: cfg.cli_bin.clone(),
+            model: cfg.model.clone(),
+            timeout_secs: cfg.timeout_secs,
+            max_response_bytes: 1024 * 1024,
+        })
+        .complete(&request),
+    }?;
+    let trimmed = response.text.trim();
     if trimmed.is_empty() {
         bail!("LLM 返回了空内容");
     }
@@ -806,486 +835,6 @@ const SYSTEM_PROMPT: &str = "你是一名严谨的 A 股技术面分析助手。
 4) 结尾必须包含“不构成投资建议”提示；\
 5) 全文不超过 450 字；\
 6) 不得编造快照之外的数据，数值必须与快照一致。";
-
-// ---- HTTP API --------------------------------------------------------------
-
-fn api_complete(cfg: &AiConfig, system: &str, user: &str) -> Result<String> {
-    if cfg.api_key.trim().is_empty() {
-        bail!("未配置 API Key（设置 → AI 分析）");
-    }
-    let base = cfg.base_url.trim().trim_end_matches('/');
-    if base.is_empty() {
-        bail!("未配置 API 地址（设置 → AI 分析）");
-    }
-    let model = cfg.model.trim();
-    if model.is_empty() {
-        bail!("未配置模型名称（设置 → AI 分析）");
-    }
-
-    let timeout = Duration::from_secs(cfg.timeout_secs.clamp(5, 120));
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(timeout)
-        .timeout_read(timeout)
-        .timeout_write(timeout)
-        .build();
-
-    let (path, payload) = match cfg.kind {
-        AiKind::Responses => (
-            format!("{base}/responses"),
-            serde_json::json!({
-                "model": model,
-                "instructions": system,
-                "input": user,
-                "max_output_tokens": cfg.max_tokens,
-            })
-            .to_string(),
-        ),
-        AiKind::Chat => (
-            format!("{base}/chat/completions"),
-            serde_json::json!({
-                "model": model,
-                "messages": [
-                    { "role": "system", "content": system },
-                    { "role": "user", "content": user },
-                ],
-                "temperature": 0.3,
-                "max_tokens": cfg.max_tokens,
-            })
-            .to_string(),
-        ),
-    };
-
-    let response = agent
-        .post(&path)
-        .set("Content-Type", "application/json")
-        .set("Authorization", &format!("Bearer {}", cfg.api_key.trim()))
-        .send_string(&payload)
-        .map_err(friendly_http_error)?;
-    let text = response
-        .into_string()
-        .map_err(|e| anyhow!("读取 LLM 响应失败：{e}"))?;
-
-    match cfg.kind {
-        AiKind::Responses => parse_responses(&text),
-        AiKind::Chat => parse_chat(&text),
-    }
-}
-
-fn friendly_http_error(e: ureq::Error) -> anyhow::Error {
-    match e {
-        ureq::Error::Status(code, response) => {
-            let body = response.into_string().unwrap_or_default();
-            let snippet = body.trim();
-            if snippet.is_empty() {
-                anyhow!("HTTP {code}")
-            } else {
-                anyhow!("HTTP {code}：{}", truncate(snippet, 180))
-            }
-        }
-        ureq::Error::Transport(t) => anyhow!("网络错误：{t}"),
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    let mut out: String = s.chars().take(max).collect();
-    if s.chars().count() > max {
-        out.push('…');
-    }
-    out
-}
-
-fn parse_responses(text: &str) -> Result<String> {
-    let v: serde_json::Value =
-        serde_json::from_str(text).context("解析 Responses 响应失败（返回的不是 JSON）")?;
-    if let Some(msg) = extract_api_error(&v) {
-        bail!("接口返回错误：{msg}");
-    }
-    let mut parts = Vec::new();
-    if let Some(output) = v.get("output").and_then(|o| o.as_array()) {
-        for item in output {
-            if item.get("type").and_then(|t| t.as_str()) != Some("message") {
-                continue;
-            }
-            if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
-                for c in content {
-                    if c.get("type").and_then(|t| t.as_str()) == Some("output_text")
-                        && let Some(t) = c.get("text").and_then(|t| t.as_str())
-                    {
-                        parts.push(t);
-                    }
-                }
-            }
-        }
-    }
-    if parts.is_empty() {
-        bail!("Responses 响应中没有找到文本内容");
-    }
-    Ok(parts.join("\n"))
-}
-
-fn parse_chat(text: &str) -> Result<String> {
-    let v: serde_json::Value =
-        serde_json::from_str(text).context("解析 Chat 响应失败（返回的不是 JSON）")?;
-    if let Some(msg) = extract_api_error(&v) {
-        bail!("接口返回错误：{msg}");
-    }
-    match v
-        .pointer("/choices/0/message/content")
-        .and_then(|c| c.as_str())
-    {
-        Some(s) if !s.trim().is_empty() => Ok(s.to_string()),
-        _ => bail!("Chat 响应中没有文本内容（可能是配额或限流错误）"),
-    }
-}
-
-fn extract_api_error(v: &serde_json::Value) -> Option<String> {
-    v.get("error")
-        .and_then(|e| e.get("message"))
-        .and_then(|m| m.as_str())
-        .map(|s| truncate(s, 200))
-}
-
-// ---- Local CLI -------------------------------------------------------------
-
-fn cli_complete(cfg: &AiConfig, system: &str, user: &str) -> Result<String> {
-    let bin = resolve_cli_bin(cfg)?;
-    // Agent CLIs are often slower than a raw HTTP call (auth / first token).
-    let timeout = Duration::from_secs(cfg.timeout_secs.clamp(60, 600));
-    let model = cfg.model.trim();
-    let model = if model.is_empty() { None } else { Some(model) };
-
-    match cfg.cli_provider {
-        AiCliProvider::Grok => run_grok(&bin, system, user, model, timeout),
-        AiCliProvider::Chatgpt => {
-            let name = bin
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if name == "codex" || name.starts_with("codex") {
-                run_codex(&bin, system, user, model, timeout)
-            } else {
-                run_chatgpt_generic(&bin, system, user, model, timeout)
-            }
-        }
-        AiCliProvider::Opencode => run_opencode(&bin, system, user, model, timeout),
-        AiCliProvider::Claude => run_claude(&bin, system, user, model, timeout),
-    }
-}
-
-fn resolve_cli_bin(cfg: &AiConfig) -> Result<PathBuf> {
-    let custom = cfg.cli_bin.trim();
-    if !custom.is_empty() {
-        let p = PathBuf::from(custom);
-        if p.is_file() {
-            return Ok(p);
-        }
-        if let Some(found) = which_bin(custom) {
-            return Ok(found);
-        }
-        bail!(
-            "找不到 CLI「{}」（请确认已安装，或在设置中填写绝对路径）",
-            custom
-        );
-    }
-    for name in cfg.cli_provider.default_bins() {
-        if let Some(found) = which_bin(name) {
-            return Ok(found);
-        }
-    }
-    let names = cfg.cli_provider.default_bins().join(" / ");
-    bail!(
-        "未找到 {} CLI（已搜索 {}；可安装后重试，或在设置中填写 CLI 路径）",
-        cfg.cli_provider.label(),
-        names
-    );
-}
-
-/// Locate an executable by bare name: `$PATH` first, then common install dirs
-/// (GUI apps on macOS often inherit a stripped PATH).
-fn which_bin(name: &str) -> Option<PathBuf> {
-    if name.contains('/') || name.contains('\\') {
-        let p = PathBuf::from(name);
-        return p.is_file().then_some(p);
-    }
-
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join(name);
-            if is_executable(&candidate) {
-                return Some(candidate);
-            }
-        }
-    }
-
-    let mut dirs: Vec<PathBuf> = vec![
-        PathBuf::from("/opt/homebrew/bin"),
-        PathBuf::from("/usr/local/bin"),
-        PathBuf::from("/usr/bin"),
-        PathBuf::from("/bin"),
-    ];
-    if let Some(home) = dirs::home_dir() {
-        dirs.push(home.join(".grok/bin"));
-        dirs.push(home.join(".local/bin"));
-        dirs.push(home.join(".npm-global/bin"));
-        dirs.push(home.join("bin"));
-        dirs.push(home.join(".cargo/bin"));
-    }
-    for dir in dirs {
-        let candidate = dir.join(name);
-        if is_executable(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-fn is_executable(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        path.metadata()
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
-fn combined_prompt(system: &str, user: &str) -> String {
-    format!("{system}\n\n---\n\n{user}")
-}
-
-fn write_temp_prompt(content: &str) -> Result<PathBuf> {
-    let path = std::env::temp_dir().join(format!(
-        "zstock-ai-{}-{}.txt",
-        std::process::id(),
-        Instant::now().elapsed().as_nanos()
-    ));
-    std::fs::write(&path, content)
-        .with_context(|| format!("写入临时提示失败：{}", path.display()))?;
-    Ok(path)
-}
-
-fn run_grok(
-    bin: &Path,
-    system: &str,
-    user: &str,
-    model: Option<&str>,
-    timeout: Duration,
-) -> Result<String> {
-    let prompt_file = write_temp_prompt(user)?;
-    let mut cmd = Command::new(bin);
-    cmd.arg("--prompt-file")
-        .arg(&prompt_file)
-        .arg("--output-format")
-        .arg("plain")
-        .arg("--system-prompt-override")
-        .arg(system)
-        .arg("--max-turns")
-        .arg("1")
-        .arg("--no-subagents")
-        .arg("--disable-web-search")
-        .arg("--permission-mode")
-        .arg("dontAsk");
-    if let Some(m) = model {
-        cmd.arg("-m").arg(m);
-    }
-    let result = run_command(cmd, timeout);
-    let _ = std::fs::remove_file(&prompt_file);
-    result
-}
-
-fn run_claude(
-    bin: &Path,
-    system: &str,
-    user: &str,
-    model: Option<&str>,
-    timeout: Duration,
-) -> Result<String> {
-    let mut cmd = Command::new(bin);
-    cmd.arg("-p")
-        .arg("--output-format")
-        .arg("text")
-        .arg("--system-prompt")
-        .arg(system)
-        // Empty tool set: pure completion, no interactive permission prompts.
-        .arg("--tools")
-        .arg("")
-        .arg("--bare")
-        .arg("--permission-mode")
-        .arg("dontAsk");
-    if let Some(m) = model {
-        cmd.arg("--model").arg(m);
-    }
-    cmd.arg("--").arg(user);
-    run_command(cmd, timeout)
-}
-
-fn run_opencode(
-    bin: &Path,
-    system: &str,
-    user: &str,
-    model: Option<&str>,
-    timeout: Duration,
-) -> Result<String> {
-    let prompt = combined_prompt(system, user);
-    let mut cmd = Command::new(bin);
-    cmd.arg("run").arg("--format").arg("default");
-    if let Some(m) = model {
-        cmd.arg("-m").arg(m);
-    }
-    // Positional message after options.
-    cmd.arg("--").arg(prompt);
-    run_command(cmd, timeout)
-}
-
-fn run_codex(
-    bin: &Path,
-    system: &str,
-    user: &str,
-    model: Option<&str>,
-    timeout: Duration,
-) -> Result<String> {
-    let prompt = combined_prompt(system, user);
-    let out_path = std::env::temp_dir().join(format!(
-        "zstock-codex-{}-{}.txt",
-        std::process::id(),
-        Instant::now().elapsed().as_nanos()
-    ));
-    let mut cmd = Command::new(bin);
-    cmd.arg("exec")
-        .arg("--ephemeral")
-        .arg("--skip-git-repo-check")
-        .arg("-s")
-        .arg("read-only")
-        .arg("-o")
-        .arg(&out_path);
-    if let Some(m) = model {
-        cmd.arg("-m").arg(m);
-    }
-    cmd.arg(prompt);
-    let run = run_command(cmd, timeout);
-    let file_out = std::fs::read_to_string(&out_path).ok();
-    let _ = std::fs::remove_file(&out_path);
-    match run {
-        Ok(stdout) => {
-            if let Some(text) = file_out.filter(|s| !s.trim().is_empty()) {
-                Ok(text)
-            } else {
-                Ok(stdout)
-            }
-        }
-        Err(e) => {
-            if let Some(text) = file_out.filter(|s| !s.trim().is_empty()) {
-                Ok(text)
-            } else {
-                Err(e)
-            }
-        }
-    }
-}
-
-/// Generic `chatgpt` (and similar) one-shot CLIs: pass the full prompt as the
-/// sole argument; optional `-m MODEL` when configured.
-fn run_chatgpt_generic(
-    bin: &Path,
-    system: &str,
-    user: &str,
-    model: Option<&str>,
-    timeout: Duration,
-) -> Result<String> {
-    let prompt = combined_prompt(system, user);
-    let mut cmd = Command::new(bin);
-    if let Some(m) = model {
-        cmd.arg("-m").arg(m);
-    }
-    cmd.arg(prompt);
-    run_command(cmd, timeout)
-}
-
-fn run_command(mut cmd: Command, timeout: Duration) -> Result<String> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("NO_COLOR", "1")
-        .env("TERM", "dumb")
-        // Avoid accidental interactive prompts when PATH-less GUI spawns shells.
-        .env("CI", "1");
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| anyhow!("启动 CLI 失败：{e}（请确认二进制在 PATH 中或已填写绝对路径）"))?;
-
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let out_handle = std::thread::spawn(move || {
-        let mut s = String::new();
-        if let Some(mut r) = stdout {
-            let _ = r.read_to_string(&mut s);
-        }
-        s
-    });
-    let err_handle = std::thread::spawn(move || {
-        let mut s = String::new();
-        if let Some(mut r) = stderr {
-            let _ = r.read_to_string(&mut s);
-        }
-        s
-    });
-
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break st,
-            Ok(None) if start.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = out_handle.join();
-                let _ = err_handle.join();
-                bail!("CLI 超时（{}s）", timeout.as_secs());
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(40)),
-            Err(e) => {
-                let _ = out_handle.join();
-                let _ = err_handle.join();
-                bail!("等待 CLI 失败：{e}");
-            }
-        }
-    };
-
-    let stdout = out_handle.join().unwrap_or_default();
-    let stderr = err_handle.join().unwrap_or_default();
-
-    if !status.success() {
-        let detail = if !stderr.trim().is_empty() {
-            stderr.trim()
-        } else {
-            stdout.trim()
-        };
-        let code = status.code().unwrap_or(-1);
-        if detail.is_empty() {
-            bail!("CLI 退出码 {code}");
-        }
-        bail!("CLI 退出码 {code}：{}", truncate(detail, 240));
-    }
-
-    let text = stdout.trim();
-    if text.is_empty() {
-        // Some CLIs print the answer to stderr in edge cases.
-        let err = stderr.trim();
-        if !err.is_empty() {
-            return Ok(err.to_string());
-        }
-        bail!("CLI 返回了空内容");
-    }
-    Ok(text.to_string())
-}
 
 // ---- pattern helpers -------------------------------------------------------
 
@@ -1508,37 +1057,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_chat_extracts_content() {
-        let raw = r#"{"choices":[{"message":{"content":"趋势向好。不构成投资建议"}}]}"#;
-        assert_eq!(parse_chat(raw).unwrap(), "趋势向好。不构成投资建议");
-    }
-
-    #[test]
-    fn parse_responses_extracts_output_text() {
-        let raw = r#"{
-            "output": [
-                {"type": "message", "content": [
-                    {"type": "output_text", "text": "第一段"},
-                    {"type": "output_text", "text": "第二段"}
-                ]},
-                {"type": "reasoning", "summary": []}
-            ]
-        }"#;
-        assert_eq!(parse_responses(raw).unwrap(), "第一段\n第二段");
-    }
-
-    #[test]
-    fn api_error_is_surfaced() {
-        let raw = r#"{"error":{"message":"Invalid API key"}}"#;
-        assert!(
-            parse_chat(raw)
-                .unwrap_err()
-                .to_string()
-                .contains("Invalid API key")
-        );
-    }
-
-    #[test]
     fn config_defaults_and_serde() {
         let cfg: AiConfig = serde_json::from_str("{}").unwrap();
         assert!(!cfg.enabled);
@@ -1575,13 +1093,5 @@ mod tests {
         cfg.api_key = "sk-test".into();
         assert!(cfg.is_configured());
         assert_eq!(cfg.source_label(), "LLM · gpt-5-mini");
-    }
-
-    #[test]
-    fn combined_prompt_joins_system_and_user() {
-        let p = combined_prompt("SYS", "USER");
-        assert!(p.contains("SYS"));
-        assert!(p.contains("USER"));
-        assert!(p.contains("---"));
     }
 }

@@ -1292,7 +1292,8 @@ impl StockApp {
         }
         let currency = crate::domain::money::Currency::for_code(self.selected.as_ref())
             .unwrap_or(crate::domain::money::Currency::Cny);
-        let report = backtest::run(&self.candles, rule, 10, currency);
+        let report =
+            backtest::run_for_instrument(&self.candles, self.selected.as_ref(), rule, 10, currency);
         self.backtest_report = report;
         if let Some(ref r) = self.backtest_report {
             self.status = shared(r.summary_line(self.work_mode));

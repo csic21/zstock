@@ -2,11 +2,39 @@ use serde::{Deserialize, Serialize};
 
 use super::money::Currency;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Market {
     AShare,
     HongKong,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetType {
+    Stock,
+    Index,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct InstrumentId {
+    pub market: Market,
+    pub asset_type: AssetType,
+    pub code: String,
+}
+
+impl InstrumentId {
+    pub fn storage_key(&self) -> String {
+        let market = match self.market {
+            Market::AShare => "a_share",
+            Market::HongKong => "hong_kong",
+        };
+        let asset_type = match self.asset_type {
+            AssetType::Stock => "stock",
+            AssetType::Index => "index",
+        };
+        format!("{market}:{asset_type}:{}", self.code)
+    }
 }
 
 impl Market {

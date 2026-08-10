@@ -25,3 +25,7 @@ pub fn journal() -> PathBuf {
 pub fn performance_report() -> PathBuf {
     app_data_dir().join("performance-report.json")
 }
+
+pub fn strategy_lab_database() -> PathBuf {
+    app_data_dir().join("strategy-lab.sqlite3")
+}

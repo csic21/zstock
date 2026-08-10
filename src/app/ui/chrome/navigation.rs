@@ -164,6 +164,7 @@ impl StockApp {
                                 ("task-research", "研究", PrimaryTask::Research),
                                 ("task-opportunities", "机会", PrimaryTask::Opportunities),
                                 ("task-portfolio", "组合", PrimaryTask::Portfolio),
+                                ("task-strategy-lab", "策略实验室", PrimaryTask::StrategyLab),
                             ]
                             .map(|(id, label, task)| {
                                 let active = self.ui_state.primary_task == task;

@@ -16,6 +16,7 @@ mod portfolio;
 mod prefs;
 mod series_cache;
 mod state;
+mod strategy_lab;
 mod symbols;
 mod types;
 mod ui;
@@ -62,6 +63,7 @@ use crate::storage::{
 };
 use crate::update::UpdateState;
 
+use crate::features::strategy_lab::StrategyLabFeature;
 #[cfg(feature = "work-mode")]
 use state::WorkModeFeature;
 use state::{
@@ -118,6 +120,7 @@ pub struct StockApp {
     analysis_state: AnalysisState,
     ui_state: UiState,
     runtime_state: RuntimeState,
+    pub(crate) strategy_lab_feature: StrategyLabFeature,
     #[cfg(feature = "work-mode")]
     work_mode_feature: WorkModeFeature,
     legacy: AppState,
@@ -598,6 +601,7 @@ impl StockApp {
             analysis_state: AnalysisState::default(),
             ui_state: UiState::default(),
             runtime_state: RuntimeState::default(),
+            strategy_lab_feature: StrategyLabFeature::new(),
             #[cfg(feature = "work-mode")]
             work_mode_feature: WorkModeFeature::default(),
             legacy: AppState {
@@ -784,6 +788,7 @@ impl StockApp {
 
         window.set_window_title(app.window_title());
         app.bootstrap(cx);
+        app.strategy_lab_start_daily_observation(cx);
         // 盘后 / 缓存过期：静默预扫长线，打开就能用。
         app.maybe_background_rescan(cx);
         app
@@ -913,6 +918,14 @@ impl Render for StockApp {
                     .w_full()
                     .overflow_hidden()
                     .child(self.render_market_analysis(window, cx))
+                    .into_any_element()
+            } else if self.ui_state.primary_task == state::PrimaryTask::StrategyLab {
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_hidden()
+                    .child(self.render_strategy_lab(window, cx))
                     .into_any_element()
             } else if work {
                 div()
