@@ -26,10 +26,13 @@ const UPDATE_MANIFEST_URLS: &[&str] = &[
     "https://cdn.jsdelivr.net/gh/csic21/zstock@main/updates/stable.json",
 ];
 const UPDATE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(target_os = "macos")]
 const APP_BUNDLE_NAME: &str = "ZStock.app";
 /// Bundle name used before the v0.0.8 rename; still accepted when installing
 /// so packages from either naming era can be applied.
+#[cfg(target_os = "macos")]
 const LEGACY_BUNDLE_NAME: &str = "Stock Analysis.app";
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const BINARY_NAME: &str = "stock";
 
 /// UI state of the auto-updater.
@@ -326,6 +329,7 @@ fn bundle_dir(exe: &Path) -> Option<PathBuf> {
 
 /// Locate the app bundle inside an extracted update, preferring the current
 /// bundle name and falling back to the pre-rename one.
+#[cfg(target_os = "macos")]
 fn find_new_bundle(extracted: &Path) -> Option<PathBuf> {
     let primary = extracted.join(APP_BUNDLE_NAME);
     if primary.is_dir() {
@@ -409,7 +413,7 @@ fn find_named_file(root: &Path, name: &str) -> Option<PathBuf> {
                 if let Some(found) = walk(&path, name, depth + 1) {
                     return Some(found);
                 }
-            } else if path.file_name().map_or(false, |f| f == name) {
+            } else if path.file_name().is_some_and(|f| f == name) {
                 return Some(path);
             }
         }
@@ -455,6 +459,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn finds_new_bundle_preferring_current_name() {
         let dir = std::env::temp_dir().join(format!("stock-bundle-new-{}", std::process::id()));
         fs::create_dir_all(dir.join(APP_BUNDLE_NAME)).unwrap();

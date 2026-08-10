@@ -900,6 +900,7 @@ impl StockApp {
     }
 
     /// Apply trackpad pinch magnification (positive ≈ fingers apart → zoom in).
+    #[cfg(target_os = "macos")]
     pub(crate) fn on_chart_pinch(&mut self, magnification: f32, cx: &mut Context<Self>) {
         if self.candles.is_empty() || magnification.abs() < 1e-5 {
             return;

@@ -1,5 +1,6 @@
 //! Preferences, layout, work mode, status bar, AI settings, updates.
 
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
 use gpui::{App, Context, Entity, Timer, Window, px, size};
@@ -560,6 +561,7 @@ impl StockApp {
 
     /// Menu-bar title: one symbol full, many symbols compact side-by-side.
     /// Caller guarantees `syms` is non-empty.
+    #[cfg(target_os = "macos")]
     pub(crate) fn status_bar_multi_title_for(&self, syms: &[&Symbol]) -> String {
         if syms.len() == 1 {
             return self.status_bar_title_for(syms[0]);
@@ -572,6 +574,7 @@ impl StockApp {
         parts.join(" · ")
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn status_bar_title_for(&self, sym: &Symbol) -> String {
         // Always include last price when available. Work-mode / multi compact used
         // to show only ±% (2dp); the main window re-renders every poll with live
@@ -598,6 +601,7 @@ impl StockApp {
     }
 
     /// Compact segment for multi-symbol titles: `名 价±%` (price keeps it live).
+    #[cfg(target_os = "macos")]
     pub(crate) fn status_bar_compact_for(&self, sym: &Symbol) -> String {
         if self.work_mode {
             let alias = disguise_label(&sym.code, sym.name.as_ref());
@@ -620,6 +624,7 @@ impl StockApp {
         }
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn status_bar_menu_label_for(&self, sym: &Symbol) -> String {
         if self.work_mode {
             let alias = disguise_label(&sym.code, sym.name.as_ref());

@@ -4,6 +4,7 @@ use std::process::Stdio;
 
 use crate::services::secrets::{SecretError, SecretStore};
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const SERVICE: &str = "com.karl.zstock";
 
 #[derive(Debug, Clone, Default)]
@@ -217,7 +218,7 @@ fn command_error(error: std::io::Error) -> SecretError {
     SecretError(format!("credential store unavailable: {error}"))
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn status_error(operation: &str, stderr: &[u8]) -> SecretError {
     let detail = String::from_utf8_lossy(stderr);
     SecretError(format!(
