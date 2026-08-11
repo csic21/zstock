@@ -29,6 +29,8 @@ pub struct QuoteTick {
     pub last: f64,
     pub change_pct: f64,
     pub volume: u64,
+    /// Turnover amount when supplied by the quote backend.
+    pub amount: f64,
     pub currency: Currency,
     pub source: String,
     pub fetched_at: i64,
@@ -894,6 +896,7 @@ fn parse_quote_diff(v: Value) -> Result<Vec<QuoteTick>> {
             last,
             change_pct: num_f64(item.get("f3")),
             volume: num_f64(item.get("f5")) as u64,
+            amount: num_f64(item.get("f6")),
             currency,
             source: "东方财富".into(),
             fetched_at: chrono::Utc::now().timestamp_millis(),

@@ -83,6 +83,7 @@ pub fn fetch_quotes(codes: &[String]) -> Result<Sourced<Vec<QuoteTick>>> {
                 last: price,
                 change_pct: record.change_pct.unwrap_or_default(),
                 volume: record.volume.unwrap_or_default(),
+                amount: price * record.volume.unwrap_or_default() as f64,
                 currency: record.currency,
                 source: record.source,
                 fetched_at: record.fetched_at,

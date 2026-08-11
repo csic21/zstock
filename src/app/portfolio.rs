@@ -215,6 +215,10 @@ impl StockApp {
             return;
         }
         if self.market_analysis_open {
+            if self.market_heatmap_can_go_back() {
+                self.back_market_heatmap(cx);
+                return;
+            }
             self.close_market_analysis(cx);
             return;
         }

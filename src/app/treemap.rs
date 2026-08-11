@@ -117,6 +117,45 @@ pub(crate) fn squarified_treemap(weights: &[f64], target_aspect_ratio: f64) -> V
     cells
 }
 
+/// Return how many leading, descending weights should remain visible before
+/// the long tail is collapsed into one aggregate cell.
+pub(crate) fn primary_item_count(
+    descending_weights: &[f64],
+    minimum_items: usize,
+    maximum_items: usize,
+    minimum_share: f64,
+) -> usize {
+    if descending_weights.is_empty() || maximum_items == 0 {
+        return 0;
+    }
+    let cap = maximum_items.min(descending_weights.len());
+    let floor = minimum_items.min(cap);
+    let total: f64 = descending_weights
+        .iter()
+        .copied()
+        .filter(|weight| weight.is_finite() && *weight > 0.0)
+        .sum();
+    if total <= 0.0 {
+        return cap;
+    }
+    let minimum_share = minimum_share.clamp(0.0, 1.0);
+    let mut keep = floor;
+    for (index, weight) in descending_weights
+        .iter()
+        .copied()
+        .enumerate()
+        .take(cap)
+        .skip(floor)
+    {
+        if weight.is_finite() && weight > 0.0 && weight / total >= minimum_share {
+            keep = index + 1;
+        } else {
+            break;
+        }
+    }
+    keep
+}
+
 fn worst_ratio(row: &[AreaItem], side: f64) -> f64 {
     if row.is_empty() {
         return f64::INFINITY;
@@ -261,6 +300,18 @@ mod tests {
             squarified_treemap(&weights, 2.7),
             squarified_treemap(&weights, 2.7)
         );
+    }
+
+    #[test]
+    fn long_tail_partition_keeps_minimum_and_respects_share() {
+        let weights = [50.0, 25.0, 10.0, 8.0, 4.0, 2.0, 0.6, 0.4];
+        assert_eq!(primary_item_count(&weights, 3, 6, 0.03), 5);
+        assert_eq!(primary_item_count(&weights, 3, 4, 0.0), 4);
+    }
+
+    #[test]
+    fn zero_weight_partition_uses_the_display_cap() {
+        assert_eq!(primary_item_count(&[0.0; 50], 20, 40, 0.004), 40);
     }
 
     fn overlaps(a: TreemapRect, b: TreemapRect) -> bool {

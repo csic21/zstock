@@ -159,6 +159,7 @@ fn parse_quote_body(body: &str) -> Result<Vec<QuoteTick>> {
             name: f[1].trim().to_string(),
             last,
             volume: parse_f(6) as u64,
+            amount: last * parse_f(6),
             change_pct: parse_f(32),
             currency,
             source: "腾讯财经".into(),

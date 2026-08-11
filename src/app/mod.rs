@@ -72,8 +72,8 @@ use state::{
     RuntimeState, UiState,
 };
 use types::{
-    AiCacheEntry, AiPanelState, AiSource, ChartKind, ChartRange, DetailTab, LeftTab, MarketRegion,
-    SettingsSection,
+    AiCacheEntry, AiPanelState, AiSource, ChartKind, ChartRange, DetailTab, LeftTab,
+    MarketHeatmapLevel, MarketRegion, SettingsSection,
 };
 
 actions!(
@@ -194,6 +194,9 @@ pub struct AppState {
     market_analysis_region: MarketRegion,
     /// Real-time A-share industry sectors.
     market_analysis_sectors: Vec<market_data::SectorTick>,
+    /// Current navigation level and presentation inside the industry heatmap.
+    market_heatmap_level: MarketHeatmapLevel,
+    market_heatmap_list: bool,
     market_analysis_loading: bool,
     market_analysis_error: Option<SharedString>,
     market_analysis_source: SharedString,
@@ -650,6 +653,8 @@ impl StockApp {
                 market_analysis_open: false,
                 market_analysis_region: MarketRegion::AShare,
                 market_analysis_sectors: Vec::new(),
+                market_heatmap_level: MarketHeatmapLevel::Industries,
+                market_heatmap_list: false,
                 market_analysis_loading: false,
                 market_analysis_error: None,
                 market_analysis_source: shared(market_data::SRC_EASTMONEY),

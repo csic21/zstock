@@ -8,7 +8,7 @@ use crate::data::{
 };
 use crate::model::shared;
 
-use super::{AiPanelState, AiSource, MarketRegion, StockApp};
+use super::{AiPanelState, AiSource, MarketHeatmapLevel, MarketRegion, StockApp};
 
 impl StockApp {
     pub(crate) fn open_market_analysis(&mut self, cx: &mut Context<Self>) {
@@ -268,13 +268,45 @@ impl StockApp {
     }
 
     pub(crate) fn clear_sector_drill(&mut self, cx: &mut Context<Self>) {
+        self.clear_sector_drill_state();
+        cx.notify();
+    }
+
+    pub(crate) fn open_market_heatmap_tail(&mut self, cx: &mut Context<Self>) {
+        self.clear_sector_drill_state();
+        self.market_heatmap_level = MarketHeatmapLevel::TailIndustries;
+        cx.notify();
+    }
+
+    pub(crate) fn set_market_heatmap_list(&mut self, list: bool, cx: &mut Context<Self>) {
+        if self.market_heatmap_list == list {
+            return;
+        }
+        self.market_heatmap_list = list;
+        cx.notify();
+    }
+
+    pub(crate) fn market_heatmap_can_go_back(&self) -> bool {
+        self.sector_drill_code.is_some()
+            || self.market_heatmap_level == MarketHeatmapLevel::TailIndustries
+    }
+
+    pub(crate) fn back_market_heatmap(&mut self, cx: &mut Context<Self>) {
+        if self.sector_drill_code.is_some() {
+            self.clear_sector_drill(cx);
+        } else if self.market_heatmap_level == MarketHeatmapLevel::TailIndustries {
+            self.market_heatmap_level = MarketHeatmapLevel::Industries;
+            cx.notify();
+        }
+    }
+
+    fn clear_sector_drill_state(&mut self) {
         self.sector_drill_gen = self.sector_drill_gen.wrapping_add(1);
         self.sector_drill_code = None;
         self.sector_drill_name = None;
         self.sector_drill_quotes.clear();
         self.sector_drill_loading = false;
         self.sector_drill_error = None;
-        cx.notify();
     }
 
     pub(crate) fn select_sector_constituent(
