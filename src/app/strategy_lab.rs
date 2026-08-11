@@ -13,6 +13,45 @@ use crate::services::market_data::KlineProvider;
 use crate::services::strategy_generator::{StrategyBatchDraft, StrategyGenerator};
 
 impl super::StockApp {
+    pub(crate) fn strategy_lab_data_context(&self) -> (String, &'static str, usize, usize) {
+        let code = self.selected.to_string();
+        let market = Market::for_code(&code).unwrap_or(Market::AShare);
+        let market_label = match market {
+            Market::AShare => "A 股",
+            Market::HongKong => "港股",
+        };
+        let watchlist_count = self
+            .symbols
+            .iter()
+            .filter(|symbol| Market::for_code(&symbol.code) == Some(market))
+            .count()
+            .min(100);
+        (code, market_label, watchlist_count, self.candles.len())
+    }
+
+    pub(crate) fn strategy_lab_instrument_labels(
+        &self,
+        instruments: &[InstrumentId],
+    ) -> Vec<String> {
+        instruments
+            .iter()
+            .map(|instrument| {
+                self.symbols
+                    .iter()
+                    .find(|symbol| symbol.code == instrument.code)
+                    .map(|symbol| {
+                        let name = symbol.name.trim();
+                        if name.is_empty() || name == instrument.code {
+                            instrument.code.clone()
+                        } else {
+                            format!("{} {}", instrument.code, name)
+                        }
+                    })
+                    .unwrap_or_else(|| instrument.code.clone())
+            })
+            .collect()
+    }
+
     pub(crate) fn strategy_lab_start_daily_observation(&mut self, cx: &mut gpui::Context<Self>) {
         let today = chrono::Local::now()
             .date_naive()
@@ -82,14 +121,6 @@ impl super::StockApp {
     }
 
     pub(crate) fn strategy_lab_generate_ai(&mut self, cx: &mut gpui::Context<Self>) {
-        if self
-            .strategy_lab_feature
-            .state
-            .selected_experiment_id
-            .is_none()
-        {
-            self.strategy_lab_create_current(cx);
-        }
         let (experiment_id, input) = match self.strategy_lab_feature.prepare_ai_generation() {
             Ok(value) => value,
             Err(error) => {

@@ -413,7 +413,7 @@ impl StrategyLabFeature {
             .state
             .selected_experiment_id
             .clone()
-            .context("请先用当前日 K 创建实验")?;
+            .context("请先冻结当前标的或自选股票池，再生成 AI 策略草案")?;
         let experiment = self
             .store
             .load_experiment(&experiment_id)?
