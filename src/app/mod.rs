@@ -18,6 +18,7 @@ mod series_cache;
 mod state;
 mod strategy_lab;
 mod symbols;
+mod treemap;
 mod types;
 mod ui;
 mod view_models;
