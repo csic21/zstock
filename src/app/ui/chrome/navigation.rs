@@ -226,8 +226,11 @@ impl StockApp {
                         )
                         .when(!work, |row| row.children(self.render_update_button(cx)))
                         .child(
+                            // When open, drop the gear icon so 「返回」is truly
+                            // centered in the primary pill (icon+label was
+                            // optically left-heavy).
                             Button::new("settings-btn")
-                                .icon(IconName::Settings2)
+                                .when(!self.settings_open, |b| b.icon(IconName::Settings2))
                                 .ghost()
                                 .xsmall()
                                 .when(self.settings_open, |b| b.primary())

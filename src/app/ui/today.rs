@@ -63,29 +63,22 @@ impl StockApp {
                             ),
                     )
                     .child(div().flex_1())
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_full()
-                            .bg(if action_count == 0 {
-                                cx.theme().success.opacity(0.11)
-                            } else {
-                                cx.theme().warning.opacity(0.11)
-                            })
-                            .text_xs()
-                            .font_semibold()
-                            .text_color(if action_count == 0 {
-                                cx.theme().success
-                            } else {
-                                cx.theme().warning
-                            })
-                            .child(if action_count == 0 {
-                                "当前没有必须操作"
-                            } else {
-                                "先处理风险，再看机会"
-                            }),
-                    )
+                    .child({
+                        let (fg, bg, text) = if action_count == 0 {
+                            (
+                                cx.theme().success,
+                                cx.theme().success.opacity(0.11),
+                                "当前没有必须操作",
+                            )
+                        } else {
+                            (
+                                cx.theme().warning,
+                                cx.theme().warning.opacity(0.11),
+                                "先处理风险，再看机会",
+                            )
+                        };
+                        crate::app::helpers::status_pill(text, fg, bg)
+                    })
                     .child(
                         Button::new("today-market-context")
                             .ghost()
@@ -389,17 +382,11 @@ impl StockApp {
             .border_l_1()
             .border_color(color.opacity(0.35))
             .bg(color.opacity(0.05))
-            .child(
-                div()
-                    .px_2()
-                    .py_0p5()
-                    .rounded_full()
-                    .bg(color.opacity(0.14))
-                    .text_xs()
-                    .font_semibold()
-                    .text_color(color)
-                    .child(badge),
-            )
+            .child(crate::app::helpers::status_pill(
+                badge,
+                color,
+                color.opacity(0.14),
+            ))
             .child(
                 v_flex()
                     .flex_1()

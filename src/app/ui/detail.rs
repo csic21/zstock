@@ -93,17 +93,9 @@ impl StockApp {
                             .child(self.status.clone()),
                     ),
             )
-            .when(active == DetailTab::Overview, |panel| {
-                let trace = self.decision_trace_view_model(cx);
-                panel.child(
-                    div()
-                        .w_full()
-                        .flex_shrink_0()
-                        .px_3()
-                        .pt_3()
-                        .child(self.render_decision_trace(&trace, cx)),
-                )
-            })
+            // Entire tab body scrolls as one region. Decision process used to sit
+            // outside the scroller with flex_shrink_0, which starved the card/evidence
+            // below when the 6-step trace was tall.
             .child(
                 div()
                     .id("detail-scroll")
@@ -130,7 +122,7 @@ impl StockApp {
             )
     }
 
-    /// 概览：紧凑两行——评分/因子 + OHLC/量能/快捷，填满底栏而不是漂在大片空底上。
+    /// 概览：决策过程 + 决策卡 + 评分/因子，整体可滚动，避免固定决策过程挤占下方空间。
     pub(crate) fn render_detail_overview(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let work = self.work_mode;
         let signal = self.current_signal();
@@ -177,10 +169,12 @@ impl StockApp {
             .decision_card
             .clone()
             .unwrap_or_else(|| self.decision_card_view_model());
+        let decision_trace = self.decision_trace_view_model(cx);
 
         v_flex()
             .w_full()
             .gap_2()
+            .child(self.render_decision_trace(&decision_trace, cx))
             .child(self.render_decision_card_summary(&decision_card, cx))
             // Row 1: score + title/chips + quick links
             .child(
@@ -206,21 +200,16 @@ impl StockApp {
                                             .text_color(cx.theme().foreground)
                                             .child(title),
                                     )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .px_1p5()
-                                            .py_0p5()
-                                            .rounded_full()
-                                            .bg(cx.theme().muted)
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(if work {
-                                                "svc".to_string()
-                                            } else {
-                                                sym.map(|s| s.board.as_ref().to_string())
-                                                    .unwrap_or_else(|| "--".into())
-                                            }),
-                                    )
+                                    .child(crate::app::helpers::status_pill(
+                                        if work {
+                                            "svc".to_string()
+                                        } else {
+                                            sym.map(|s| s.board.as_ref().to_string())
+                                                .unwrap_or_else(|| "--".into())
+                                        },
+                                        cx.theme().muted_foreground,
+                                        cx.theme().muted,
+                                    ))
                                     .child(
                                         div()
                                             .text_xs()

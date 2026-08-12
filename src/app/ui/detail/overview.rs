@@ -45,17 +45,11 @@ impl StockApp {
                             .text_color(cx.theme().foreground)
                             .child("决策过程"),
                     )
-                    .child(
-                        div()
-                            .px_2()
-                            .py_0p5()
-                            .rounded_full()
-                            .bg(outcome_color.opacity(0.16))
-                            .text_xs()
-                            .font_semibold()
-                            .text_color(outcome_color)
-                            .child(trace.outcome.label()),
-                    )
+                    .child(status_pill(
+                        trace.outcome.label(),
+                        outcome_color,
+                        outcome_color.opacity(0.16),
+                    ))
                     .child(
                         div()
                             .text_xs()
@@ -103,17 +97,12 @@ impl StockApp {
                             .text_color(cx.theme().foreground)
                             .child(step.title.clone()),
                     )
-                    .child(
-                        div()
-                            .w(px(48.0))
-                            .px_1()
-                            .py_0p5()
-                            .rounded_full()
-                            .bg(color.opacity(0.14))
-                            .text_xs()
-                            .text_color(color)
-                            .child(step.state.label()),
-                    )
+                    .child(status_pill_sized(
+                        step.state.label(),
+                        color,
+                        color.opacity(0.14),
+                        Some(48.0),
+                    ))
                     .child(
                         div()
                             .flex_1()

@@ -129,17 +129,12 @@ impl StockApp {
                             ),
                     )
                     .child(
-                        div()
-                            .min_w(px(28.))
-                            .px_2()
-                            .py_0p5()
-                            .rounded_full()
-                            .bg(cx.theme().muted)
-                            .text_xs()
-                            .font_semibold()
-                            .text_color(cx.theme().muted_foreground)
-                            .text_center()
-                            .child(count),
+                        crate::app::helpers::status_pill_sized(
+                            count,
+                            cx.theme().muted_foreground,
+                            cx.theme().muted,
+                            Some(28.0),
+                        ),
                     ),
             )
             .child(match self.left_tab {

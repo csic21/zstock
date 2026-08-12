@@ -1,8 +1,8 @@
 //! Pure UI/string helpers shared across app modules.
 
 use gpui::{
-    App, Context, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
-    Styled, div, prelude::FluentBuilder, px,
+    App, Context, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px, relative,
 };
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
@@ -319,6 +319,47 @@ pub(crate) fn metric_chip(label: &str, value: &str, cx: &App) -> impl IntoElemen
                 .font_semibold()
                 .text_color(cx.theme().foreground)
                 .child(value.to_string()),
+        )
+}
+
+/// Centered status/tag pill (通过 / 拦截 / 注意 …).
+///
+/// Plain `div` + padding leaves Chinese glyphs optically off-center, and a fixed
+/// width without flex makes short labels hug the left edge. This helper pins a
+/// fixed height and centers the label on both axes.
+pub(crate) fn status_pill(
+    label: impl Into<SharedString>,
+    color: Hsla,
+    bg: Hsla,
+) -> impl IntoElement {
+    status_pill_sized(label, color, bg, None)
+}
+
+/// Like [`status_pill`], with an optional minimum width (e.g. align a column of
+/// 通过/注意/拦截 badges).
+pub(crate) fn status_pill_sized(
+    label: impl Into<SharedString>,
+    color: Hsla,
+    bg: Hsla,
+    min_width: Option<f32>,
+) -> impl IntoElement {
+    h_flex()
+        .items_center()
+        .justify_center()
+        .h(px(20.))
+        .when_some(min_width, |this, w| this.min_w(px(w)))
+        .px_2()
+        .rounded_full()
+        .bg(bg)
+        .child(
+            div()
+                .flex_none()
+                .text_xs()
+                .font_semibold()
+                .text_color(color)
+                // Tight line box so flex centering (not font metrics) owns vertical placement.
+                .line_height(relative(1.))
+                .child(label.into()),
         )
 }
 

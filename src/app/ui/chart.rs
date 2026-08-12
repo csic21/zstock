@@ -178,16 +178,11 @@ impl StockApp {
                                         .child(n),
                                 )
                             })
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_full()
-                                    .bg(cx.theme().muted)
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(board),
-                            )
+                            .child(crate::app::helpers::status_pill(
+                                board,
+                                cx.theme().muted_foreground,
+                                cx.theme().muted,
+                            ))
                             .child(div().w(px(8.)))
                             .child(ohlc_el),
                     )
@@ -212,17 +207,13 @@ impl StockApp {
                             )
                             .when_some(cost_mark, |row, (cost, pnl_pct)| {
                                 let pnl_color = self.chg_color(pnl_pct >= 0.0, cx);
-                                row.child(div().w(px(6.)))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .px_2()
-                                            .py_0p5()
-                                            .rounded_full()
-                                            .bg(cx.theme().muted)
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(format!("成本 {}", format_price(cost))),
-                                    )
+                                row.child(div().w(px(6.))).child(
+                                    crate::app::helpers::status_pill(
+                                        format!("成本 {}", format_price(cost)),
+                                        cx.theme().muted_foreground,
+                                        cx.theme().muted,
+                                    ),
+                                )
                                     .child(
                                         div()
                                             .text_xs()
@@ -233,26 +224,20 @@ impl StockApp {
                             })
                             .when(self.refreshing, |row| {
                                 row.child(div().w(px(6.))).child(
-                                    div()
-                                        .text_xs()
-                                        .px_2()
-                                        .py_0p5()
-                                        .rounded_full()
-                                        .bg(cx.theme().accent.opacity(0.18))
-                                        .text_color(cx.theme().accent)
-                                        .child(L::chart_refreshing(work)),
+                                    crate::app::helpers::status_pill(
+                                        L::chart_refreshing(work),
+                                        cx.theme().accent,
+                                        cx.theme().accent.opacity(0.18),
+                                    ),
                                 )
                             })
                             .when(self.loading && !self.refreshing, |row| {
                                 row.child(div().w(px(6.))).child(
-                                    div()
-                                        .text_xs()
-                                        .px_2()
-                                        .py_0p5()
-                                        .rounded_full()
-                                        .bg(cx.theme().muted)
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(L::loading_short(work)),
+                                    crate::app::helpers::status_pill(
+                                        L::loading_short(work),
+                                        cx.theme().muted_foreground,
+                                        cx.theme().muted,
+                                    ),
                                 )
                             }),
                     ),
@@ -285,17 +270,11 @@ impl StockApp {
                                 .text_color(cx.theme().foreground)
                                 .child("决策"),
                         )
-                        .child(
-                            div()
-                                .px_2()
-                                .py_0p5()
-                                .rounded_full()
-                                .bg(color.opacity(0.16))
-                                .text_xs()
-                                .font_semibold()
-                                .text_color(color)
-                                .child(trace.outcome.label()),
-                        )
+                        .child(crate::app::helpers::status_pill(
+                            trace.outcome.label(),
+                            color,
+                            color.opacity(0.16),
+                        ))
                         .child(
                             div()
                                 .flex_1()
