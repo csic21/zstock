@@ -128,14 +128,12 @@ impl StockApp {
                                     .child(subtitle),
                             ),
                     )
-                    .child(
-                        crate::app::helpers::status_pill_sized(
-                            count,
-                            cx.theme().muted_foreground,
-                            cx.theme().muted,
-                            Some(28.0),
-                        ),
-                    ),
+                    .child(crate::app::helpers::status_pill_sized(
+                        count,
+                        cx.theme().muted_foreground,
+                        cx.theme().muted,
+                        Some(28.0),
+                    )),
             )
             .child(match self.left_tab {
                 LeftTab::Watchlist => self.render_watchlist_body(cx).into_any_element(),
