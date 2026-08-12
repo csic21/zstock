@@ -37,9 +37,9 @@ impl StockApp {
             .bg(cx.theme().background)
             .child(
                 h_flex()
-                    .h(px(58.0))
+                    .h(px(68.0))
                     .flex_shrink_0()
-                    .px_4()
+                    .px_5()
                     .items_center()
                     .gap_3()
                     .border_b_1()
@@ -50,10 +50,10 @@ impl StockApp {
                             .gap_0p5()
                             .child(
                                 div()
-                                    .text_base()
+                                    .text_lg()
                                     .font_semibold()
                                     .text_color(cx.theme().foreground)
-                                    .child("每日决策台"),
+                                    .child("今天，先处理什么？"),
                             )
                             .child(
                                 div()
@@ -65,7 +65,16 @@ impl StockApp {
                     .child(div().flex_1())
                     .child(
                         div()
+                            .px_2()
+                            .py_1()
+                            .rounded_full()
+                            .bg(if action_count == 0 {
+                                cx.theme().success.opacity(0.11)
+                            } else {
+                                cx.theme().warning.opacity(0.11)
+                            })
                             .text_xs()
+                            .font_semibold()
                             .text_color(if action_count == 0 {
                                 cx.theme().success
                             } else {
@@ -81,7 +90,7 @@ impl StockApp {
                         Button::new("today-market-context")
                             .ghost()
                             .xsmall()
-                            .label("市场背景")
+                            .label("查看市场")
                             .tooltip("查看指数、市场宽度、行业榜和热力图")
                             .on_click(cx.listener(|this, _, _window, cx| {
                                 this.open_market_analysis(cx);
@@ -103,12 +112,12 @@ impl StockApp {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .p_4()
+                    .p_5()
                     .child(
                         v_flex()
                             .w_full()
-                            .max_w(px(1280.0))
-                            .gap_4()
+                            .max_w(px(1360.0))
+                            .gap_5()
                             .child(
                                 h_flex()
                                     .gap_2()
@@ -187,7 +196,7 @@ impl StockApp {
                                                     v_flex()
                                                         .gap_1()
                                                         .p_4()
-                                                        .rounded(cx.theme().radius)
+                                                        .rounded(cx.theme().radius_lg)
                                                         .border_1()
                                                         .border_color(cx.theme().success.opacity(0.3))
                                                         .bg(cx.theme().success.opacity(0.05))
@@ -250,7 +259,7 @@ impl StockApp {
                                                     v_flex()
                                                         .gap_2()
                                                         .p_4()
-                                                        .rounded(cx.theme().radius)
+                                                        .rounded(cx.theme().radius_lg)
                                                         .border_1()
                                                         .border_color(cx.theme().border)
                                                         .bg(cx.theme().sidebar)
@@ -321,8 +330,8 @@ impl StockApp {
                             .child(
                                 v_flex()
                                     .gap_1()
-                                    .p_3()
-                                    .rounded(cx.theme().radius)
+                                    .p_4()
+                                    .rounded(cx.theme().radius_lg)
                                     .border_1()
                                     .border_color(cx.theme().border)
                                     .bg(cx.theme().sidebar.opacity(0.7))
@@ -375,7 +384,7 @@ impl StockApp {
             .gap_3()
             .items_center()
             .p_3()
-            .rounded(cx.theme().radius)
+            .rounded(cx.theme().radius_lg)
             .border_1()
             .border_l_1()
             .border_color(color.opacity(0.35))
@@ -445,7 +454,7 @@ impl StockApp {
             .gap_2()
             .items_center()
             .p_3()
-            .rounded(cx.theme().radius)
+            .rounded(cx.theme().radius_lg)
             .border_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().sidebar)
@@ -517,12 +526,14 @@ fn today_metric(
     cx: &mut Context<StockApp>,
 ) -> AnyElement {
     v_flex()
-        .w(px(224.0))
+        .flex_1()
+        .min_w(px(188.0))
+        .max_w(px(260.0))
         .gap_1()
-        .p_3()
-        .rounded(cx.theme().radius)
+        .p_4()
+        .rounded(cx.theme().radius_lg)
         .border_1()
-        .border_color(cx.theme().border)
+        .border_color(cx.theme().border.opacity(0.82))
         .bg(cx.theme().sidebar)
         .child(
             div()

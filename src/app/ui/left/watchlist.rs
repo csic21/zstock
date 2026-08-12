@@ -25,12 +25,13 @@ impl StockApp {
             .w_full()
             .child(
                 h_flex()
-                    .h(px(28.))
-                    .px_2()
+                    .h(px(30.))
+                    .px_3()
                     .items_center()
                     .gap_1()
                     .border_b_1()
-                    .border_color(cx.theme().border)
+                    .border_color(cx.theme().border.opacity(0.65))
+                    .bg(cx.theme().background.opacity(0.36))
                     .child(
                         div()
                             .flex_1()
@@ -48,12 +49,13 @@ impl StockApp {
             )
             .child(
                 h_flex()
-                    .h(px(26.))
-                    .px_1()
+                    .h(px(28.))
+                    .px_2()
                     .items_center()
                     .gap_0p5()
                     .border_b_1()
-                    .border_color(cx.theme().border.opacity(0.6))
+                    .border_color(cx.theme().border.opacity(0.5))
+                    .bg(cx.theme().background.opacity(0.24))
                     .children(WatchlistSort::all().map(|s| {
                         let active = sort == s;
                         Button::new(("wl-sort", s as u32))
@@ -68,12 +70,13 @@ impl StockApp {
             )
             .child(
                 h_flex()
-                    .h(px(26.))
-                    .px_1()
+                    .h(px(28.))
+                    .px_2()
                     .items_center()
                     .gap_0p5()
                     .border_b_1()
-                    .border_color(cx.theme().border.opacity(0.45))
+                    .border_color(cx.theme().border.opacity(0.5))
+                    .bg(cx.theme().background.opacity(0.24))
                     .children(
                         WatchTag::all_filters()
                             .into_iter()
@@ -145,16 +148,20 @@ impl StockApp {
 
                         div()
                             .id(("watch-row", ix))
-                            .h(px(48.))
+                            .h(px(52.))
                             .px_3()
                             .flex()
                             .items_center()
                             .gap_2()
                             .cursor_pointer()
                             .border_b_1()
-                            .border_color(cx.theme().border.opacity(0.35))
-                            .when(is_selected, |this| this.bg(cx.theme().accent.opacity(0.18)))
-                            .hover(|this| this.bg(cx.theme().accent.opacity(0.10)))
+                            .border_color(cx.theme().border.opacity(0.30))
+                            .when(is_selected, |this| {
+                                this.border_l_2()
+                                    .border_color(cx.theme().accent.opacity(0.82))
+                                    .bg(cx.theme().accent.opacity(0.13))
+                            })
+                            .hover(|this| this.bg(cx.theme().accent.opacity(0.08)))
                             .on_click(cx.listener(move |this, _, _w, cx| {
                                 this.select_symbol(code.clone(), cx);
                             }))
@@ -256,17 +263,19 @@ impl StockApp {
             )
             .child(
                 h_flex()
-                    .h(px(32.))
-                    .px_2()
+                    .h(px(38.))
+                    .px_3()
                     .items_center()
                     .gap_1()
                     .border_t_1()
                     .border_color(cx.theme().border)
+                    .bg(cx.theme().background.opacity(0.30))
                     .child(
                         Button::new("add-sym")
-                            .ghost()
+                            .primary()
                             .xsmall()
-                            .label(if work { "+ Add" } else { "+ 添加" })
+                            .icon(IconName::Plus)
+                            .label(if work { "Add" } else { "添加自选" })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.toggle_palette(window, cx);
                             })),
@@ -275,7 +284,8 @@ impl StockApp {
                         Button::new("rm-sym")
                             .ghost()
                             .xsmall()
-                            .label(if work { "Remove" } else { "移除" })
+                            .icon(IconName::Delete)
+                            .tooltip(if work { "Remove" } else { "移除当前自选" })
                             .on_click(cx.listener(|this, _, _w, cx| {
                                 this.remove_selected_from_watchlist(cx);
                             })),
@@ -284,22 +294,13 @@ impl StockApp {
                         Button::new("wl-find")
                             .ghost()
                             .xsmall()
-                            .label(if work { "Find" } else { "去找票" })
+                            .icon(IconName::Search)
+                            .label(if work { "Find" } else { "发现机会" })
                             .on_click(cx.listener(|this, _, _w, cx| {
                                 this.set_left_tab(LeftTab::Treasure, cx);
                             })),
                     )
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground.opacity(0.75))
-                            .child(if work {
-                                "↑↓ · tag"
-                            } else {
-                                "↑↓ · 标分组"
-                            }),
-                    ),
+                    .child(div().flex_1()),
             )
     }
 }

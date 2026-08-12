@@ -31,8 +31,8 @@ use std::time::{Duration, Instant};
 use gpui::{
     App, AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
     KeyBinding, KeyDownEvent, KeyUpEvent, ParentElement, Pixels, Point, Render, SharedString,
-    Styled, Window, WindowBounds, WindowOptions, actions, div, point, prelude::FluentBuilder, px,
-    size,
+    Styled, Window, WindowBounds, WindowOptions, actions, div, hsla, point, prelude::FluentBuilder,
+    px, size,
 };
 use gpui_component::{
     ActiveTheme, PixelsExt, Root, TITLE_BAR_HEIGHT, Theme, ThemeMode, TitleBar,
@@ -83,6 +83,10 @@ actions!(
     [
         ToggleCommandPalette,
         RefreshData,
+        SelectTodayTask,
+        SelectResearchTask,
+        SelectOpportunitiesTask,
+        SelectPortfolioTask,
         ToggleTreasure,
         ToggleWorkMode,
         ToggleSettings,
@@ -899,6 +903,18 @@ impl Render for StockApp {
             .on_action(cx.listener(|this, _: &RefreshData, _w, cx| {
                 this.refresh_all(cx);
             }))
+            .on_action(cx.listener(|this, _: &SelectTodayTask, _w, cx| {
+                this.set_primary_task(state::PrimaryTask::Today, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectResearchTask, _w, cx| {
+                this.set_primary_task(state::PrimaryTask::Research, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectOpportunitiesTask, _w, cx| {
+                this.set_primary_task(state::PrimaryTask::Opportunities, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectPortfolioTask, _w, cx| {
+                this.set_primary_task(state::PrimaryTask::Portfolio, cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleTreasure, _w, cx| {
                 // Treasure UI is hidden in work mode; ignore hotkey there.
                 if !this.work_mode {
@@ -1108,11 +1124,75 @@ fn open_main_window(cx: &mut App) {
     cx.open_window(window_options, |window, cx| {
         window.activate_window();
         Theme::change(ThemeMode::Dark, Some(window), cx);
+        apply_zstock_theme(cx);
+        window.refresh();
         // Title is set inside StockApp::new (respects persisted work_mode).
         let view = cx.new(|cx| StockApp::new(window, cx));
         cx.new(|cx| Root::new(view, window, cx))
     })
     .expect("Failed to open window");
+}
+
+/// A calmer, higher-contrast visual system for dense market information.
+///
+/// The upstream dark theme is nearly black, which flattens cards, navigation,
+/// and charts into one surface. ZStock uses a blue-slate base so users can
+/// distinguish application chrome, working surfaces, and selected content at
+/// a glance without introducing decorative gradients or extra chrome.
+fn apply_zstock_theme(cx: &mut App) {
+    let theme = Theme::global_mut(cx);
+
+    theme.font_size = px(15.);
+    theme.radius = px(8.);
+    theme.radius_lg = px(12.);
+    theme.shadow = false;
+
+    theme.background = hsla(0.61, 0.30, 0.075, 1.0);
+    theme.sidebar = hsla(0.60, 0.28, 0.105, 1.0);
+    theme.title_bar = hsla(0.61, 0.32, 0.070, 1.0);
+    theme.title_bar_border = hsla(0.59, 0.22, 0.19, 1.0);
+    theme.popover = hsla(0.60, 0.30, 0.12, 1.0);
+    theme.popover_foreground = hsla(0.58, 0.24, 0.93, 1.0);
+    theme.foreground = hsla(0.58, 0.24, 0.93, 1.0);
+    theme.muted = hsla(0.60, 0.22, 0.16, 1.0);
+    theme.muted_foreground = hsla(0.58, 0.14, 0.64, 1.0);
+    theme.border = hsla(0.59, 0.22, 0.20, 1.0);
+    theme.input = hsla(0.59, 0.22, 0.24, 1.0);
+
+    theme.accent = hsla(0.57, 0.84, 0.62, 1.0);
+    theme.accent_foreground = hsla(0.61, 0.34, 0.09, 1.0);
+    theme.primary = hsla(0.57, 0.78, 0.57, 1.0);
+    theme.primary_hover = hsla(0.57, 0.82, 0.63, 1.0);
+    theme.primary_active = hsla(0.57, 0.72, 0.52, 1.0);
+    theme.primary_foreground = hsla(0.61, 0.34, 0.08, 1.0);
+    theme.ring = theme.accent.opacity(0.72);
+    theme.selection = theme.accent.opacity(0.24);
+
+    theme.list = theme.sidebar;
+    theme.list_head = hsla(0.60, 0.25, 0.13, 1.0);
+    theme.list_even = hsla(0.60, 0.24, 0.115, 1.0);
+    theme.list_hover = theme.accent.opacity(0.09);
+    theme.list_active = theme.accent.opacity(0.15);
+    theme.list_active_border = theme.accent.opacity(0.72);
+    theme.tab_bar = theme.sidebar;
+    theme.tab = theme.sidebar;
+    theme.tab_active = theme.accent.opacity(0.14);
+    theme.tab_active_foreground = theme.foreground;
+    theme.tab_foreground = theme.muted_foreground;
+
+    theme.success = hsla(0.45, 0.62, 0.55, 1.0);
+    theme.warning = hsla(0.11, 0.86, 0.64, 1.0);
+    theme.danger = hsla(0.985, 0.78, 0.66, 1.0);
+    theme.red = hsla(0.985, 0.78, 0.66, 1.0);
+    theme.green = hsla(0.45, 0.62, 0.55, 1.0);
+    theme.blue = hsla(0.57, 0.84, 0.62, 1.0);
+    theme.yellow = hsla(0.11, 0.86, 0.64, 1.0);
+    theme.cyan = hsla(0.51, 0.68, 0.59, 1.0);
+    theme.magenta = hsla(0.83, 0.64, 0.68, 1.0);
+
+    theme.scrollbar = theme.background.opacity(0.45);
+    theme.scrollbar_thumb = theme.muted_foreground.opacity(0.28);
+    theme.scrollbar_thumb_hover = theme.muted_foreground.opacity(0.46);
 }
 
 pub fn run() {
@@ -1153,6 +1233,22 @@ pub fn run() {
             KeyBinding::new("cmd-r", RefreshData, None),
             #[cfg(not(target_os = "macos"))]
             KeyBinding::new("ctrl-r", RefreshData, None),
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-1", SelectTodayTask, Some("stock && !Input")),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-1", SelectTodayTask, Some("stock && !Input")),
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-2", SelectResearchTask, Some("stock && !Input")),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-2", SelectResearchTask, Some("stock && !Input")),
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-3", SelectOpportunitiesTask, Some("stock && !Input")),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-3", SelectOpportunitiesTask, Some("stock && !Input")),
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-4", SelectPortfolioTask, Some("stock && !Input")),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-4", SelectPortfolioTask, Some("stock && !Input")),
             #[cfg(target_os = "macos")]
             KeyBinding::new("cmd-t", ToggleTreasure, None),
             #[cfg(not(target_os = "macos"))]

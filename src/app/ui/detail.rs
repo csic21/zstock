@@ -37,12 +37,13 @@ impl StockApp {
             // Tab strip：功能分区，一次只看一类信息
             .child(
                 h_flex()
-                    .h(px(34.))
-                    .px_2()
+                    .h(px(40.))
+                    .px_3()
                     .items_center()
                     .gap_1()
                     .border_b_1()
                     .border_color(cx.theme().border)
+                    .bg(cx.theme().background.opacity(0.30))
                     // Primary analysis tabs only — lists live in the left sidebar.
                     .children(DetailTab::dock_tabs().map(|tab| {
                         let is_on = active == tab;

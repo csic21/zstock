@@ -30,8 +30,8 @@ impl StockApp {
             .flex()
             .items_start()
             .justify_center()
-            .pt(px(72.))
-            .bg(gpui::hsla(0., 0., 0., 0.55))
+            .pt(px(88.))
+            .bg(gpui::hsla(0.61, 0.35, 0.035, 0.72))
             // Same modal isolation as the settings overlay: don't let wheel
             // scrolling or hover styles reach the app behind the palette.
             .occlude()
@@ -55,11 +55,11 @@ impl StockApp {
                 v_flex()
                     .id("palette-panel")
                     .key_context("stock_palette")
-                    .w(px(560.))
-                    .max_h(px(480.))
+                    .w(px(620.))
+                    .max_h(px(520.))
                     .rounded(cx.theme().radius_lg)
                     .border_1()
-                    .border_color(cx.theme().border)
+                    .border_color(cx.theme().accent.opacity(0.28))
                     .bg(cx.theme().popover)
                     .overflow_hidden()
                     .on_mouse_down_out(cx.listener(|this, _, _w, cx| {

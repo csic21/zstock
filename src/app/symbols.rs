@@ -164,6 +164,17 @@ impl StockApp {
     }
 
     pub(crate) fn set_left_tab(&mut self, tab: LeftTab, cx: &mut Context<Self>) {
+        if !self.work_mode {
+            let task = match tab {
+                LeftTab::Watchlist => crate::app::state::PrimaryTask::Research,
+                LeftTab::Portfolio => crate::app::state::PrimaryTask::Portfolio,
+                LeftTab::Treasure => crate::app::state::PrimaryTask::Opportunities,
+            };
+            if self.ui_state.primary_task != task {
+                self.set_primary_task(task, cx);
+                return;
+            }
+        }
         if self.left_tab == tab {
             return;
         }
