@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.93.1
+          toolchain: 1.97.1
       - uses: Swatinem/rust-cache@v2
       - name: Run ignored network smoke tests
         run: cargo test --all-targets -- --ignored --test-threads=1

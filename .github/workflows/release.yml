@@ -26,7 +26,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.93.1
+          toolchain: 1.97.1
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
@@ -113,7 +113,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.93.1
+          toolchain: 1.97.1
           targets: x86_64-apple-darwin, aarch64-apple-darwin
 
       - name: Cache Cargo
@@ -202,7 +202,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.93.1
+          toolchain: 1.97.1
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2

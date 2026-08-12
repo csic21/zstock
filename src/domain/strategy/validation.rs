@@ -181,25 +181,21 @@ fn validate_expression(
     errors: &mut Vec<ValidationError>,
 ) {
     match expression {
-        super::expression::Expression::All { all } => {
-            if all.is_empty() {
-                push(
-                    errors,
-                    "empty_all",
-                    path,
-                    "all must contain at least one condition",
-                );
-            }
+        super::expression::Expression::All { all } if all.is_empty() => {
+            push(
+                errors,
+                "empty_all",
+                path,
+                "all must contain at least one condition",
+            );
         }
-        super::expression::Expression::Any { any } => {
-            if any.is_empty() {
-                push(
-                    errors,
-                    "empty_any",
-                    path,
-                    "any must contain at least one condition",
-                );
-            }
+        super::expression::Expression::Any { any } if any.is_empty() => {
+            push(
+                errors,
+                "empty_any",
+                path,
+                "any must contain at least one condition",
+            );
         }
         _ => {}
     }

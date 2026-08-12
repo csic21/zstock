@@ -571,6 +571,7 @@ impl StockApp {
                                 chrono::Local::now().format("%H:%M:%S")
                             ));
                         }
+                        #[allow(clippy::collapsible_match)]
                         Some(Err(e)) => {
                             if app.candles_code.as_deref() != Some(req_code.as_str()) {
                                 app.status = shared(format!("分时加载失败: {e}"));
@@ -594,6 +595,7 @@ impl StockApp {
                                 chrono::Local::now().format("%H:%M:%S")
                             ));
                         }
+                        #[allow(clippy::collapsible_match)]
                         Some(Err(e)) => {
                             if app.candles_code.as_deref() != Some(req_code.as_str()) {
                                 app.status = shared(format!("K线加载失败: {e}"));
