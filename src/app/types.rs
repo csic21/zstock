@@ -126,14 +126,6 @@ pub(crate) enum MarketRegion {
     Us,
 }
 
-/// Navigation level inside the market heatmap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum MarketHeatmapLevel {
-    #[default]
-    Industries,
-    TailIndustries,
-}
-
 impl MarketRegion {
     pub(crate) fn label(self) -> &'static str {
         match self {

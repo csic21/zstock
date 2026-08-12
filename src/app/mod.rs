@@ -24,6 +24,7 @@ mod ui;
 mod view_models;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -72,8 +73,8 @@ use state::{
     RuntimeState, UiState,
 };
 use types::{
-    AiCacheEntry, AiPanelState, AiSource, ChartKind, ChartRange, DetailTab, LeftTab,
-    MarketHeatmapLevel, MarketRegion, SettingsSection,
+    AiCacheEntry, AiPanelState, AiSource, ChartKind, ChartRange, DetailTab, LeftTab, MarketRegion,
+    SettingsSection,
 };
 
 actions!(
@@ -194,9 +195,14 @@ pub struct AppState {
     market_analysis_region: MarketRegion,
     /// Real-time A-share industry sectors.
     market_analysis_sectors: Vec<market_data::SectorTick>,
-    /// Current navigation level and presentation inside the industry heatmap.
-    market_heatmap_level: MarketHeatmapLevel,
+    /// Complete Shenwan level-1 -> level-2 -> stock heatmap hierarchy.
+    market_heatmap_sectors: Arc<Vec<market_data::IndustryHeatmapSector>>,
+    /// Current presentation inside the industry heatmap.
     market_heatmap_list: bool,
+    /// Focus mode where the heatmap fills the whole market-analysis viewport.
+    market_heatmap_fullscreen: bool,
+    market_heatmap_loading: bool,
+    market_heatmap_error: Option<SharedString>,
     market_analysis_loading: bool,
     market_analysis_error: Option<SharedString>,
     market_analysis_source: SharedString,
@@ -653,8 +659,11 @@ impl StockApp {
                 market_analysis_open: false,
                 market_analysis_region: MarketRegion::AShare,
                 market_analysis_sectors: Vec::new(),
-                market_heatmap_level: MarketHeatmapLevel::Industries,
+                market_heatmap_sectors: Arc::new(Vec::new()),
                 market_heatmap_list: false,
+                market_heatmap_fullscreen: false,
+                market_heatmap_loading: false,
+                market_heatmap_error: None,
                 market_analysis_loading: false,
                 market_analysis_error: None,
                 market_analysis_source: shared(market_data::SRC_EASTMONEY),
@@ -1210,11 +1219,67 @@ mod keymap_tests {
 
 #[cfg(test)]
 mod layout_regression_tests {
+    use std::sync::Arc;
+
     use super::StockApp;
     use gpui::{
         AnyWindowHandle, AppContext, TestAppContext, VisualContext, VisualTestContext, px, size,
     };
     use gpui_component::PixelsExt;
+
+    use crate::data::eastmoney::{
+        IndustryHeatmapSector, IndustryStockGroup, QuoteTick, SectorTick,
+    };
+    use crate::domain::market::{Availability, Freshness};
+    use crate::domain::money::Currency;
+
+    fn full_heatmap_fixture() -> Arc<Vec<IndustryHeatmapSector>> {
+        let mut next_code = 600_000u32;
+        let mut sectors = Vec::with_capacity(31);
+        for sector_index in 0..31 {
+            let mut industries = Vec::with_capacity(4);
+            for industry_index in 0..4 {
+                let mut stocks = Vec::with_capacity(44);
+                for stock_index in 0..44 {
+                    let code = format!("{next_code:06}");
+                    next_code += 1;
+                    let amount = f64::from(45 - stock_index) * 1_000_000.0;
+                    stocks.push(QuoteTick {
+                        code,
+                        name: format!("个股{sector_index:02}{industry_index}{stock_index:02}"),
+                        last: 10.0 + f64::from(stock_index),
+                        change_pct: f64::from(stock_index % 9 - 4) * 0.8,
+                        volume: 10_000,
+                        amount,
+                        currency: Currency::Cny,
+                        source: "fixture".into(),
+                        fetched_at: 0,
+                        market_time: None,
+                        availability: Availability::Available,
+                        freshness: Freshness::Live,
+                    });
+                }
+                industries.push(IndustryStockGroup {
+                    name: format!("二级行业{sector_index:02}-{industry_index}"),
+                    amount: stocks.iter().map(|stock| stock.amount).sum(),
+                    stocks,
+                });
+            }
+            sectors.push(IndustryHeatmapSector {
+                sector: SectorTick {
+                    code: format!("BK{sector_index:04}"),
+                    name: format!("一级行业{sector_index:02}"),
+                    change_pct: 0.0,
+                    amount: industries.iter().map(|industry| industry.amount).sum(),
+                    advances: 0,
+                    declines: 0,
+                    unchanged: 0,
+                },
+                industries,
+            });
+        }
+        Arc::new(sectors)
+    }
 
     /// Shared window/App setup for layout regression tests: isolated HOME and a
     /// deterministic default config (work mode off, fixed dock) so results do
@@ -1376,6 +1441,85 @@ mod layout_regression_tests {
             (panel.size.height.as_f32() - 566.0).abs() < 1.0,
             "settings page should fill 600-34 height, got {}",
             panel.size.height.as_f32()
+        );
+    }
+
+    /// The normal heatmap is taller than the original compact view, while its
+    /// focus mode must consume the available market-analysis viewport instead
+    /// of leaving the rest of the dashboard visible around it.
+    #[gpui::test]
+    fn market_heatmap_expands_in_fullscreen_mode(cx: &mut TestAppContext) {
+        let mut window = test_window(cx, 1600.0, 900.0);
+        window.run_until_parked();
+        let handle = window.window_handle();
+        let update_result = window.cx.update_window(handle, |view, _window, cx| {
+            view.downcast::<StockApp>()
+                .expect("window root view")
+                .update(cx, |this, cx| {
+                    this.market_analysis_open = true;
+                    this.market_heatmap_sectors = full_heatmap_fixture();
+                    this.market_heatmap_loading = false;
+                    cx.notify();
+                });
+        });
+        assert!(
+            update_result.is_ok(),
+            "market analysis update should succeed"
+        );
+        window.run_until_parked();
+        window.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let normal = window
+            .debug_bounds("market-sector-heatmap")
+            .expect("normal heatmap bounds");
+        assert!(
+            (normal.size.height.as_f32() - 440.0).abs() < 1.0,
+            "normal heatmap should be 440px tall, got {}",
+            normal.size.height.as_f32()
+        );
+        let first_stock = window
+            .debug_bounds("market-heatmap-first-stock")
+            .expect("first stock tile bounds");
+        assert!(first_stock.size.width.as_f32() > 0.0);
+        assert!(first_stock.size.height.as_f32() > 0.0);
+
+        let update_result = window.cx.update_window(handle, |view, _window, cx| {
+            view.downcast::<StockApp>()
+                .expect("window root view")
+                .update(cx, |this, cx| {
+                    this.toggle_market_heatmap_fullscreen(cx);
+                });
+        });
+        assert!(update_result.is_ok(), "fullscreen update should succeed");
+        window.run_until_parked();
+        window.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let page = window
+            .debug_bounds("market-analysis-heatmap-fullscreen")
+            .expect("fullscreen heatmap page bounds");
+        let expanded = window
+            .debug_bounds("market-sector-heatmap")
+            .expect("fullscreen heatmap bounds");
+        assert!(
+            (page.size.height.as_f32() - 866.0).abs() < 1.0,
+            "fullscreen page should fill the content area, got {}",
+            page.size.height.as_f32()
+        );
+        assert!(
+            expanded.size.height.as_f32() > normal.size.height.as_f32() + 250.0,
+            "fullscreen heatmap should grow vertically: normal={}, expanded={}",
+            normal.size.height.as_f32(),
+            expanded.size.height.as_f32()
+        );
+        assert!(
+            expanded.size.width.as_f32() > normal.size.width.as_f32() + 250.0,
+            "fullscreen heatmap should grow horizontally: normal={}, expanded={}",
+            normal.size.width.as_f32(),
+            expanded.size.width.as_f32()
         );
     }
 }

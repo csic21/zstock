@@ -1,5 +1,7 @@
 //! State and data loading for the full-page market analysis view.
 
+use std::sync::Arc;
+
 use gpui::Context;
 
 use crate::data::{
@@ -8,7 +10,7 @@ use crate::data::{
 };
 use crate::model::shared;
 
-use super::{AiPanelState, AiSource, MarketHeatmapLevel, MarketRegion, StockApp};
+use super::{AiPanelState, AiSource, MarketRegion, StockApp};
 
 impl StockApp {
     pub(crate) fn open_market_analysis(&mut self, cx: &mut Context<Self>) {
@@ -16,8 +18,8 @@ impl StockApp {
         self.palette_open = false;
         self.market_analysis_open = true;
         if self.market_analysis_region == MarketRegion::AShare
-            && self.market_analysis_sectors.is_empty()
-            && !self.market_analysis_loading
+            && ((self.market_analysis_sectors.is_empty() && !self.market_analysis_loading)
+                || (self.market_heatmap_sectors.is_empty() && !self.market_heatmap_loading))
         {
             self.refresh_market_analysis(cx);
         } else {
@@ -30,6 +32,7 @@ impl StockApp {
             return;
         }
         self.market_analysis_open = false;
+        self.market_heatmap_fullscreen = false;
         cx.notify();
     }
 
@@ -59,6 +62,8 @@ impl StockApp {
         let generation = self.market_analysis_gen;
         self.market_analysis_loading = true;
         self.market_analysis_error = None;
+        self.market_heatmap_loading = true;
+        self.market_heatmap_error = None;
         cx.notify();
 
         // The sector list and index quotes are independent requests so the page
@@ -82,6 +87,30 @@ impl StockApp {
                     }
                     Err(e) => {
                         app.market_analysis_error = Some(shared(format!("板块数据暂不可用：{e}")));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+
+        cx.spawn(async move |this, cx| {
+            let result = smol::unblock(eastmoney::fetch_a_share_industry_heatmap).await;
+            let _ = this.update(cx, |app, cx| {
+                if app.market_analysis_gen != generation {
+                    return;
+                }
+                app.market_heatmap_loading = false;
+                match result {
+                    Ok(groups) if !groups.is_empty() => {
+                        app.market_heatmap_sectors = Arc::new(groups);
+                    }
+                    Ok(_) => {
+                        app.market_heatmap_error = Some(shared("全景热力图数据为空"));
+                    }
+                    Err(error) => {
+                        app.market_heatmap_error =
+                            Some(shared(format!("全景热力图暂不可用：{error}")));
                     }
                 }
                 cx.notify();
@@ -242,7 +271,7 @@ impl StockApp {
         cx.spawn(async move |this, cx| {
             let code_fetch = code.clone();
             let result =
-                smol::unblock(move || market::fetch_sector_constituents(&code_fetch, 40)).await;
+                smol::unblock(move || market::fetch_sector_constituents(&code_fetch, 1000)).await;
             let _ = this.update(cx, |app, cx| {
                 if app.sector_drill_gen != drill_id {
                     return;
@@ -272,12 +301,6 @@ impl StockApp {
         cx.notify();
     }
 
-    pub(crate) fn open_market_heatmap_tail(&mut self, cx: &mut Context<Self>) {
-        self.clear_sector_drill_state();
-        self.market_heatmap_level = MarketHeatmapLevel::TailIndustries;
-        cx.notify();
-    }
-
     pub(crate) fn set_market_heatmap_list(&mut self, list: bool, cx: &mut Context<Self>) {
         if self.market_heatmap_list == list {
             return;
@@ -286,17 +309,18 @@ impl StockApp {
         cx.notify();
     }
 
+    pub(crate) fn toggle_market_heatmap_fullscreen(&mut self, cx: &mut Context<Self>) {
+        self.market_heatmap_fullscreen = !self.market_heatmap_fullscreen;
+        cx.notify();
+    }
+
     pub(crate) fn market_heatmap_can_go_back(&self) -> bool {
         self.sector_drill_code.is_some()
-            || self.market_heatmap_level == MarketHeatmapLevel::TailIndustries
     }
 
     pub(crate) fn back_market_heatmap(&mut self, cx: &mut Context<Self>) {
         if self.sector_drill_code.is_some() {
             self.clear_sector_drill(cx);
-        } else if self.market_heatmap_level == MarketHeatmapLevel::TailIndustries {
-            self.market_heatmap_level = MarketHeatmapLevel::Industries;
-            cx.notify();
         }
     }
 
@@ -319,6 +343,7 @@ impl StockApp {
         self.ensure_in_watchlist(&code, &name, last);
         self.set_watch_tag(&code, crate::data::groups::WatchTag::Short, cx);
         self.market_analysis_open = false;
+        self.market_heatmap_fullscreen = false;
         self.select_symbol(shared(code), cx);
     }
 }

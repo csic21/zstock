@@ -7,8 +7,11 @@
 //!
 //! These are free for personal tooling but have no SLA; rate-limit politely.
 
-use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{
+    LazyLock,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -77,6 +80,21 @@ pub struct SectorTick {
     pub unchanged: u64,
 }
 
+/// One mutually-exclusive Shenwan level-2 industry inside a level-1 sector.
+#[derive(Debug, Clone)]
+pub struct IndustryStockGroup {
+    pub name: String,
+    pub amount: f64,
+    pub stocks: Vec<QuoteTick>,
+}
+
+/// Complete, paginated stock membership for one Shenwan level-1 industry.
+#[derive(Debug, Clone)]
+pub struct IndustryHeatmapSector {
+    pub sector: SectorTick,
+    pub industries: Vec<IndustryStockGroup>,
+}
+
 /// Process-wide agent so keep-alive sockets are reused across quote polls.
 static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
     ureq::AgentBuilder::new()
@@ -96,6 +114,15 @@ const PUSH2_HOSTS: &[&str] = &[
     "80.push2.eastmoney.com",
     "push2delay.eastmoney.com",
 ];
+
+const CLIST_PAGE_SIZE: usize = 100;
+const MAX_SECTOR_CONSTITUENTS: usize = 1000;
+const HEATMAP_FETCH_CONCURRENCY: usize = 6;
+/// Eastmoney's own first-level industry taxonomy. Keeping one level avoids
+/// counting parent and child boards as siblings in a treemap.
+const EASTMONEY_LEVEL_ONE_INDUSTRIES: &str = "m:90%2Bs:2%2Bf:!50";
+const EASTMONEY_LEVEL_TWO_INDUSTRIES: &str = "m:90%2Bs:4%2Bf:!50";
+const EASTMONEY_A_SHARE_UNIVERSE: &str = "m:0%2Bt:6,m:0%2Bt:80,m:1%2Bt:2,m:1%2Bt:23";
 
 /// Prefer delay node first when the request includes 港股（主节点对 116.* 常 empty-reply）。
 const PUSH2_HOSTS_HK: &[&str] = &[
@@ -782,25 +809,310 @@ pub fn fetch_major_indices() -> Result<Vec<QuoteTick>> {
 
 /// A 股行业板块涨跌榜（东财行业口径）。
 pub fn fetch_a_share_industry_sectors() -> Result<Vec<SectorTick>> {
-    // Request the complete industry-board universe. The UI presents the
-    // result in a scrollable list instead of silently dropping rows.
-    let path = "/api/qt/clist/get?\
-        pn=1&pz=2000&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281\
-        &fltt=2&invt=2&fid=f3&fs=m:90%2Bt:2\
-        &fields=f12,f14,f2,f3,f4,f5,f6,f104,f105,f106";
-    let mut last_err = anyhow!("板块接口未返回数据");
-    for host in PUSH2_HOSTS {
-        let url = format!("https://{host}{path}");
-        match get_json(&url).and_then(parse_sector_diff) {
-            Ok(data) if !data.is_empty() => return Ok(data),
-            Ok(_) => last_err = anyhow!("板块数据为空"),
-            Err(e) => last_err = e,
-        }
-    }
-    Err(anyhow!("板块行情不可用: {last_err}"))
+    // Eastmoney exposes levels 1/2/3 separately. The broad `m:90+t:2`
+    // filter mixes all levels and silently caps responses at 100 rows.
+    fetch_complete_industry_sectors(EASTMONEY_LEVEL_ONE_INDUSTRIES, "申万一级")
 }
 
-/// 行业板块成分股（按涨跌幅降序，东财 `fs=b:BKxxxx`）。
+fn fetch_complete_industry_sectors(filter: &str, level_label: &str) -> Result<Vec<SectorTick>> {
+    let mut page = 1;
+    let mut raw_rows = 0usize;
+    let mut expected_total = None;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    loop {
+        let path = format!(
+            "/api/qt/clist/get?\
+             pn={page}&pz={CLIST_PAGE_SIZE}&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281\
+             &fltt=2&invt=2&fid=f6&fs={filter}\
+             &fields=f12,f14,f2,f3,f4,f5,f6,f104,f105,f106"
+        );
+        let mut last_err = anyhow!("{level_label}行业接口未返回数据");
+        let mut response = None;
+        for host in PUSH2_HOSTS {
+            let url = format!("https://{host}{path}");
+            match get_json(&url) {
+                Ok(value) => {
+                    response = Some(value);
+                    break;
+                }
+                Err(error) => last_err = error,
+            }
+        }
+        let value = response.ok_or_else(|| anyhow!("{level_label}行业不可用: {last_err}"))?;
+        let total = clist_total(&value).ok_or_else(|| anyhow!("{level_label}行业缺少总数"))?;
+        if let Some(expected) = expected_total {
+            if total != expected {
+                bail!("{level_label}行业分页总数变化：{expected} -> {total}");
+            }
+        } else {
+            expected_total = Some(total);
+        }
+        let received_count = clist_row_count(&value);
+        raw_rows += received_count;
+        for sector in parse_sector_diff(value)? {
+            if seen.insert(sector.code.clone()) {
+                out.push(sector);
+            }
+        }
+        if raw_rows >= total || received_count < CLIST_PAGE_SIZE {
+            if raw_rows < total || out.len() != total {
+                bail!(
+                    "{level_label}行业数据不完整：原始 {raw_rows}，去重 {}，应有 {total}",
+                    out.len()
+                );
+            }
+            break;
+        }
+        page += 1;
+    }
+    Ok(out)
+}
+
+fn fetch_a_share_stock_total() -> Result<usize> {
+    let path = format!(
+        "/api/qt/clist/get?\
+         pn=1&pz=1&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281\
+         &fltt=2&invt=2&fid=f6&fs={EASTMONEY_A_SHARE_UNIVERSE}&fields=f12"
+    );
+    let mut last_err = anyhow!("全 A 股接口未返回数据");
+    for host in PUSH2_HOSTS {
+        let url = format!("https://{host}{path}");
+        match get_json(&url)
+            .and_then(|value| clist_total(&value).ok_or_else(|| anyhow!("全 A 股接口缺少总数")))
+        {
+            Ok(total) if total > 0 => return Ok(total),
+            Ok(_) => last_err = anyhow!("全 A 股总数为 0"),
+            Err(error) => last_err = error,
+        }
+    }
+    Err(anyhow!("全 A 股总数不可用: {last_err}"))
+}
+
+/// Complete A-share heatmap hierarchy using Shenwan's mutually-exclusive
+/// level-1 -> level-2 -> stock classification.
+///
+/// Eastmoney caps every `clist` response at 100 rows even when a larger `pz`
+/// is requested. Each of the 31 level-1 boards is therefore paginated to its
+/// reported `data.total`; `f100` supplies the level-2 industry for every
+/// constituent. A small fixed worker pool keeps the full-market refresh fast
+/// without sending an unbounded burst of requests.
+pub fn fetch_a_share_industry_heatmap() -> Result<Vec<IndustryHeatmapSector>> {
+    let mut sectors = fetch_a_share_industry_sectors()?;
+    sectors.sort_by(|left, right| {
+        right
+            .amount
+            .total_cmp(&left.amount)
+            .then_with(|| left.code.cmp(&right.code))
+    });
+    if sectors.is_empty() {
+        bail!("一级行业为空");
+    }
+
+    let next = AtomicUsize::new(0);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker_count = HEATMAP_FETCH_CONCURRENCY.min(sectors.len());
+    let groups = std::thread::scope(|scope| -> Result<Vec<IndustryHeatmapSector>> {
+        for _ in 0..worker_count {
+            let sender = sender.clone();
+            let sectors = &sectors;
+            let next = &next;
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(sector) = sectors.get(index).cloned() else {
+                        break;
+                    };
+                    let result = fetch_complete_sector_heatmap(sector);
+                    if sender.send((index, result)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+
+        let mut ordered = vec![None; sectors.len()];
+        for _ in 0..sectors.len() {
+            let (index, result) = receiver
+                .recv()
+                .map_err(|_| anyhow!("行业热力图任务提前结束"))?;
+            ordered[index] = Some(result?);
+        }
+        ordered
+            .into_iter()
+            .map(|group| group.ok_or_else(|| anyhow!("行业热力图缺少分组")))
+            .collect()
+    })?;
+
+    let level_two = fetch_complete_industry_sectors(EASTMONEY_LEVEL_TWO_INDUSTRIES, "申万二级")?;
+    let expected_industries = level_two
+        .into_iter()
+        .map(|sector| sector.name)
+        .collect::<HashSet<_>>();
+    let expected_stock_total = fetch_a_share_stock_total()?;
+    validate_heatmap_coverage(&groups, &expected_industries, expected_stock_total)?;
+    Ok(groups)
+}
+
+fn validate_heatmap_coverage(
+    groups: &[IndustryHeatmapSector],
+    expected_industries: &HashSet<String>,
+    expected_stock_total: usize,
+) -> Result<()> {
+    let mut owners = HashMap::<String, String>::new();
+    let mut industry_owners = HashMap::<String, String>::new();
+    for group in groups {
+        for industry in &group.industries {
+            if let Some(previous) =
+                industry_owners.insert(industry.name.clone(), group.sector.name.clone())
+                && previous != group.sector.name
+            {
+                bail!(
+                    "申万二级行业归属重叠：{} 同时属于 {} / {}",
+                    industry.name,
+                    previous,
+                    group.sector.name
+                );
+            }
+            for stock in &industry.stocks {
+                if let Some(previous) = owners.insert(stock.code.clone(), group.sector.name.clone())
+                    && previous != group.sector.name
+                {
+                    bail!(
+                        "申万一级行业成分重叠：{} 同时属于 {} / {}",
+                        stock.code,
+                        previous,
+                        group.sector.name
+                    );
+                }
+            }
+        }
+    }
+    let actual_industries = industry_owners.keys().cloned().collect::<HashSet<_>>();
+    if *expected_industries != actual_industries {
+        let mut missing = expected_industries
+            .difference(&actual_industries)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut unexpected = actual_industries
+            .difference(expected_industries)
+            .cloned()
+            .collect::<Vec<_>>();
+        missing.sort_unstable();
+        unexpected.sort_unstable();
+        bail!(
+            "申万二级行业集合不完整：缺少 [{}]，额外 [{}]",
+            missing.join(", "),
+            unexpected.join(", ")
+        );
+    }
+    if owners.len() != expected_stock_total {
+        bail!(
+            "全 A 股覆盖不完整：行业成分 {} / 全市场 {expected_stock_total}",
+            owners.len()
+        );
+    }
+    Ok(())
+}
+
+fn fetch_complete_sector_heatmap(sector: SectorTick) -> Result<IndustryHeatmapSector> {
+    let code = sector.code.trim();
+    if code.is_empty() {
+        bail!("板块代码为空");
+    }
+    let mut page = 1;
+    let mut raw_rows = 0usize;
+    let mut expected_total = None;
+    let mut seen = HashSet::new();
+    let mut classified = Vec::new();
+
+    loop {
+        let path = format!(
+            "/api/qt/clist/get?pn={page}&pz={CLIST_PAGE_SIZE}&po=1&np=1\
+             &ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2\
+             &fid=f6&fs=b:{code}&fields=f12,f14,f2,f3,f5,f6,f15,f16,f17,f18,f100"
+        );
+        let mut last_err = anyhow!("板块成分接口未返回");
+        let mut response = None;
+        for host in PUSH2_HOSTS {
+            let url = format!("https://{host}{path}");
+            match get_json(&url) {
+                Ok(value) => {
+                    response = Some(value);
+                    break;
+                }
+                Err(error) => last_err = error,
+            }
+        }
+        let value = response.ok_or_else(|| anyhow!("{} 成分不可用: {last_err}", sector.name))?;
+        let total = clist_total(&value).ok_or_else(|| anyhow!("{} 缺少成分总数", sector.name))?;
+        if let Some(expected) = expected_total {
+            if total != expected {
+                bail!("{} 分页总数变化：{expected} -> {total}", sector.name);
+            }
+        } else {
+            expected_total = Some(total);
+        }
+        let received_count = clist_row_count(&value);
+        raw_rows += received_count;
+        for (industry, quote) in parse_classified_quote_diff(value)? {
+            if seen.insert(quote.code.clone()) {
+                classified.push((industry, quote));
+            }
+        }
+
+        if raw_rows >= total || received_count < CLIST_PAGE_SIZE {
+            if raw_rows < total {
+                bail!("{} 成分数据不完整：返回 {raw_rows} / {total}", sector.name);
+            }
+            if classified.len() != total {
+                bail!(
+                    "{} 成分去重后数量异常：{} / {total}",
+                    sector.name,
+                    classified.len()
+                );
+            }
+            break;
+        }
+        page += 1;
+    }
+
+    let industries = group_classified_quotes(classified);
+    Ok(IndustryHeatmapSector { sector, industries })
+}
+
+fn group_classified_quotes(classified: Vec<(String, QuoteTick)>) -> Vec<IndustryStockGroup> {
+    let mut by_industry = BTreeMap::<String, Vec<QuoteTick>>::new();
+    for (industry, quote) in classified {
+        by_industry.entry(industry).or_default().push(quote);
+    }
+    let mut industries = by_industry
+        .into_iter()
+        .map(|(name, mut stocks)| {
+            stocks.sort_by(|left, right| {
+                right
+                    .amount
+                    .total_cmp(&left.amount)
+                    .then_with(|| left.code.cmp(&right.code))
+            });
+            IndustryStockGroup {
+                amount: stocks.iter().map(|stock| stock.amount.max(0.0)).sum(),
+                name,
+                stocks,
+            }
+        })
+        .collect::<Vec<_>>();
+    industries.sort_by(|left, right| {
+        right
+            .amount
+            .total_cmp(&left.amount)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    industries
+}
+
+/// 行业板块成分股（按成交额降序，东财 `fs=b:BKxxxx`）。
 ///
 /// 用于市场分析页「点板块 → 看成分」下钻。
 pub fn fetch_sector_constituents(sector_code: &str, limit: usize) -> Result<Vec<QuoteTick>> {
@@ -808,26 +1120,73 @@ pub fn fetch_sector_constituents(sector_code: &str, limit: usize) -> Result<Vec<
     if code.is_empty() {
         bail!("板块代码为空");
     }
-    let limit = limit.clamp(5, 80);
-    let path = format!(
-        "/api/qt/clist/get?pn=1&pz={limit}&po=1&np=1\
-         &ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2\
-         &fid=f3&fs=b:{code}&fields=f12,f14,f2,f3,f5,f6,f15,f16,f17,f18"
-    );
-    let mut last_err = anyhow!("板块成分接口未返回");
-    for host in PUSH2_HOSTS {
-        let url = format!("https://{host}{path}");
-        match get_json(&url).and_then(parse_quote_diff) {
-            Ok(data) if !data.is_empty() => {
-                let mut data = data;
-                data.truncate(limit);
-                return Ok(data);
+    let limit = limit.clamp(5, MAX_SECTOR_CONSTITUENTS);
+    let mut page = 1;
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    loop {
+        let path = format!(
+            "/api/qt/clist/get?pn={page}&pz={CLIST_PAGE_SIZE}&po=1&np=1\
+             &ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2\
+             &fid=f6&fs=b:{code}&fields=f12,f14,f2,f3,f5,f6,f15,f16,f17,f18"
+        );
+        let mut last_err = anyhow!("板块成分接口未返回");
+        let mut response = None;
+        for host in PUSH2_HOSTS {
+            let url = format!("https://{host}{path}");
+            match get_json(&url) {
+                Ok(value) => {
+                    response = Some(value);
+                    break;
+                }
+                Err(error) => last_err = error,
             }
-            Ok(_) => last_err = anyhow!("板块成分为空"),
-            Err(e) => last_err = e,
         }
+        let value = response.ok_or_else(|| anyhow!("板块成分不可用: {last_err}"))?;
+        let total = clist_total(&value);
+        let received_count = clist_row_count(&value);
+        let rows = parse_quote_diff(value)?;
+        for row in rows {
+            if seen.insert(row.code.clone()) {
+                out.push(row);
+            }
+        }
+
+        if out.len() >= limit
+            || total.is_some_and(|total| out.len() >= total)
+            || received_count < CLIST_PAGE_SIZE
+        {
+            break;
+        }
+        page += 1;
     }
-    Err(anyhow!("板块成分不可用: {last_err}"))
+
+    if out.is_empty() {
+        bail!("板块成分为空");
+    }
+    out.sort_by(|left, right| {
+        right
+            .amount
+            .total_cmp(&left.amount)
+            .then_with(|| left.code.cmp(&right.code))
+    });
+    out.truncate(limit);
+    Ok(out)
+}
+
+fn clist_total(value: &Value) -> Option<usize> {
+    value
+        .pointer("/data/total")
+        .and_then(Value::as_u64)
+        .and_then(|total| usize::try_from(total).ok())
+}
+
+fn clist_row_count(value: &Value) -> usize {
+    value
+        .pointer("/data/diff")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len)
 }
 
 fn parse_sector_diff(v: Value) -> Result<Vec<SectorTick>> {
@@ -872,44 +1231,63 @@ fn parse_quote_diff(v: Value) -> Result<Vec<QuoteTick>> {
         .and_then(|d| d.as_array())
         .ok_or_else(|| anyhow!("行情数据为空或格式异常"))?;
 
-    let mut out = Vec::with_capacity(diff.len());
-    for item in diff {
-        let code = item
-            .get("f12")
-            .and_then(|x| x.as_str())
-            .unwrap_or_default()
-            .to_string();
-        if code.is_empty() {
-            continue;
-        }
-        let Some(currency) = Currency::for_code(&code) else {
-            continue;
-        };
-        let last = num_f64(item.get("f2"));
-        out.push(QuoteTick {
-            code,
-            name: item
-                .get("f14")
-                .and_then(|x| x.as_str())
-                .unwrap_or("--")
-                .to_string(),
-            last,
-            change_pct: num_f64(item.get("f3")),
-            volume: num_f64(item.get("f5")) as u64,
-            amount: num_f64(item.get("f6")),
-            currency,
-            source: "东方财富".into(),
-            fetched_at: chrono::Utc::now().timestamp_millis(),
-            market_time: None,
-            availability: if last > 0.0 {
-                Availability::Available
-            } else {
-                Availability::Invalid
-            },
-            freshness: Freshness::Live,
-        });
+    Ok(diff.iter().filter_map(parse_quote_item).collect())
+}
+
+fn parse_classified_quote_diff(v: Value) -> Result<Vec<(String, QuoteTick)>> {
+    let diff = v
+        .pointer("/data/diff")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("行情数据为空或格式异常"))?;
+    Ok(diff
+        .iter()
+        .filter_map(|item| {
+            let quote = parse_quote_item(item)?;
+            let industry = item
+                .get("f100")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty() && *name != "-")
+                .unwrap_or("其他")
+                .to_string();
+            Some((industry, quote))
+        })
+        .collect())
+}
+
+fn parse_quote_item(item: &Value) -> Option<QuoteTick> {
+    let code = item
+        .get("f12")
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if code.is_empty() {
+        return None;
     }
-    Ok(out)
+    let currency = Currency::for_code(&code)?;
+    let last = num_f64(item.get("f2"));
+    Some(QuoteTick {
+        code,
+        name: item
+            .get("f14")
+            .and_then(|x| x.as_str())
+            .unwrap_or("--")
+            .to_string(),
+        last,
+        change_pct: num_f64(item.get("f3")),
+        volume: num_f64(item.get("f5")) as u64,
+        amount: num_f64(item.get("f6")),
+        currency,
+        source: "东方财富".into(),
+        fetched_at: chrono::Utc::now().timestamp_millis(),
+        market_time: None,
+        availability: if last > 0.0 {
+            Availability::Available
+        } else {
+            Availability::Invalid
+        },
+        freshness: Freshness::Live,
+    })
 }
 
 /// Daily K-line, end at latest, `limit` bars. `fqt=1` 前复权.
@@ -1256,6 +1634,143 @@ mod universe_list_tests {
             "universe sample: {} {} mv={:.0}",
             rows[0].code, rows[0].name, rows[0].market_cap
         );
+    }
+}
+
+#[cfg(test)]
+mod market_board_tests {
+    use super::*;
+
+    #[test]
+    fn level_one_filter_does_not_mix_industry_hierarchies() {
+        assert_eq!(EASTMONEY_LEVEL_ONE_INDUSTRIES, "m:90%2Bs:2%2Bf:!50");
+        assert_eq!(EASTMONEY_LEVEL_TWO_INDUSTRIES, "m:90%2Bs:4%2Bf:!50");
+        assert!(!EASTMONEY_LEVEL_ONE_INDUSTRIES.contains("t:2"));
+        assert!(!EASTMONEY_LEVEL_TWO_INDUSTRIES.contains("t:2"));
+        assert_eq!(
+            EASTMONEY_A_SHARE_UNIVERSE,
+            "m:0%2Bt:6,m:0%2Bt:80,m:1%2Bt:2,m:1%2Bt:23"
+        );
+    }
+
+    #[test]
+    fn sector_parser_preserves_declines_and_breadth() {
+        let value = serde_json::json!({
+            "data": {
+                "total": 1,
+                "diff": [{
+                    "f12": "BK1201",
+                    "f14": "电子",
+                    "f3": -1.25,
+                    "f6": 123_000_000.0,
+                    "f104": 20,
+                    "f105": 80,
+                    "f106": 3
+                }]
+            }
+        });
+        assert_eq!(clist_total(&value), Some(1));
+        assert_eq!(clist_row_count(&value), 1);
+        let sectors = parse_sector_diff(value).expect("sector fixture");
+        assert_eq!(sectors.len(), 1);
+        assert_eq!(sectors[0].name, "电子");
+        assert_eq!(sectors[0].change_pct, -1.25);
+        assert_eq!(sectors[0].advances, 20);
+        assert_eq!(sectors[0].declines, 80);
+        assert_eq!(sectors[0].unchanged, 3);
+    }
+
+    #[test]
+    fn classified_quotes_preserve_every_stock_and_form_level_two_groups() {
+        let value = serde_json::json!({
+            "data": {
+                "total": 3,
+                "diff": [
+                    {"f12":"600001","f14":"甲","f2":10.0,"f3":1.0,"f5":100,"f6":300.0,"f100":"半导体"},
+                    {"f12":"600002","f14":"乙","f2":20.0,"f3":-1.0,"f5":200,"f6":100.0,"f100":"元件"},
+                    {"f12":"600003","f14":"丙","f2":30.0,"f3":0.0,"f5":300,"f6":200.0,"f100":"半导体"}
+                ]
+            }
+        });
+        let classified = parse_classified_quote_diff(value).expect("classified fixture");
+        let groups = group_classified_quotes(classified);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups.iter().map(|group| group.stocks.len()).sum::<usize>(),
+            3
+        );
+        assert_eq!(groups[0].name, "半导体");
+        assert_eq!(groups[0].amount, 500.0);
+        assert_eq!(groups[0].stocks[0].code, "600001");
+        assert_eq!(groups[0].stocks[1].code, "600003");
+
+        let heatmap = vec![IndustryHeatmapSector {
+            sector: SectorTick {
+                code: "BK1201".into(),
+                name: "电子".into(),
+                change_pct: 0.0,
+                amount: 600.0,
+                advances: 1,
+                declines: 1,
+                unchanged: 1,
+            },
+            industries: groups,
+        }];
+        let expected = HashSet::from(["半导体".to_string(), "元件".to_string()]);
+        validate_heatmap_coverage(&heatmap, &expected, 3).expect("complete fixture");
+        let expected_with_missing = HashSet::from([
+            "半导体".to_string(),
+            "元件".to_string(),
+            "银行Ⅱ".to_string(),
+        ]);
+        let error = validate_heatmap_coverage(&heatmap, &expected_with_missing, 3)
+            .expect_err("missing industry must fail");
+        assert!(error.to_string().contains("缺少 [银行Ⅱ]"));
+        let error =
+            validate_heatmap_coverage(&heatmap, &expected, 4).expect_err("missing stock must fail");
+        assert!(error.to_string().contains("行业成分 3 / 全市场 4"));
+    }
+
+    #[test]
+    #[ignore = "requires public market-data network"]
+    fn level_one_industries_smoke() {
+        let sectors = fetch_a_share_industry_sectors().expect("level-one industries");
+        assert_eq!(sectors.len(), 31);
+        assert!(sectors.iter().all(|sector| sector.amount > 0.0));
+    }
+
+    #[test]
+    #[ignore = "requires public market-data network"]
+    fn large_sector_constituents_are_paginated_and_amount_sorted() {
+        let rows = fetch_sector_constituents("BK1201", 1000).expect("electronics constituents");
+        assert!(rows.len() > CLIST_PAGE_SIZE, "rows={}", rows.len());
+        assert!(rows.windows(2).all(|pair| pair[0].amount >= pair[1].amount));
+    }
+
+    #[test]
+    #[ignore = "requires public market-data network"]
+    fn complete_heatmap_contains_all_levels_and_unique_stocks() {
+        let groups = fetch_a_share_industry_heatmap().expect("complete heatmap");
+        assert_eq!(groups.len(), 31);
+        let industry_count: usize = groups.iter().map(|group| group.industries.len()).sum();
+        let stock_count: usize = groups
+            .iter()
+            .flat_map(|group| &group.industries)
+            .map(|industry| industry.stocks.len())
+            .sum();
+        let codes = groups
+            .iter()
+            .flat_map(|group| &group.industries)
+            .flat_map(|industry| &industry.stocks)
+            .map(|stock| stock.code.as_str())
+            .collect::<HashSet<_>>();
+        eprintln!(
+            "complete heatmap: level1={} level2={industry_count} stocks={stock_count}",
+            groups.len()
+        );
+        assert!(industry_count >= 120, "level-2 industries={industry_count}");
+        assert!(stock_count >= 5_000, "stocks={stock_count}");
+        assert_eq!(codes.len(), stock_count, "stocks must be globally unique");
     }
 }
 

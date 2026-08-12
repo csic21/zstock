@@ -13,8 +13,8 @@ use crate::model::{
     Candle, MinutePeriod, MinuteSeries, Symbol, board_for_code, is_hk_code, shared,
 };
 
-pub use super::eastmoney::SectorTick;
 use super::eastmoney::{self, QuoteTick};
+pub use super::eastmoney::{IndustryHeatmapSector, SectorTick};
 use super::tencent;
 
 /// 行业板块成分股（东财）。
