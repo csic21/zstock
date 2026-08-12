@@ -10,7 +10,7 @@ use crate::data::{
 };
 use crate::model::shared;
 
-use super::{AiPanelState, AiSource, MarketRegion, StockApp};
+use super::{AiPanelState, AiSource, MarketRegion, StockApp, state::PrimaryTask};
 
 impl StockApp {
     pub(crate) fn open_market_analysis(&mut self, cx: &mut Context<Self>) {
@@ -344,6 +344,10 @@ impl StockApp {
         self.set_watch_tag(&code, crate::data::groups::WatchTag::Short, cx);
         self.market_analysis_open = false;
         self.market_heatmap_fullscreen = false;
+        // Market analysis can be opened from Today. Selecting a heatmap stock
+        // must therefore switch to Research as the overlay closes, otherwise
+        // the selected symbol remains hidden behind the Today dashboard.
+        self.set_primary_task(PrimaryTask::Research, cx);
         self.select_symbol(shared(code), cx);
     }
 }

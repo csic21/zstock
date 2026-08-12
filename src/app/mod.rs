@@ -1728,4 +1728,33 @@ mod layout_regression_tests {
             expanded.size.width.as_f32()
         );
     }
+
+    /// Regression test: market analysis is commonly opened from Today. Picking
+    /// a stock from its heatmap must reveal that stock in Research instead of
+    /// closing the overlay back onto the Today dashboard.
+    #[gpui::test]
+    fn heatmap_stock_selection_opens_research(cx: &mut TestAppContext) {
+        let mut window = test_window(cx, 1320.0, 860.0);
+        let handle = window.window_handle();
+        let update_result = window.cx.update_window(handle, |view, _window, cx| {
+            view.downcast::<StockApp>()
+                .expect("window root view")
+                .update(cx, |this, cx| {
+                    this.ui_state.primary_task = super::state::PrimaryTask::Today;
+                    this.market_analysis_open = true;
+                    this.market_heatmap_fullscreen = true;
+
+                    this.select_sector_constituent("600000".into(), "浦发银行".into(), 10.25, cx);
+
+                    assert_eq!(
+                        this.ui_state.primary_task,
+                        super::state::PrimaryTask::Research
+                    );
+                    assert!(!this.market_analysis_open);
+                    assert!(!this.market_heatmap_fullscreen);
+                    assert_eq!(this.selected.as_ref(), "600000");
+                });
+        });
+        assert!(update_result.is_ok(), "heatmap selection should succeed");
+    }
 }
