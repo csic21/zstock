@@ -856,11 +856,16 @@ fn fetch_complete_industry_sectors(filter: &str, level_label: &str) -> Result<Ve
             }
         }
         if raw_rows >= total || received_count < CLIST_PAGE_SIZE {
-            if raw_rows < total || out.len() != total {
+            if raw_rows < total {
                 bail!(
                     "{level_label}行业数据不完整：原始 {raw_rows}，去重 {}，应有 {total}",
                     out.len()
                 );
+            }
+            // Eastmoney `total` can count duplicate rows across pages; unique
+            // codes may be slightly lower once de-duplicated by board code.
+            if out.is_empty() && total > 0 {
+                bail!("{level_label}行业解析为空：接口总数 {total}");
             }
             break;
         }
@@ -1007,9 +1012,14 @@ fn validate_heatmap_coverage(
             unexpected.join(", ")
         );
     }
-    if owners.len() != expected_stock_total {
+    // Shenwan board membership and the A-share universe filter are not an
+    // identical set (boards can include extras; universe totals lag listings).
+    // Require near-complete coverage rather than exact equality so one API
+    // mismatch does not blank the entire heatmap.
+    let min_stocks = expected_stock_total.saturating_mul(95) / 100;
+    if owners.len() < min_stocks {
         bail!(
-            "全 A 股覆盖不完整：行业成分 {} / 全市场 {expected_stock_total}",
+            "全 A 股覆盖不完整：行业成分 {} / 全市场 {expected_stock_total}（至少需要 {min_stocks}）",
             owners.len()
         );
     }
@@ -1066,12 +1076,12 @@ fn fetch_complete_sector_heatmap(sector: SectorTick) -> Result<IndustryHeatmapSe
             if raw_rows < total {
                 bail!("{} 成分数据不完整：返回 {raw_rows} / {total}", sector.name);
             }
-            if classified.len() != total {
-                bail!(
-                    "{} 成分去重后数量异常：{} / {total}",
-                    sector.name,
-                    classified.len()
-                );
+            // Eastmoney `data.total` is a row count, not a unique-code count.
+            // Large boards (e.g. 医药生物) occasionally emit the same code on
+            // adjacent pages; accepting the de-duplicated set keeps the full
+            // heatmap usable instead of failing the whole refresh for one dup.
+            if classified.is_empty() && total > 0 {
+                bail!("{} 成分解析为空：接口总数 {total}", sector.name);
             }
             break;
         }
@@ -1726,9 +1736,15 @@ mod market_board_tests {
         let error = validate_heatmap_coverage(&heatmap, &expected_with_missing, 3)
             .expect_err("missing industry must fail");
         assert!(error.to_string().contains("缺少 [银行Ⅱ]"));
-        let error =
-            validate_heatmap_coverage(&heatmap, &expected, 4).expect_err("missing stock must fail");
-        assert!(error.to_string().contains("行业成分 3 / 全市场 4"));
+        // 95% of 100 is 95; three stocks must fail the soft floor.
+        let error = validate_heatmap_coverage(&heatmap, &expected, 100)
+            .expect_err("far-below-universe must fail");
+        assert!(
+            error.to_string().contains("行业成分 3 / 全市场 100"),
+            "error={error}"
+        );
+        // Industry count above universe total is fine (filter mismatch).
+        validate_heatmap_coverage(&heatmap, &expected, 2).expect("extra industry stocks ok");
     }
 
     #[test]
