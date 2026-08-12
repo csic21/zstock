@@ -1634,9 +1634,10 @@ mod layout_regression_tests {
         );
     }
 
-    /// The normal heatmap is taller than the original compact view, while its
-    /// focus mode must consume the available market-analysis viewport instead
-    /// of leaving the rest of the dashboard visible around it.
+    /// The normal heatmap uses the full content width and preserves its useful
+    /// reference aspect ratio on wide windows. Focus mode then consumes the
+    /// available market-analysis viewport instead of leaving the dashboard
+    /// visible around it.
     #[gpui::test]
     fn market_heatmap_expands_in_fullscreen_mode(cx: &mut TestAppContext) {
         let mut window = test_window(cx, 1600.0, 900.0);
@@ -1664,10 +1665,25 @@ mod layout_regression_tests {
         let normal = window
             .debug_bounds("market-sector-heatmap")
             .expect("normal heatmap bounds");
+        let page = window
+            .debug_bounds("market-analysis-page-root")
+            .expect("market analysis page bounds");
         assert!(
-            (normal.size.height.as_f32() - 440.0).abs() < 1.0,
-            "normal heatmap should be 440px tall, got {}",
-            normal.size.height.as_f32()
+            normal.size.width.as_f32() > 1_500.0,
+            "normal heatmap should use the wide viewport, got {}",
+            normal.size.width.as_f32()
+        );
+        let right_inset =
+            page.size.width.as_f32() - normal.origin.x.as_f32() - normal.size.width.as_f32();
+        assert!(
+            right_inset < 50.0,
+            "normal heatmap should not leave a wide blank gutter, got {right_inset}"
+        );
+        let normal_aspect = normal.size.width.as_f32() / normal.size.height.as_f32();
+        let reference_aspect = 1248.0 / 440.0;
+        assert!(
+            (normal_aspect - reference_aspect).abs() < 0.02,
+            "normal heatmap should preserve its readable aspect ratio, got {normal_aspect}"
         );
         let first_stock = window
             .debug_bounds("market-heatmap-first-stock")
@@ -1688,26 +1704,26 @@ mod layout_regression_tests {
             let _ = window.draw(cx);
         });
 
-        let page = window
+        let focus_page = window
             .debug_bounds("market-analysis-heatmap-fullscreen")
             .expect("fullscreen heatmap page bounds");
         let expanded = window
             .debug_bounds("market-sector-heatmap")
             .expect("fullscreen heatmap bounds");
         assert!(
-            (page.size.height.as_f32() - 866.0).abs() < 1.0,
+            (focus_page.size.height.as_f32() - 866.0).abs() < 1.0,
             "fullscreen page should fill the content area, got {}",
-            page.size.height.as_f32()
+            focus_page.size.height.as_f32()
         );
         assert!(
-            expanded.size.height.as_f32() > normal.size.height.as_f32() + 250.0,
+            expanded.size.height.as_f32() > normal.size.height.as_f32() + 180.0,
             "fullscreen heatmap should grow vertically: normal={}, expanded={}",
             normal.size.height.as_f32(),
             expanded.size.height.as_f32()
         );
         assert!(
-            expanded.size.width.as_f32() > normal.size.width.as_f32() + 250.0,
-            "fullscreen heatmap should grow horizontally: normal={}, expanded={}",
+            expanded.size.width.as_f32() >= normal.size.width.as_f32(),
+            "fullscreen heatmap should retain the full viewport width: normal={}, expanded={}",
             normal.size.width.as_f32(),
             expanded.size.width.as_f32()
         );

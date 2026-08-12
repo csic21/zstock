@@ -24,10 +24,18 @@ use crate::model::IndexSnap;
 use super::super::treemap::squarified_treemap;
 use super::super::{AiPanelState, MarketRegion, StockApp};
 
-const HEATMAP_DEFAULT_HEIGHT: f32 = 440.0;
+const HEATMAP_REFERENCE_WIDTH: f32 = 1248.0;
+const HEATMAP_REFERENCE_HEIGHT: f32 = 440.0;
+const HEATMAP_MAX_DEFAULT_HEIGHT: f32 = 1200.0;
 const HEATMAP_FULLSCREEN_RESERVED_HEIGHT: f32 = 148.0;
 const HEATMAP_SECTOR_HEADER_HEIGHT: f32 = 20.0;
 const HEATMAP_INDUSTRY_HEADER_HEIGHT: f32 = 16.0;
+
+fn default_heatmap_height(surface_width: f32) -> f32 {
+    (surface_width * HEATMAP_REFERENCE_HEIGHT / HEATMAP_REFERENCE_WIDTH)
+        .clamp(HEATMAP_REFERENCE_HEIGHT, HEATMAP_MAX_DEFAULT_HEIGHT)
+}
+
 #[derive(Clone)]
 enum HeatmapAction {
     Stock {
@@ -103,7 +111,8 @@ impl StockApp {
         };
         let window_width = window.bounds().size.width.as_f32();
         let window_height = window.bounds().size.height.as_f32();
-        let heatmap_surface_width = (window_width - 72.0).clamp(320.0, 1248.0);
+        let heatmap_surface_width = (window_width - 72.0).max(320.0);
+        let heatmap_surface_height = default_heatmap_height(heatmap_surface_width);
         let fullscreen_surface_width = (window_width - 56.0).max(320.0);
         let fullscreen_surface_height =
             (window_height - HEATMAP_FULLSCREEN_RESERVED_HEIGHT).clamp(440.0, 1400.0);
@@ -212,7 +221,6 @@ impl StockApp {
                     .child(
                         v_flex()
                             .w_full()
-                            .max_w(px(1280.))
                             .gap(px(16.))
                             .child(
                                 h_flex()
@@ -378,7 +386,7 @@ impl StockApp {
                             .child(self.render_market_heatmap(
                                 heatmap_sectors,
                                 heatmap_surface_width,
-                                HEATMAP_DEFAULT_HEIGHT,
+                                heatmap_surface_height,
                                 false,
                                 cx,
                             ))
