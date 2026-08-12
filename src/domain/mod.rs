@@ -10,4 +10,6 @@ pub mod market;
 pub mod money;
 pub mod paper;
 pub mod portfolio;
+pub mod position_sizing;
 pub mod strategy;
+pub mod today;

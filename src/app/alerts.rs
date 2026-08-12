@@ -20,6 +20,27 @@ pub(crate) struct BuyAlertHit {
 }
 
 impl StockApp {
+    pub(crate) fn install_execution_alerts(&mut self, cx: &mut Context<Self>) {
+        let Some(levels) = self.current_levels() else {
+            self.status = shared("加载至少 30 根日 K 后才能生成三道提醒");
+            cx.notify();
+            return;
+        };
+        let code = self.selected.to_string();
+        let mut alert = BuyAlert::new(levels.buy_high, BuyAlertBasis::Technical);
+        alert.sell_price = Some(levels.sell_low);
+        alert.stop_price = Some(levels.buy_low);
+        self.buy_alerts.insert(code, alert);
+        self.schedule_persist(cx);
+        self.status = shared(format!(
+            "三道提醒已开启 · 观察 {} · 失效 {} · 目标 {}",
+            format_price(levels.buy_high),
+            format_price(levels.buy_low),
+            format_price(levels.sell_low)
+        ));
+        cx.notify();
+    }
+
     pub(crate) fn selected_buy_alert(&self) -> Option<BuyAlert> {
         self.buy_alerts.get(self.selected.as_ref()).cloned()
     }

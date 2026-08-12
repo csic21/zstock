@@ -92,6 +92,17 @@ impl StockApp {
                             .child(self.status.clone()),
                     ),
             )
+            .when(active == DetailTab::Overview, |panel| {
+                let trace = self.decision_trace_view_model(cx);
+                panel.child(
+                    div()
+                        .w_full()
+                        .flex_shrink_0()
+                        .px_3()
+                        .pt_3()
+                        .child(self.render_decision_trace(&trace, cx)),
+                )
+            })
             .child(
                 div()
                     .id("detail-scroll")

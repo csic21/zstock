@@ -9,6 +9,113 @@ pub enum DecisionStatus {
     MatchesStrategy,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionStepState {
+    Running,
+    Passed,
+    Attention,
+    Blocked,
+}
+
+impl DecisionStepState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Running => "进行中",
+            Self::Passed => "通过",
+            Self::Attention => "注意",
+            Self::Blocked => "拦截",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionStep {
+    pub title: String,
+    pub state: DecisionStepState,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionOutcome {
+    Calculating,
+    NeedEvidence,
+    NoAction,
+    Wait,
+    PlanReady,
+}
+
+impl DecisionOutcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Calculating => "正在决策",
+            Self::NeedEvidence => "暂不行动 · 等待证据",
+            Self::NoAction => "不操作",
+            Self::Wait => "继续观察",
+            Self::PlanReady => "可制定计划",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionTrace {
+    pub code: String,
+    pub outcome: DecisionOutcome,
+    pub evaluated_steps: usize,
+    pub steps: Vec<DecisionStep>,
+}
+
+impl DecisionTrace {
+    pub fn build(
+        code: impl Into<String>,
+        decision_status: DecisionStatus,
+        steps: Vec<DecisionStep>,
+    ) -> Self {
+        let calculating = steps
+            .iter()
+            .any(|step| step.state == DecisionStepState::Running);
+        let outcome = if calculating {
+            DecisionOutcome::Calculating
+        } else {
+            match decision_status {
+                DecisionStatus::InsufficientEvidence => DecisionOutcome::NeedEvidence,
+                DecisionStatus::NotEligible => DecisionOutcome::NoAction,
+                DecisionStatus::Waiting => DecisionOutcome::Wait,
+                DecisionStatus::MatchesStrategy => DecisionOutcome::PlanReady,
+            }
+        };
+        let evaluated_steps = steps
+            .iter()
+            .filter(|step| step.state != DecisionStepState::Running)
+            .count();
+        Self {
+            code: code.into(),
+            outcome,
+            evaluated_steps,
+            steps,
+        }
+    }
+
+    pub fn current_activity(&self) -> String {
+        self.steps
+            .iter()
+            .find(|step| step.state == DecisionStepState::Running)
+            .map(|step| format!("正在{}：{}", step.title, step.summary))
+            .unwrap_or_else(|| {
+                self.steps
+                    .iter()
+                    .rev()
+                    .find(|step| {
+                        matches!(
+                            step.state,
+                            DecisionStepState::Blocked | DecisionStepState::Attention
+                        )
+                    })
+                    .map(|step| format!("{}：{}", step.title, step.summary))
+                    .unwrap_or_else(|| "全部规则已计算完成".into())
+            })
+    }
+}
+
 impl DecisionStatus {
     pub fn label(self) -> &'static str {
         match self {
@@ -259,5 +366,37 @@ mod tests {
             assert!(score <= previous);
             previous = score;
         }
+    }
+
+    #[test]
+    fn trace_stays_calculating_while_any_step_is_running() {
+        let trace = DecisionTrace::build(
+            "600519",
+            DecisionStatus::InsufficientEvidence,
+            vec![DecisionStep {
+                title: "基本面检查".into(),
+                state: DecisionStepState::Running,
+                summary: "读取公告".into(),
+            }],
+        );
+        assert_eq!(trace.outcome, DecisionOutcome::Calculating);
+        assert_eq!(trace.evaluated_steps, 0);
+        assert!(trace.current_activity().contains("正在基本面检查"));
+    }
+
+    #[test]
+    fn trace_exposes_the_final_action_after_all_steps_finish() {
+        let trace = DecisionTrace::build(
+            "600519",
+            DecisionStatus::MatchesStrategy,
+            vec![DecisionStep {
+                title: "行情数据".into(),
+                state: DecisionStepState::Passed,
+                summary: "120 根日 K".into(),
+            }],
+        );
+        assert_eq!(trace.outcome, DecisionOutcome::PlanReady);
+        assert_eq!(trace.evaluated_steps, 1);
+        assert_eq!(trace.current_activity(), "全部规则已计算完成");
     }
 }

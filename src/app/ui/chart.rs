@@ -46,6 +46,7 @@ impl StockApp {
         let chg_color = self.chg_color(up, cx);
         let paint = self.chart_paint_data(cx);
         let work = self.work_mode;
+        let decision_trace = (!work).then(|| self.decision_trace_view_model(cx));
 
         let code_show = self.display_code(self.selected.as_ref());
         let name_raw = sym.map(|s| s.name.as_ref().to_string()).unwrap_or_default();
@@ -256,6 +257,81 @@ impl StockApp {
                             }),
                     ),
             )
+            .when_some(decision_trace, |panel, trace| {
+                let color = match trace.outcome {
+                    crate::domain::decision::DecisionOutcome::Calculating => cx.theme().accent,
+                    crate::domain::decision::DecisionOutcome::PlanReady => cx.theme().success,
+                    crate::domain::decision::DecisionOutcome::Wait => cx.theme().warning,
+                    crate::domain::decision::DecisionOutcome::NoAction => cx.theme().danger,
+                    crate::domain::decision::DecisionOutcome::NeedEvidence => {
+                        cx.theme().muted_foreground
+                    }
+                };
+                panel.child(
+                    h_flex()
+                        .id("decision-status-strip")
+                        .h(px(38.0))
+                        .flex_shrink_0()
+                        .px_4()
+                        .gap_2()
+                        .items_center()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .bg(color.opacity(0.055))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_semibold()
+                                .text_color(cx.theme().foreground)
+                                .child("决策"),
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .py_0p5()
+                                .rounded_full()
+                                .bg(color.opacity(0.16))
+                                .text_xs()
+                                .font_semibold()
+                                .text_color(color)
+                                .child(trace.outcome.label()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(trace.current_activity()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!(
+                                    "{}/{} 步",
+                                    trace.evaluated_steps,
+                                    trace.steps.len()
+                                )),
+                        )
+                        .child(
+                            Button::new("show-decision-process")
+                                .xsmall()
+                                .ghost()
+                                .label("查看全过程")
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    this.detail_tab = DetailTab::Overview;
+                                    this.bottom_height = this.bottom_height.max(300.0);
+                                    if let Some(height) = this.dock.main_v.get_mut(1) {
+                                        *height = (*height).max(300.0);
+                                    }
+                                    this.schedule_persist(cx);
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
             // Toolbar：周期 / 指标 / 画线（操作与行情分离）
             .child(
                 h_flex()

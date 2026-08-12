@@ -18,6 +18,7 @@ mod series_cache;
 mod state;
 mod strategy_lab;
 mod symbols;
+mod today;
 mod treemap;
 mod types;
 mod ui;
@@ -349,6 +350,9 @@ pub struct AppState {
     ai_cli_bin_input: Entity<InputState>,
     /// Price field used by the selected-symbol buy alert panel.
     alert_price_input: Entity<InputState>,
+    /// Session-only capital and loss budget used by the position sizing card.
+    position_capital_input: Entity<InputState>,
+    position_risk_pct_input: Entity<InputState>,
     /// Persisted local buy-price alerts keyed by symbol code.
     buy_alerts: HashMap<String, BuyAlert>,
     /// 本地持仓（交易流水 + 可选现金）。
@@ -470,6 +474,16 @@ impl StockApp {
         let portfolio_cash_input = cx.new(|cx| InputState::new(window, cx).placeholder("现金余额"));
         let alert_price_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("目标价，如 12.30"));
+        let position_capital_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("计划本金"));
+        position_capital_input.update(cx, |state, cx| {
+            state.set_value("100000", window, cx);
+        });
+        let position_risk_pct_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("单笔亏损 %"));
+        position_risk_pct_input.update(cx, |state, cx| {
+            state.set_value("1.0", window, cx);
+        });
         let journal_note_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("写一句观察 / 计划，如：回踩 MA20 再看…")
         });
@@ -539,6 +553,20 @@ impl StockApp {
                 move |this, _state: &Entity<InputState>, event: &InputEvent, window, cx| {
                     if let InputEvent::PressEnter { .. } = event {
                         this.commit_work_alias(window, cx);
+                    }
+                }
+            }),
+            cx.subscribe_in(&position_capital_input, window, {
+                move |_this, _state: &Entity<InputState>, event: &InputEvent, _window, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        cx.notify();
+                    }
+                }
+            }),
+            cx.subscribe_in(&position_risk_pct_input, window, {
+                move |_this, _state: &Entity<InputState>, event: &InputEvent, _window, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        cx.notify();
                     }
                 }
             }),
@@ -756,6 +784,8 @@ impl StockApp {
                 ai_api_key_input,
                 ai_cli_bin_input,
                 alert_price_input,
+                position_capital_input,
+                position_risk_pct_input,
                 buy_alerts: cfg.buy_alerts.clone(),
                 portfolio,
                 trade_form_side: None,
@@ -776,10 +806,17 @@ impl StockApp {
             },
         };
 
-        app.ui_state.primary_task = match app.left_tab {
-            LeftTab::Portfolio => state::PrimaryTask::Portfolio,
-            LeftTab::Treasure => state::PrimaryTask::Opportunities,
-            LeftTab::Watchlist => state::PrimaryTask::Research,
+        // Normal launches begin with the action-oriented Today dashboard. Work
+        // mode keeps the persisted sidebar identity because it renders its own
+        // full-page dashboard.
+        app.ui_state.primary_task = if app.work_mode {
+            match app.left_tab {
+                LeftTab::Portfolio => state::PrimaryTask::Portfolio,
+                LeftTab::Treasure => state::PrimaryTask::Opportunities,
+                LeftTab::Watchlist => state::PrimaryTask::Research,
+            }
+        } else {
+            state::PrimaryTask::Today
         };
 
         // 历史持仓代码自动并入自选，便于行情轮询。
@@ -933,6 +970,14 @@ impl Render for StockApp {
                     .w_full()
                     .overflow_hidden()
                     .child(self.render_market_analysis(window, cx))
+                    .into_any_element()
+            } else if self.ui_state.primary_task == state::PrimaryTask::Today && !work {
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_hidden()
+                    .child(self.render_today_dashboard(cx))
                     .into_any_element()
             } else if self.ui_state.primary_task == state::PrimaryTask::StrategyLab {
                 div()
@@ -1316,7 +1361,16 @@ mod layout_regression_tests {
                     })),
                     ..Default::default()
                 },
-                |window, cx| cx.new(|cx| StockApp::new(window, cx)),
+                |window, cx| {
+                    cx.new(|cx| {
+                        let mut app = StockApp::new(window, cx);
+                        // These regression cases exercise the research split
+                        // layout explicitly. Normal launches now begin on the
+                        // task-oriented Today dashboard.
+                        app.ui_state.primary_task = super::state::PrimaryTask::Research;
+                        app
+                    })
+                },
             )
             .expect("open window")
         });
@@ -1345,6 +1399,40 @@ mod layout_regression_tests {
         assert!(
             (root.size.height.as_f32() - 826.0).abs() < 1.0,
             "sidebar should span the full content height (826px), got {}",
+            root.size.height.as_f32()
+        );
+    }
+
+    #[gpui::test]
+    fn today_dashboard_fills_content_area(cx: &mut TestAppContext) {
+        let mut window = test_window(cx, 1320.0, 860.0);
+        let handle = window.window_handle();
+        let update_result = window.cx.update_window(handle, |view, _window, cx| {
+            view.downcast::<StockApp>()
+                .expect("window root view")
+                .update(cx, |this, cx| {
+                    this.ui_state.primary_task = super::state::PrimaryTask::Today;
+                    this.market_analysis_open = false;
+                    cx.notify();
+                });
+        });
+        assert!(update_result.is_ok(), "today update should succeed");
+        window.run_until_parked();
+        window.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let root = window
+            .debug_bounds("today-dashboard-root")
+            .expect("today-dashboard-root bounds");
+        assert!(
+            (root.origin.y.as_f32() - 34.0).abs() < 1.0,
+            "today dashboard should start below the title bar, got y={}",
+            root.origin.y.as_f32()
+        );
+        assert!(
+            (root.size.height.as_f32() - 826.0).abs() < 1.0,
+            "today dashboard should fill the content area, got {}",
             root.size.height.as_f32()
         );
     }

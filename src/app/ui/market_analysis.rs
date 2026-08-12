@@ -146,7 +146,7 @@ impl StockApp {
                         Button::new("market-analysis-back")
                             .ghost()
                             .xsmall()
-                            .label("← 返回行情")
+                            .label("← 返回今日")
                             .on_click(cx.listener(|this, _, _w, cx| {
                                 this.close_market_analysis(cx);
                             })),

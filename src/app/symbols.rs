@@ -22,6 +22,12 @@ impl StockApp {
     pub(crate) fn select_symbol(&mut self, code: SharedString, cx: &mut Context<Self>) {
         if self.selected == code {
             self.palette_open = false;
+            self.detail_tab = DetailTab::Overview;
+            self.bottom_height = self.bottom_height.max(300.0);
+            if let Some(height) = self.dock.main_v.get_mut(1) {
+                *height = (*height).max(300.0);
+            }
+            self.schedule_persist(cx);
             cx.notify();
             return;
         }
@@ -29,6 +35,13 @@ impl StockApp {
             crate::domain::money::Currency::for_code(code.as_ref());
         self.selected = code;
         self.palette_open = false;
+        // A new selection is a new decision. Keep the process visible instead
+        // of leaving the user on an unrelated detail tab or a collapsed dock.
+        self.detail_tab = DetailTab::Overview;
+        self.bottom_height = self.bottom_height.max(300.0);
+        if let Some(height) = self.dock.main_v.get_mut(1) {
+            *height = (*height).max(300.0);
+        }
         self.schedule_persist(cx);
         self.reload_fundamentals(cx);
         self.reload_chart(cx);

@@ -13,6 +13,48 @@ use super::helpers::*;
 use super::{AiCacheEntry, AiPanelState, AiSource, DetailTab, LeftTab, StockApp};
 
 impl StockApp {
+    pub(crate) fn prefill_position_sized_buy(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.decision_card_view_model().status
+            != crate::domain::decision::DecisionStatus::MatchesStrategy
+        {
+            self.status = shared("当前结论不是“符合策略”，只保留观察/提醒，不预填买入记录");
+            cx.notify();
+            return;
+        }
+        let plan = match self.position_sizing_plan(cx) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.status = shared(error.user_message());
+                cx.notify();
+                return;
+            }
+        };
+        self.open_trade_form(TradeSide::Buy, window, cx);
+        self.trade_shares_input.update(cx, |state, cx| {
+            state.set_value(plan.shares.to_string(), window, cx);
+        });
+        self.trade_price_input.update(cx, |state, cx| {
+            state.set_value(format_price(plan.entry_price), window, cx);
+        });
+        self.trade_note_input.update(cx, |state, cx| {
+            state.set_value(
+                format!(
+                    "纪律仓位：失效价 {}，计划损失不超过约 {:.2}",
+                    format_price(plan.invalidation_price),
+                    plan.planned_loss
+                ),
+                window,
+                cx,
+            );
+        });
+        self.status = shared("已预填本地买入记录；不会自动下单，请按实际成交修改");
+        cx.notify();
+    }
+
     /// Write config.json immediately (structural changes: add/remove symbol, trades).
     pub(crate) fn persist(&self) {
         let mut dock = self.dock.clone();

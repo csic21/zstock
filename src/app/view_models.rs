@@ -1,14 +1,278 @@
 use crate::domain::decision::{
-    DecisionCard, DecisionInput, Eligibility, FactorContributions, QualityEvidence,
+    DecisionCard, DecisionInput, DecisionStep, DecisionStepState, DecisionTrace, Eligibility,
+    FactorContributions, QualityEvidence,
 };
 use crate::domain::fundamentals::{
     QualityGate, REQUIRED_QUALITY_METRICS, metric_label, quality_gate,
 };
 use crate::domain::journal::{DecisionPlan, EvidenceSnapshot, PlanStatus};
+use crate::domain::money::Currency;
+use crate::domain::position_sizing::{
+    PositionPlan, PositionSizingError, PositionSizingInput, calculate_position_plan,
+};
 
 use super::StockApp;
 
 impl StockApp {
+    pub(crate) fn decision_trace_view_model(&self, cx: &gpui::Context<Self>) -> DecisionTrace {
+        use crate::controller::state::RequestState;
+
+        let card = self.decision_card_view_model();
+        let candles_current = self
+            .candles_code
+            .as_ref()
+            .is_some_and(|code| code == self.selected.as_ref());
+        let candle_count = if candles_current {
+            self.candles.len()
+        } else {
+            0
+        };
+        let data_step = if (self.loading || self.refreshing) && candle_count == 0 {
+            DecisionStep {
+                title: "行情数据".into(),
+                state: DecisionStepState::Running,
+                summary: "正在读取当前标的日 K 与行情来源".into(),
+            }
+        } else if candle_count < 30 {
+            DecisionStep {
+                title: "行情数据".into(),
+                state: DecisionStepState::Blocked,
+                summary: format!("只有 {candle_count} 根日 K，至少需要 30 根"),
+            }
+        } else {
+            DecisionStep {
+                title: "行情数据".into(),
+                state: DecisionStepState::Passed,
+                summary: format!(
+                    "{candle_count} 根日 K · {} · 截至 {}",
+                    self.data_source, card.data_as_of
+                ),
+            }
+        };
+
+        let technical_step = if self.current_signal().is_none() {
+            DecisionStep {
+                title: "技术规则".into(),
+                state: if self.loading {
+                    DecisionStepState::Running
+                } else {
+                    DecisionStepState::Blocked
+                },
+                summary: "等待趋势、动量、量能与风险因子".into(),
+            }
+        } else if let Some(score) = card.score {
+            DecisionStep {
+                title: "技术规则".into(),
+                state: if score >= 62.0 {
+                    DecisionStepState::Passed
+                } else {
+                    DecisionStepState::Attention
+                },
+                summary: format!(
+                    "策略匹配度 {score:.0} · 门槛 62 · {}",
+                    card.supports
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or("暂无主要支持因素")
+                ),
+            }
+        } else {
+            DecisionStep {
+                title: "技术规则".into(),
+                state: DecisionStepState::Attention,
+                summary: "数据完整度不足，暂不输出强结论".into(),
+            }
+        };
+
+        let evidence_date = card.data_as_of.as_str();
+        let fundamental_step = match &self.analysis_state.fundamentals.state {
+            RequestState::Idle | RequestState::Loading => DecisionStep {
+                title: "基本面门槛".into(),
+                state: DecisionStepState::Running,
+                summary: "正在按公告日期读取质量证据".into(),
+            },
+            RequestState::Failed(message) => DecisionStep {
+                title: "基本面门槛".into(),
+                state: DecisionStepState::Blocked,
+                summary: format!("数据不可用：{message}"),
+            },
+            RequestState::Ready(snapshot) => {
+                let gate = quality_gate(&snapshot.metrics, evidence_date);
+                if !gate.blockers.is_empty() {
+                    DecisionStep {
+                        title: "基本面门槛".into(),
+                        state: DecisionStepState::Blocked,
+                        summary: gate.blockers.join("；"),
+                    }
+                } else if !gate.unknown.is_empty() {
+                    DecisionStep {
+                        title: "基本面门槛".into(),
+                        state: DecisionStepState::Attention,
+                        summary: gate.unknown.join("；"),
+                    }
+                } else {
+                    DecisionStep {
+                        title: "基本面门槛".into(),
+                        state: DecisionStepState::Passed,
+                        summary: format!(
+                            "质量门槛通过 · {} 项可追溯证据",
+                            card.quality_evidence.len()
+                        ),
+                    }
+                }
+            }
+        };
+
+        let levels_step = match self.current_levels() {
+            Some(levels) => DecisionStep {
+                title: "价位计划".into(),
+                state: DecisionStepState::Passed,
+                summary: format!(
+                    "观察 {} · 失效 {:.2} · 目标 {}",
+                    levels.buy_band_text(),
+                    levels.buy_low,
+                    levels.sell_band_text()
+                ),
+            },
+            None => DecisionStep {
+                title: "价位计划".into(),
+                state: if self.loading {
+                    DecisionStepState::Running
+                } else {
+                    DecisionStepState::Blocked
+                },
+                summary: "尚未形成可解释的观察、失效和目标价".into(),
+            },
+        };
+
+        let sizing_result = self.position_sizing_plan(cx);
+        let sizing_step = match &sizing_result {
+            Ok(plan) => DecisionStep {
+                title: "风险与仓位".into(),
+                state: DecisionStepState::Passed,
+                summary: format!(
+                    "最多新买 {} 股 · 加仓后 {:.1}% · 失效损失约 {:.2}",
+                    plan.shares, plan.capital_pct, plan.planned_loss
+                ),
+            },
+            Err(error) => DecisionStep {
+                title: "风险与仓位".into(),
+                state: DecisionStepState::Blocked,
+                summary: error.user_message().into(),
+            },
+        };
+
+        let final_step = match (card.status, sizing_result.as_ref()) {
+            (crate::domain::decision::DecisionStatus::MatchesStrategy, Err(error)) => {
+                DecisionStep {
+                    title: "最终动作".into(),
+                    state: DecisionStepState::Attention,
+                    summary: format!("策略条件符合，但暂不新增仓位：{}", error.user_message()),
+                }
+            }
+            (crate::domain::decision::DecisionStatus::MatchesStrategy, Ok(_)) => DecisionStep {
+                title: "最终动作".into(),
+                state: DecisionStepState::Passed,
+                summary: "可制定计划；等待进入观察区，不代表立即追价买入".into(),
+            },
+            (crate::domain::decision::DecisionStatus::Waiting, _) => DecisionStep {
+                title: "最终动作".into(),
+                state: DecisionStepState::Attention,
+                summary: "继续观察，不预填买入；可设置价位提醒".into(),
+            },
+            (crate::domain::decision::DecisionStatus::NotEligible, _) => DecisionStep {
+                title: "最终动作".into(),
+                state: DecisionStepState::Blocked,
+                summary: format!(
+                    "不操作：{}",
+                    card.risks
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or("资格门槛未通过")
+                ),
+            },
+            (crate::domain::decision::DecisionStatus::InsufficientEvidence, _) => DecisionStep {
+                title: "最终动作".into(),
+                state: if matches!(
+                    self.analysis_state.fundamentals.state,
+                    RequestState::Idle | RequestState::Loading
+                ) || self.loading
+                {
+                    DecisionStepState::Running
+                } else {
+                    DecisionStepState::Blocked
+                },
+                summary: "证据不足，不做买入动作".into(),
+            },
+        };
+
+        let trace_status = if card.status
+            == crate::domain::decision::DecisionStatus::MatchesStrategy
+            && sizing_result.is_err()
+        {
+            crate::domain::decision::DecisionStatus::Waiting
+        } else {
+            card.status
+        };
+
+        DecisionTrace::build(
+            self.selected.to_string(),
+            trace_status,
+            vec![
+                data_step,
+                technical_step,
+                fundamental_step,
+                levels_step,
+                sizing_step,
+                final_step,
+            ],
+        )
+    }
+
+    pub(crate) fn position_sizing_plan(
+        &self,
+        cx: &gpui::Context<Self>,
+    ) -> Result<PositionPlan, PositionSizingError> {
+        let capital = super::helpers::parse_f64(&self.position_capital_input.read(cx).value())
+            .unwrap_or_default();
+        let risk_pct = super::helpers::parse_f64(&self.position_risk_pct_input.read(cx).value())
+            .unwrap_or_default();
+        let levels = self
+            .levels_cache
+            .as_ref()
+            .ok_or(PositionSizingError::InvalidEntry)?;
+        let currency = Currency::for_code(self.selected.as_ref()).unwrap_or(Currency::Cny);
+        let existing_shares = self
+            .portfolio
+            .position_of(self.selected.as_ref())
+            .map(|position| position.shares.floor().max(0.0) as u64)
+            .unwrap_or_default();
+        let is_star_market = self.selected.starts_with("688") || self.selected.starts_with("689");
+        calculate_position_plan(PositionSizingInput {
+            capital,
+            risk_pct,
+            max_position_pct: 20.0,
+            entry_price: levels.buy_high,
+            invalidation_price: levels.buy_low,
+            target_price: Some(levels.sell_low),
+            existing_shares,
+            lot_size: if is_star_market {
+                1
+            } else if currency == Currency::Cny {
+                100
+            } else {
+                1
+            },
+            minimum_shares: if is_star_market {
+                200
+            } else if currency == Currency::Cny {
+                100
+            } else {
+                1
+            },
+        })
+    }
+
     pub(crate) fn decision_card_view_model(&self) -> DecisionCard {
         let signal = self.current_signal();
         let levels = self.levels_cache.as_ref();
@@ -226,6 +490,7 @@ impl StockApp {
             .invalidation
             .clone()
             .unwrap_or_else(|| "尚未定义，不能执行".into());
+        let position_plan = self.position_sizing_plan(cx).ok();
         let plan = DecisionPlan {
             id: entry_id.clone(),
             code: code.clone(),
@@ -235,7 +500,16 @@ impl StockApp {
             observation_range: card.observation.clone().unwrap_or_else(|| "—".into()),
             invalidation: invalidation.clone(),
             target: card.target.clone(),
-            risk_amount: None,
+            risk_amount: position_plan.map(|position| {
+                format!(
+                    "计划新增 {} 股 / 加仓后 {} 股 · 金额 {:.2} · 失效损失约 {:.2} {}",
+                    position.shares,
+                    position.resulting_shares,
+                    position.planned_notional,
+                    position.planned_loss,
+                    Currency::for_code(&code).unwrap_or(Currency::Cny).symbol()
+                )
+            }),
             status: PlanStatus::Planned,
             evidence: EvidenceSnapshot {
                 strategy_version: card.strategy_version.clone(),

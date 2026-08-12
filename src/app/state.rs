@@ -139,6 +139,11 @@ impl super::StockApp {
 
     pub(crate) fn set_primary_task(&mut self, task: PrimaryTask, cx: &mut gpui::Context<Self>) {
         if self.ui_state.primary_task == task {
+            if task == PrimaryTask::Today && self.market_analysis_open {
+                self.market_analysis_open = false;
+                self.market_heatmap_fullscreen = false;
+                cx.notify();
+            }
             return;
         }
         self.runtime_state.performance.begin_navigation();
@@ -163,7 +168,7 @@ impl super::StockApp {
         self.settings_open = false;
         match task {
             PrimaryTask::Today => {
-                self.market_analysis_open = true;
+                self.market_analysis_open = false;
             }
             PrimaryTask::Research => {
                 self.market_analysis_open = false;

@@ -6,4 +6,5 @@ mod detail;
 mod left;
 mod market_analysis;
 mod palette;
+mod today;
 mod work;
