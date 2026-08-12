@@ -43,7 +43,7 @@ use gpui_component::{
 
 use crate::data::ai::AiConfig;
 use crate::data::alerts::BuyAlert;
-use crate::data::backtest::BacktestReport;
+use crate::data::backtest::{BacktestReport, BacktestRule};
 use crate::data::groups::{FindMode, WatchTag};
 use crate::data::indicators::{BollSeries, MaSeries, MacdSeries};
 use crate::data::journal::Journal;
@@ -324,6 +324,10 @@ pub struct AppState {
     sector_drill_gen: u64,
     /// 当前标的轻量回测报告（策略 Tab）。
     backtest_report: Option<BacktestReport>,
+    /// Three-rule comparison for the current immutable candle snapshot.
+    backtest_comparison: Vec<BacktestReport>,
+    /// Active rule stays explicit so the UI never highlights the wrong strategy.
+    backtest_active_rule: BacktestRule,
     /// 决策日记（本地 journal.json）。
     journal: Journal,
     /// 日记手写输入。
@@ -771,6 +775,8 @@ impl StockApp {
                 sector_drill_error: None,
                 sector_drill_gen: 0,
                 backtest_report: None,
+                backtest_comparison: Vec::new(),
+                backtest_active_rule: BacktestRule::Ma20CrossUp,
                 journal,
                 journal_note_input,
                 journal_filter_selected: true,

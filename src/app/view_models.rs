@@ -425,15 +425,42 @@ impl StockApp {
         {
             risks.push("历史回撤较深".into());
         }
+        if signal
+            .as_ref()
+            .is_some_and(|value| value.price_vs_ma20_pct >= 8.0)
+        {
+            risks.push("价格偏离 MA20 超过 8%，等待回踩而非追高".into());
+        }
         let observation = levels.map(|value| format!("{} 元", value.buy_band_text()));
         let invalidation = levels.map(|value| format!("有效跌破 {:.2} 元", value.buy_low));
         let target = levels.map(|value| format!("{} 元", value.sell_band_text()));
         let risk_reward = levels.and_then(|value| {
-            let risk_distance = value.close - value.buy_low;
-            let reward_distance = value.sell_low - value.close;
+            // Use the actual planned entry (upper edge of the observation band),
+            // not the current close. This avoids showing an optimistic payoff
+            // while position sizing uses a less favorable entry.
+            let risk_distance = value.buy_high - value.buy_low;
+            let reward_distance = value.sell_low - value.buy_high;
             (risk_distance > 0.0 && reward_distance > 0.0)
                 .then_some(reward_distance / risk_distance)
         });
+        if risk_reward.is_none_or(|ratio| ratio < crate::domain::decision::MINIMUM_PLAN_RISK_REWARD)
+        {
+            risks.push(format!(
+                "计划盈亏比低于 {:.1}，不进入执行阶段",
+                crate::domain::decision::MINIMUM_PLAN_RISK_REWARD
+            ));
+        }
+        let evidence_grade = self
+            .backtest_report
+            .as_ref()
+            .map(|report| report.verdict().label(false).to_string())
+            .unwrap_or_else(|| {
+                if self.candles.len() >= 120 {
+                    "待运行样本外验证".into()
+                } else {
+                    "样本不足".into()
+                }
+            });
         DecisionCard::build(DecisionInput {
             eligibility: Eligibility {
                 passed: blockers.is_empty() && fundamental_gate.passed,
@@ -456,12 +483,8 @@ impl StockApp {
             source: format!("行情 {}；基本面 {fundamental_source}", self.data_source),
             adjustment: "前复权".into(),
             sample_size: self.candles.len(),
-            strategy_version: "technical-quality-gate-v3".into(),
-            evidence_grade: if self.candles.len() >= 120 {
-                "样本内探索".into()
-            } else {
-                "样本不足".into()
-            },
+            strategy_version: "technical-quality-gate-v4".into(),
+            evidence_grade,
         })
     }
 

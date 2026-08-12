@@ -5,7 +5,8 @@ use gpui_component::ActiveTheme;
 
 use crate::chart::{BollPaintData, ChartPaintData, ChartStyle, MacdPaintData, MinutePaintData};
 use crate::data::levels;
-use crate::data::{indicators::MaSeries, signals};
+use crate::data::{backtest, indicators::MaSeries, signals};
+use crate::domain::money::Currency;
 use crate::model::{
     IndexSnap, TrendLine, disguise_index, disguise_label, format_index, format_pct, format_price,
 };
@@ -418,13 +419,29 @@ impl StockApp {
 
     /// Recompute strategy + levels once when the candle series changes.
     pub(crate) fn refresh_analysis_cache(&mut self) {
+        self.backtest_comparison.clear();
         if self.candles.is_empty() {
             self.signal_cache = None;
             self.levels_cache = None;
+            self.backtest_report = None;
             self.analysis_state.decision_card = None;
         } else {
             self.signal_cache = signals::analyze(&self.candles);
             self.levels_cache = levels::compute(&self.candles);
+            self.backtest_report = if matches!(self.chart_kind, ChartKind::DayK)
+                && self.candles.len() >= 60
+            {
+                let currency = Currency::for_code(self.selected.as_ref()).unwrap_or(Currency::Cny);
+                backtest::run_for_instrument(
+                    &self.candles,
+                    self.selected.as_ref(),
+                    self.backtest_active_rule,
+                    10,
+                    currency,
+                )
+            } else {
+                None
+            };
             self.analysis_state.decision_card = Some(self.decision_card_view_model());
         }
     }

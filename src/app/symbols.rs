@@ -34,6 +34,11 @@ impl StockApp {
         self.portfolio_state.selected_currency =
             crate::domain::money::Currency::for_code(code.as_ref());
         self.selected = code;
+        self.signal_cache = None;
+        self.levels_cache = None;
+        self.backtest_report = None;
+        self.backtest_comparison.clear();
+        self.analysis_state.decision_card = None;
         self.palette_open = false;
         // A new selection is a new decision. Keep the process visible instead
         // of leaving the user on an unrelated detail tab or a collapsed dock.
@@ -1304,12 +1309,14 @@ impl StockApp {
         cx: &mut Context<Self>,
     ) {
         use crate::data::backtest;
-        if self.candles.len() < 60 {
+        self.backtest_active_rule = rule;
+        if !matches!(self.chart_kind, ChartKind::DayK) || self.candles.len() < 60 {
             self.backtest_report = None;
+            self.analysis_state.decision_card = Some(self.decision_card_view_model());
             self.status = shared(if self.work_mode {
-                "Need more daily bars"
+                "Switch to daily K and load at least 60 bars"
             } else {
-                "日 K 不足 60 根，无法回测"
+                "请切到日 K，并至少加载 60 根后再验证"
             });
             cx.notify();
             return;
@@ -1319,9 +1326,62 @@ impl StockApp {
         let report =
             backtest::run_for_instrument(&self.candles, self.selected.as_ref(), rule, 10, currency);
         self.backtest_report = report;
+        if let Some(report) = self.backtest_report.clone()
+            && let Some(existing) = self
+                .backtest_comparison
+                .iter_mut()
+                .find(|existing| existing.rule == report.rule)
+        {
+            *existing = report;
+        }
+        self.analysis_state.decision_card = Some(self.decision_card_view_model());
         if let Some(ref r) = self.backtest_report {
             self.status = shared(r.summary_line(self.work_mode));
         }
+        cx.notify();
+    }
+
+    pub(crate) fn run_backtest_comparison(&mut self, cx: &mut Context<Self>) {
+        use crate::data::backtest::{self, BacktestRule};
+
+        if !matches!(self.chart_kind, ChartKind::DayK) || self.candles.len() < 60 {
+            self.backtest_comparison.clear();
+            self.backtest_report = None;
+            self.analysis_state.decision_card = Some(self.decision_card_view_model());
+            self.status = shared(if self.work_mode {
+                "Switch to daily K and load at least 60 bars"
+            } else {
+                "请切到日 K，并至少加载 60 根后再比较"
+            });
+            cx.notify();
+            return;
+        }
+        let currency = crate::domain::money::Currency::for_code(self.selected.as_ref())
+            .unwrap_or(crate::domain::money::Currency::Cny);
+        self.backtest_comparison = BacktestRule::all()
+            .into_iter()
+            .filter_map(|rule| {
+                backtest::run_for_instrument(
+                    &self.candles,
+                    self.selected.as_ref(),
+                    rule,
+                    10,
+                    currency,
+                )
+            })
+            .collect();
+        self.backtest_report = self
+            .backtest_comparison
+            .iter()
+            .find(|report| report.rule == self.backtest_active_rule.label(false))
+            .cloned()
+            .or_else(|| self.backtest_comparison.first().cloned());
+        self.analysis_state.decision_card = Some(self.decision_card_view_model());
+        self.status = shared(if self.work_mode {
+            "Three rules compared on the same frozen series"
+        } else {
+            "三条规则已在同一日 K 样本、同一成本口径下完成比较"
+        });
         cx.notify();
     }
 
@@ -1399,6 +1459,11 @@ impl StockApp {
             if self.work_alias_editing {
                 self.work_alias_editing = false;
             }
+            self.signal_cache = None;
+            self.levels_cache = None;
+            self.backtest_report = None;
+            self.backtest_comparison.clear();
+            self.analysis_state.decision_card = None;
         }
         // Drop from status-bar pins if present.
         if let Some(ix) = self.status_bar_codes.iter().position(|c| c == code) {

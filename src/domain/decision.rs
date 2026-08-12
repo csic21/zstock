@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub const MINIMUM_PLAN_RISK_REWARD: f64 = 1.5;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionStatus {
@@ -212,7 +214,11 @@ impl DecisionCard {
             DecisionStatus::InsufficientEvidence
         } else if !input.eligibility.passed || !input.eligibility.blockers.is_empty() {
             DecisionStatus::NotEligible
-        } else if input.invalidation.is_none() {
+        } else if input.invalidation.is_none()
+            || input
+                .risk_reward
+                .is_none_or(|ratio| ratio < MINIMUM_PLAN_RISK_REWARD)
+        {
             DecisionStatus::Waiting
         } else if score >= 62.0 {
             DecisionStatus::MatchesStrategy
@@ -297,6 +303,27 @@ mod tests {
         let mut value = input();
         value.invalidation = None;
         assert_eq!(DecisionCard::build(value).status, DecisionStatus::Waiting);
+    }
+
+    #[test]
+    fn weak_or_undefined_payoff_never_matches() {
+        let mut undefined = input();
+        undefined.risk_reward = None;
+        assert_eq!(
+            DecisionCard::build(undefined).status,
+            DecisionStatus::Waiting
+        );
+
+        let mut weak = input();
+        weak.risk_reward = Some(MINIMUM_PLAN_RISK_REWARD - 0.01);
+        assert_eq!(DecisionCard::build(weak).status, DecisionStatus::Waiting);
+
+        let mut acceptable = input();
+        acceptable.risk_reward = Some(MINIMUM_PLAN_RISK_REWARD);
+        assert_eq!(
+            DecisionCard::build(acceptable).status,
+            DecisionStatus::MatchesStrategy
+        );
     }
 
     #[test]

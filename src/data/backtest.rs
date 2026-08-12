@@ -41,6 +41,56 @@ impl BacktestRule {
     pub fn all() -> [Self; 3] {
         [Self::Ma20CrossUp, Self::RsiOversoldExit, Self::Breakout20]
     }
+
+    pub fn playbook(self, work: bool) -> &'static str {
+        match (self, work) {
+            (Self::Ma20CrossUp, true) => "Trend recovery · wait for a close back above MA20",
+            (Self::Ma20CrossUp, false) => "趋势修复：收盘重新站上 MA20，次日开盘验证，不追盘中脉冲",
+            (Self::RsiOversoldExit, true) => "Mean reversion · only after RSI exits oversold",
+            (Self::RsiOversoldExit, false) => {
+                "超跌修复：RSI 离开超卖区后再观察，弱势下跌中不抢反弹"
+            }
+            (Self::Breakout20, true) => "Breakout · require price and volume confirmation",
+            (Self::Breakout20, false) => "趋势突破：收盘突破 20 日高并观察量能，偏离过大时等待回踩",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceVerdict {
+    Insufficient,
+    Reject,
+    Observe,
+    Candidate,
+}
+
+impl EvidenceVerdict {
+    pub fn label(self, work: bool) -> &'static str {
+        match (self, work) {
+            (Self::Insufficient, true) => "Insufficient",
+            (Self::Insufficient, false) => "样本不足",
+            (Self::Reject, true) => "Unsupported",
+            (Self::Reject, false) => "证据不支持",
+            (Self::Observe, true) => "Observe",
+            (Self::Observe, false) => "继续观察",
+            (Self::Candidate, true) => "Validation candidate",
+            (Self::Candidate, false) => "可继续验证",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TradeQualityMetrics {
+    pub trade_count: usize,
+    pub out_of_sample_count: usize,
+    pub win_rate_pct: Option<f64>,
+    pub out_of_sample_win_rate_pct: Option<f64>,
+    pub average_win_pct: Option<f64>,
+    pub average_loss_pct: Option<f64>,
+    pub payoff_ratio: Option<f64>,
+    pub profit_factor: Option<f64>,
+    pub expectancy_pct: Option<f64>,
+    pub out_of_sample_expectancy_pct: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -111,6 +161,118 @@ impl BacktestReport {
             self.evidence.dataset_version
         )
     }
+
+    pub fn quality_metrics(&self) -> TradeQualityMetrics {
+        let validation_start = self
+            .evidence
+            .validation_statistics
+            .as_ref()
+            .map(|statistics| statistics.start_index)
+            .unwrap_or(usize::MAX);
+        quality_metrics_for(&self.evidence.trades, validation_start)
+    }
+
+    /// Conservative, deterministic screening verdict. It deliberately requires
+    /// sample-out evidence and never promotes a strategy from win rate alone.
+    pub fn verdict(&self) -> EvidenceVerdict {
+        let quality = self.quality_metrics();
+        if quality.trade_count < 10 || quality.out_of_sample_count < 3 {
+            return EvidenceVerdict::Insufficient;
+        }
+        let profit_factor = quality.profit_factor.unwrap_or_else(|| {
+            if quality.expectancy_pct.is_some_and(|value| value > 0.0) {
+                f64::INFINITY
+            } else {
+                0.0
+            }
+        });
+        if quality
+            .out_of_sample_expectancy_pct
+            .is_none_or(|value| value <= 0.0)
+            || profit_factor < 1.0
+            || self.evidence.max_drawdown_pct <= -30.0
+        {
+            return EvidenceVerdict::Reject;
+        }
+        let interval_is_positive = self
+            .evidence
+            .confidence_interval_95_pct
+            .is_some_and(|(low, _)| low > 0.0);
+        if quality.trade_count >= 20
+            && quality.out_of_sample_count >= 5
+            && profit_factor >= 1.2
+            && self.evidence.max_drawdown_pct > -25.0
+            && interval_is_positive
+        {
+            EvidenceVerdict::Candidate
+        } else {
+            EvidenceVerdict::Observe
+        }
+    }
+}
+
+fn quality_metrics_for(
+    trades: &[crate::domain::backtest::SimulatedTrade],
+    validation_start: usize,
+) -> TradeQualityMetrics {
+    let out_of_sample = trades
+        .iter()
+        .filter(|trade| trade.signal_index >= validation_start)
+        .collect::<Vec<_>>();
+    let wins = trades
+        .iter()
+        .filter(|trade| trade.net_return_pct > 0.0)
+        .collect::<Vec<_>>();
+    let losses = trades
+        .iter()
+        .filter(|trade| trade.net_return_pct < 0.0)
+        .collect::<Vec<_>>();
+    let average_win_pct = mean_values(wins.iter().map(|trade| trade.net_return_pct));
+    let average_loss_pct = mean_values(losses.iter().map(|trade| trade.net_return_pct));
+    let gross_profit = wins.iter().map(|trade| trade.net_return_pct).sum::<f64>();
+    let gross_loss = losses
+        .iter()
+        .map(|trade| trade.net_return_pct.abs())
+        .sum::<f64>();
+    TradeQualityMetrics {
+        trade_count: trades.len(),
+        out_of_sample_count: out_of_sample.len(),
+        win_rate_pct: ratio_pct(
+            trades.len(),
+            trades
+                .iter()
+                .filter(|trade| trade.net_return_pct > 0.0)
+                .count(),
+        ),
+        out_of_sample_win_rate_pct: ratio_pct(
+            out_of_sample.len(),
+            out_of_sample
+                .iter()
+                .filter(|trade| trade.net_return_pct > 0.0)
+                .count(),
+        ),
+        average_win_pct,
+        average_loss_pct,
+        payoff_ratio: average_win_pct
+            .zip(average_loss_pct)
+            .and_then(|(win, loss)| (loss.abs() > f64::EPSILON).then_some(win / loss.abs())),
+        profit_factor: (gross_loss > f64::EPSILON).then_some(gross_profit / gross_loss),
+        expectancy_pct: mean_values(trades.iter().map(|trade| trade.net_return_pct)),
+        out_of_sample_expectancy_pct: mean_values(
+            out_of_sample.iter().map(|trade| trade.net_return_pct),
+        ),
+    }
+}
+
+fn mean_values(values: impl Iterator<Item = f64>) -> Option<f64> {
+    let (sum, count) = values.fold((0.0, 0usize), |(sum, count), value| {
+        (sum + value, count + 1)
+    });
+    (count > 0).then_some(sum / count as f64)
+}
+
+fn ratio_pct(total: usize, positive: usize) -> Option<f64> {
+    (total > 0).then_some(positive as f64 / total as f64 * 100.0)
 }
 
 /// Run a versioned rule with next-session-open execution, explicit costs and
@@ -235,7 +397,20 @@ fn legacy_strategy_spec(rule: BacktestRule, universe_id: &str, hold_days: u16) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::backtest::SimulatedTrade;
     use crate::model::shared;
+
+    fn simulated_trade(signal_index: usize, net_return_pct: f64) -> SimulatedTrade {
+        SimulatedTrade {
+            signal_index,
+            entry_index: signal_index + 1,
+            exit_index: signal_index + 2,
+            gross_return_pct: net_return_pct + 0.2,
+            net_return_pct,
+            entry_cost_pct: 0.1,
+            exit_cost_pct: 0.1,
+        }
+    }
 
     #[test]
     fn runs_on_synthetic_uptrend() {
@@ -283,5 +458,26 @@ mod tests {
             assert!(!report.evidence.cost_model.version.is_empty());
             assert_eq!(report.sample_bars, candles.len());
         }
+    }
+
+    #[test]
+    fn quality_metrics_keep_win_rate_payoff_and_oos_expectancy_separate() {
+        let trades = vec![
+            simulated_trade(10, 10.0),
+            simulated_trade(20, -5.0),
+            simulated_trade(80, 4.0),
+            simulated_trade(90, -2.0),
+        ];
+        let quality = quality_metrics_for(&trades, 70);
+        assert_eq!(quality.trade_count, 4);
+        assert_eq!(quality.out_of_sample_count, 2);
+        assert_eq!(quality.win_rate_pct, Some(50.0));
+        assert_eq!(quality.out_of_sample_win_rate_pct, Some(50.0));
+        assert_eq!(quality.average_win_pct, Some(7.0));
+        assert_eq!(quality.average_loss_pct, Some(-3.5));
+        assert_eq!(quality.payoff_ratio, Some(2.0));
+        assert_eq!(quality.profit_factor, Some(2.0));
+        assert_eq!(quality.expectancy_pct, Some(1.75));
+        assert_eq!(quality.out_of_sample_expectancy_pct, Some(1.0));
     }
 }

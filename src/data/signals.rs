@@ -50,6 +50,8 @@ pub struct SignalSnapshot {
     pub volatility_20_ann_pct: Option<f64>,
     pub max_drawdown_1y_pct: Option<f64>,
     pub volume_ratio_20: Option<f64>,
+    /// Distance from the latest close to MA20. Positive means price is above MA20.
+    pub price_vs_ma20_pct: f64,
     /// 0–100: only reflects sample/metric completeness, not prediction certainty.
     pub confidence: f64,
     pub reasons: Vec<&'static str>,
@@ -86,6 +88,10 @@ pub fn analyze(candles: &[Candle]) -> Option<SignalSnapshot> {
         reasons.push("价格位于MA20下方");
     } else {
         reasons.push("价格贴近MA20");
+    }
+    if price_vs_ma20 >= 0.08 {
+        score -= ((price_vs_ma20 - 0.08) * 100.0).clamp(6.0, 14.0);
+        reasons.push("价格偏离MA20，追高风险");
     }
 
     if let Some(ma60) = ma60 {
@@ -176,6 +182,7 @@ pub fn analyze(candles: &[Candle]) -> Option<SignalSnapshot> {
         volatility_20_ann_pct,
         max_drawdown_1y_pct,
         volume_ratio_20,
+        price_vs_ma20_pct: price_vs_ma20 * 100.0,
         confidence,
         reasons,
     })
@@ -320,5 +327,16 @@ mod tests {
             flat.regime,
             SignalRegime::Neutral | SignalRegime::Constructive
         ));
+    }
+
+    #[test]
+    fn overextended_price_is_flagged_instead_of_receiving_a_free_trend_bonus() {
+        let mut candles = series(10.0, 0.001, 120);
+        let last = candles.last_mut().unwrap();
+        last.close *= 1.25;
+        last.high = last.close * 1.01;
+        let snapshot = analyze(&candles).unwrap();
+        assert!(snapshot.price_vs_ma20_pct >= 8.0);
+        assert!(snapshot.reasons.contains(&"价格偏离MA20，追高风险"));
     }
 }
