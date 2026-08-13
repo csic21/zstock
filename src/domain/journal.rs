@@ -15,6 +15,10 @@ pub struct EvidenceSnapshot {
     pub data_as_of: String,
     pub source: String,
     pub payload_json: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regime: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

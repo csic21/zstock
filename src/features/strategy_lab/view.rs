@@ -16,7 +16,7 @@ use crate::domain::dataset::DatasetManifest;
 use crate::domain::experiment::{ExperimentRecord, ExperimentStatus};
 
 use super::presenter::{StrategyLabLayout, leaderboard};
-use super::state::{StrategyLabPage, StrategyLabState};
+use super::state::{StrategyLabPage, StrategyLabState, TemplateFamily};
 
 impl StockApp {
     pub(crate) fn render_strategy_lab(
@@ -232,6 +232,21 @@ impl StockApp {
                     this.strategy_lab_set_count(count, cx);
                 }))
         }));
+        let family_selector = h_flex().gap_2().flex_wrap().children(
+            [TemplateFamily::Generic, TemplateFamily::ScanPlaybooks]
+                .into_iter()
+                .enumerate()
+                .map(|(index, family)| {
+                    Button::new(("strategy-family", index))
+                        .xsmall()
+                        .when(form.template_family == family, |button| button.primary())
+                        .when(form.template_family != family, |button| button.ghost())
+                        .label(family.label())
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.strategy_lab_set_template_family(family, cx);
+                        }))
+                }),
+        );
 
         let setup = v_flex()
             .flex_1()
@@ -366,9 +381,16 @@ impl StockApp {
                     .gap_2()
                     .child(section_title(
                         "本次研究设定",
-                        "这些参数会写入实验版本；策略数量可在创建前调整。",
+                        "这些参数会写入实验版本；策略数量和模板来源可在创建前调整。",
                         cx,
                     ))
+                    .child(family_selector)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(form.template_family.hint()),
+                    )
                     .child(count_selector)
                     .child(
                         h_flex()

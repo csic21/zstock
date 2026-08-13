@@ -15,7 +15,7 @@ use crate::domain::paper::{
     PaperBehaviorComparison, PaperCandidate, PaperCandidateStatus, PaperRunResult,
     compare_with_backtest,
 };
-use crate::domain::strategy::{CompiledStrategy, local_templates};
+use crate::domain::strategy::{CompiledStrategy, local_templates, scan_playbooks};
 use crate::infrastructure::datasets::ingest::ingest_instruments;
 use crate::infrastructure::datasets::sqlite::SqliteLabStore;
 use crate::infrastructure::market::eastmoney::EastmoneyProvider;
@@ -272,10 +272,13 @@ impl StrategyLabFeature {
             },
         })?;
         let count = self.state.form.strategy_count.clamp(3, 8);
-        let specs: Vec<_> = local_templates(&manifest.id)
-            .into_iter()
-            .take(count)
-            .collect();
+        let specs: Vec<_> = match self.state.form.template_family {
+            super::state::TemplateFamily::Generic => local_templates(&manifest.id),
+            super::state::TemplateFamily::ScanPlaybooks => scan_playbooks(&manifest.id),
+        }
+        .into_iter()
+        .take(count)
+        .collect();
         let experiment_id = format!(
             "experiment:{}",
             chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ")
@@ -306,9 +309,15 @@ impl StrategyLabFeature {
                     max_positions: 10,
                 },
                 generation: GenerationAudit {
-                    model: "local-template".into(),
+                    model: match self.state.form.template_family {
+                        super::state::TemplateFamily::Generic => "local-template".into(),
+                        super::state::TemplateFamily::ScanPlaybooks => "scan-playbook".into(),
+                    },
                     transport: "local".into(),
-                    prompt_version: "strategy-generator-v1".into(),
+                    prompt_version: match self.state.form.template_family {
+                        super::state::TemplateFamily::Generic => "strategy-generator-v1".into(),
+                        super::state::TemplateFamily::ScanPlaybooks => "scan-playbook-v1".into(),
+                    },
                     raw_candidate_count: specs.len(),
                     validation_failure_count: 0,
                     raw_response_sha256: None,
@@ -1044,6 +1053,22 @@ mod tests {
         assert_eq!(feature.state.sealed_tests.len(), 1);
         assert_eq!(feature.state.page, StrategyLabPage::Leaderboard);
         assert!(feature.state.ai_explanation.is_none());
+    }
+
+    #[test]
+    fn scan_playbooks_seed_four_drafts() {
+        let mut feature = feature();
+        feature.state.form.template_family =
+            crate::features::strategy_lab::state::TemplateFamily::ScanPlaybooks;
+        feature.create_local_experiment(series()).unwrap();
+        assert_eq!(feature.state.drafts.len(), 4);
+        assert!(
+            feature
+                .state
+                .drafts
+                .iter()
+                .all(|draft| draft.spec.metadata.generator == "scan-playbook")
+        );
     }
 
     #[test]

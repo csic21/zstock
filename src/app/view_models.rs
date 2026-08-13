@@ -539,6 +539,10 @@ impl StockApp {
                 data_as_of: card.data_as_of.clone(),
                 source: card.source.clone(),
                 payload_json: serde_json::to_string(&card).unwrap_or_else(|_| "{}".into()),
+                score: card.score,
+                regime: self
+                    .current_signal()
+                    .map(|signal| signal.regime.label().to_string()),
             },
             executed: None,
             exit_reason: None,

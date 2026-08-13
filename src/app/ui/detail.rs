@@ -587,6 +587,61 @@ impl StockApp {
                                                 .text_color(cx.theme().warning)
                                                 .child(line),
                                         )
+                                    })
+                                    .when_some(e.plan.as_ref(), |column, plan| {
+                                        let review_id = e.id.clone();
+                                        column.when(
+                                            plan.followed_plan.is_none()
+                                                || plan.status
+                                                    != crate::domain::journal::PlanStatus::Reviewed,
+                                            |column| {
+                                                column.child(
+                                                    h_flex()
+                                                        .gap_1()
+                                                        .child(
+                                                            Button::new((
+                                                                "journal-followed",
+                                                                ix as u32,
+                                                            ))
+                                                            .xsmall()
+                                                            .ghost()
+                                                            .label(if work {
+                                                                "Followed"
+                                                            } else {
+                                                                "按计划"
+                                                            })
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _w, cx| {
+                                                                    this.review_journal_plan(
+                                                                        &review_id, true, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                        )
+                                                        .child({
+                                                            let review_id = e.id.clone();
+                                                            Button::new((
+                                                                "journal-overridden",
+                                                                ix as u32,
+                                                            ))
+                                                            .xsmall()
+                                                            .ghost()
+                                                            .label(if work {
+                                                                "Override"
+                                                            } else {
+                                                                "未按计划"
+                                                            })
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _w, cx| {
+                                                                    this.review_journal_plan(
+                                                                        &review_id, false, cx,
+                                                                    );
+                                                                },
+                                                            ))
+                                                        }),
+                                                )
+                                            },
+                                        )
                                     }),
                             )
                             .child(

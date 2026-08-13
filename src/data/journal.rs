@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::domain::journal::{DecisionPlan, PlanOutcome, PlanStatus, add_outcome_idempotently};
+use crate::domain::rule_ledger::LedgerSource;
 use crate::model::Candle;
 
 pub const JOURNAL_SCHEMA_VERSION: u32 =
@@ -70,6 +71,45 @@ pub struct JournalEntry {
     pub plan: Option<DecisionPlan>,
     #[serde(default)]
     pub outcomes: Vec<PlanOutcome>,
+}
+
+impl LedgerSource for JournalEntry {
+    fn strategy_version(&self) -> &str {
+        self.plan
+            .as_ref()
+            .map(|plan| plan.evidence.strategy_version.as_str())
+            .unwrap_or("unplanned")
+    }
+
+    fn score(&self) -> Option<f64> {
+        if let Some(score) = self.plan.as_ref().and_then(|plan| plan.evidence.score) {
+            return Some(score);
+        }
+        self.plan
+            .as_ref()
+            .and_then(|plan| {
+                serde_json::from_str::<serde_json::Value>(&plan.evidence.payload_json).ok()
+            })
+            .and_then(|value| value.get("score")?.as_f64())
+    }
+
+    fn regime(&self) -> Option<&str> {
+        self.plan
+            .as_ref()
+            .and_then(|plan| plan.evidence.regime.as_deref())
+    }
+
+    fn followed_plan(&self) -> Option<bool> {
+        self.plan.as_ref().and_then(|plan| plan.followed_plan)
+    }
+
+    fn plan(&self) -> Option<&DecisionPlan> {
+        self.plan.as_ref()
+    }
+
+    fn outcomes(&self) -> &[PlanOutcome] {
+        &self.outcomes
+    }
 }
 
 impl JournalEntry {
@@ -158,6 +198,19 @@ impl Journal {
             .iter_mut()
             .find(|entry| entry.id == entry_id)
             .is_some_and(|entry| add_outcome_idempotently(&mut entry.outcomes, outcome))
+    }
+
+    pub fn review_plan(&mut self, entry_id: &str, followed: bool) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == entry_id) else {
+            return false;
+        };
+        let Some(plan) = entry.plan.as_mut() else {
+            return false;
+        };
+        plan.followed_plan = Some(followed);
+        plan.executed = Some(followed);
+        plan.status = PlanStatus::Reviewed;
+        true
     }
 
     pub fn behavior_sample_size(&self) -> Option<usize> {
@@ -299,6 +352,8 @@ mod tests {
                     data_as_of: created_on.into(),
                     source: "fixture".into(),
                     payload_json: "{\"score\":61}".into(),
+                    score: Some(61.0),
+                    regime: Some("中性".into()),
                 },
                 executed: None,
                 exit_reason: None,
@@ -354,5 +409,16 @@ mod tests {
             }
         }
         assert_eq!(journal.behavior_sample_size(), Some(20));
+    }
+
+    #[test]
+    fn review_plan_marks_discipline() {
+        let mut journal = Journal::default();
+        journal.push(planned_entry("p1", "2026-01-01", "2026-01-10"));
+        assert!(journal.review_plan("p1", true));
+        let plan = journal.entries[0].plan.as_ref().unwrap();
+        assert_eq!(plan.status, PlanStatus::Reviewed);
+        assert_eq!(plan.followed_plan, Some(true));
+        assert!(!journal.review_plan("missing", false));
     }
 }

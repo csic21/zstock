@@ -89,6 +89,18 @@ impl super::StockApp {
         cx.notify();
     }
 
+    pub(crate) fn strategy_lab_set_template_family(
+        &mut self,
+        family: crate::features::strategy_lab::state::TemplateFamily,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.strategy_lab_feature.state.form.template_family = family;
+        if family == crate::features::strategy_lab::state::TemplateFamily::ScanPlaybooks {
+            self.strategy_lab_feature.state.form.strategy_count = 4;
+        }
+        cx.notify();
+    }
+
     pub(crate) fn strategy_lab_create_current(&mut self, cx: &mut gpui::Context<Self>) {
         let code = self.selected.to_string();
         let market = Market::for_code(&code).unwrap_or(Market::AShare);

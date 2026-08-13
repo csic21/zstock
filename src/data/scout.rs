@@ -9,8 +9,10 @@
 use serde::Serialize;
 
 use crate::data::ai::{self, AiConfig, AiSnapshot};
+use crate::data::eastmoney::FundamentalReportRow;
 use crate::data::levels::{self, ReferenceLevels};
 use crate::data::treasure::{TreasureHit, TreasureTag};
+use crate::domain::fundamentals::{QualityGate, ReportedMetric, quality_gate};
 use crate::model::Candle;
 
 /// 从寻宝榜取多少只做二次深评（控制耗时与请求量）。
@@ -94,6 +96,140 @@ pub fn evaluate(hit: &TreasureHit, candles: &[Candle]) -> Option<ScoutPick> {
     let snap = ai::build_snapshot(candles, &hit.code, &hit.name)?;
     let levels = levels::compute(candles)?;
     Some(score_pick(hit, &snap, &levels))
+}
+
+pub fn quality_gate_from_reports(
+    reports: &[FundamentalReportRow],
+    signal_date: &str,
+) -> QualityGate {
+    let mut metrics = Vec::new();
+    for report in reports {
+        push_report_metric(&mut metrics, "roe_pct", report.roe_pct, report);
+        push_report_metric(&mut metrics, "roic_pct", report.roic_pct, report);
+        push_report_metric(
+            &mut metrics,
+            "operating_cash_to_profit",
+            report.operating_cash_to_profit,
+            report,
+        );
+        push_report_metric(
+            &mut metrics,
+            "debt_ratio_pct",
+            report.debt_ratio_pct,
+            report,
+        );
+        push_report_metric(
+            &mut metrics,
+            "revenue_growth_pct",
+            report.revenue_growth_pct,
+            report,
+        );
+        push_report_metric(
+            &mut metrics,
+            "profit_growth_pct",
+            report.profit_growth_pct,
+            report,
+        );
+        push_report_metric(
+            &mut metrics,
+            "goodwill_ratio_pct",
+            report.goodwill_ratio_pct,
+            report,
+        );
+        if report.is_annual || report.audit_risk_flag.is_some() {
+            push_report_metric(
+                &mut metrics,
+                "audit_risk_flag",
+                report.audit_risk_flag,
+                report,
+            );
+        }
+    }
+    quality_gate(&metrics, signal_date)
+}
+
+fn push_report_metric(
+    metrics: &mut Vec<ReportedMetric>,
+    name: &str,
+    value: Option<f64>,
+    report: &FundamentalReportRow,
+) {
+    metrics.push(ReportedMetric {
+        name: name.into(),
+        value,
+        unit: "%".into(),
+        reporting_period: report.reporting_period.clone(),
+        announced_on: report.announced_on.clone(),
+        source: "eastmoney-f10".into(),
+    });
+}
+
+/// Quality gate only blocks value traps. Missing metrics stay visible as risks
+/// and do not silently promote a name into 可关注.
+pub fn apply_quality_gate(pick: &mut ScoutPick, gate: &QualityGate) {
+    if !gate.blockers.is_empty() {
+        for blocker in &gate.blockers {
+            if !pick.risks.iter().any(|risk| risk == blocker) {
+                pick.risks.push(blocker.clone());
+            }
+        }
+        let lethal = gate.blockers.iter().any(|blocker| {
+            blocker.contains("ROE")
+                || blocker.contains("ROIC")
+                || blocker.contains("审计")
+                || blocker.contains("现金流")
+        });
+        if lethal {
+            pick.verdict = ScoutVerdict::Skip;
+        } else if pick.verdict == ScoutVerdict::BuyWatch {
+            pick.verdict = ScoutVerdict::Watch;
+        }
+        refresh_headline(pick);
+        return;
+    }
+    if gate.passed {
+        if !pick
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("基本面质量"))
+        {
+            pick.reasons.push("基本面质量门槛通过".into());
+        }
+    } else if !gate.unknown.is_empty()
+        && !pick
+            .risks
+            .iter()
+            .any(|risk| risk.contains("基本面未完全核验"))
+    {
+        pick.risks.push("基本面未完全核验".into());
+    }
+    refresh_headline(pick);
+}
+
+fn refresh_headline(pick: &mut ScoutPick) {
+    pick.headline = match pick.verdict {
+        ScoutVerdict::BuyWatch => format!(
+            "符合策略 · 参考观察区间 {} 元 · 位置{:.0}/匹配{:.0}",
+            pick.buy_band_text(),
+            pick.treasure_score,
+            pick.buy_score
+        ),
+        ScoutVerdict::Watch => format!(
+            "等待触发 · 参考观察区间 {} 元 · 位置{:.0}/匹配{:.0}",
+            pick.buy_band_text(),
+            pick.treasure_score,
+            pick.buy_score
+        ),
+        ScoutVerdict::Skip => format!(
+            "不符合 · 位置{:.0}/匹配{:.0}{}",
+            pick.treasure_score,
+            pick.buy_score,
+            pick.risks
+                .first()
+                .map(|risk| format!(" · {risk}"))
+                .unwrap_or_default()
+        ),
+    };
 }
 
 fn score_pick(hit: &TreasureHit, snap: &AiSnapshot, levels: &ReferenceLevels) -> ScoutPick {
@@ -526,5 +662,38 @@ mod tests {
     fn local_summary_mentions_disclaimer() {
         let text = local_summary(&[]);
         assert!(text.contains("未筛出") || text.contains("不构成"));
+    }
+
+    #[test]
+    fn quality_blockers_cannot_stay_buy_watch() {
+        let mut pick = ScoutPick {
+            code: "000001".into(),
+            name: "trap".into(),
+            treasure_score: 80.0,
+            buy_score: 70.0,
+            verdict: ScoutVerdict::BuyWatch,
+            close: 10.0,
+            buy_low: 9.0,
+            buy_high: 9.5,
+            sell_low: 11.0,
+            sell_high: 12.0,
+            regime: "中性".into(),
+            rsi14: Some(40.0),
+            tags: vec![],
+            reasons: vec!["多年低位".into()],
+            risks: vec![],
+            headline: String::new(),
+        };
+        apply_quality_gate(
+            &mut pick,
+            &QualityGate {
+                passed: false,
+                blockers: vec!["ROE 为负".into()],
+                unknown: vec![],
+            },
+        );
+        assert_eq!(pick.verdict, ScoutVerdict::Skip);
+        assert!(pick.risks.iter().any(|risk| risk.contains("ROE")));
+        assert!(pick.headline.contains("不符合"));
     }
 }

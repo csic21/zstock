@@ -566,19 +566,36 @@ impl StockApp {
 
                 let code = hit.code.clone();
                 let result = smol::unblock(move || {
-                    market::fetch_klines_adjusted(&code, TREASURE_KLINE_LIMIT)
+                    let sourced = market::fetch_klines_adjusted(&code, TREASURE_KLINE_LIMIT)?;
+                    let (_c, name, candles) = &sourced.data;
+                    let mut hit = hit;
+                    if is_real_name(name, &hit.code) {
+                        hit.name = name.clone();
+                    }
+                    let mut pick = scout::evaluate(&hit, candles);
+                    if let Some(pick) = pick.as_mut()
+                        && pick.verdict == ScoutVerdict::BuyWatch
+                    {
+                        match eastmoney::fetch_fundamental_reports(&pick.code, 4) {
+                            Ok(reports) => {
+                                let as_of = candles
+                                    .last()
+                                    .map(|candle| candle.date.to_string())
+                                    .unwrap_or_default();
+                                scout::apply_quality_gate(
+                                    pick,
+                                    &scout::quality_gate_from_reports(&reports, &as_of),
+                                );
+                            }
+                            Err(_) => pick.risks.push("基本面未核验".into()),
+                        }
+                    }
+                    anyhow::Ok((sourced, pick))
                 })
                 .await;
 
-                if let Ok(sourced) = result {
-                    let (_c, name, candles) = sourced.data;
-                    let mut hit = hit;
-                    if is_real_name(&name, &hit.code) {
-                        hit.name = name;
-                    }
-                    if let Some(pick) = scout::evaluate(&hit, &candles) {
-                        raw.push(pick);
-                    }
+                if let Ok((_sourced, Some(pick))) = result {
+                    raw.push(pick);
                 }
 
                 let done = i + 1;
@@ -806,6 +823,18 @@ impl StockApp {
     }
 
     // —— 决策日记 ——
+
+    pub(crate) fn review_journal_plan(&mut self, id: &str, followed: bool, cx: &mut Context<Self>) {
+        if self.journal.review_plan(id, followed) {
+            self.persist_journal();
+            self.status = crate::model::shared(if followed {
+                "已记为按计划执行"
+            } else {
+                "已记为未按计划"
+            });
+        }
+        cx.notify();
+    }
 
     pub(crate) fn persist_journal(&self) {
         if let Err(error) = storage::save_journal(&self.journal) {

@@ -4,6 +4,7 @@ use gpui::Context;
 
 use crate::data::scout::ScoutVerdict;
 use crate::domain::journal::PlanStatus;
+use crate::domain::rule_ledger::{RuleLedgerReport, build_rule_ledger};
 use crate::domain::today::{
     TodayAction, TodayActionTarget, TodayAlertSnapshot, TodayDashboard, TodayDashboardInput,
     TodayOpportunity, TodayPlanSnapshot, TodayRiskSnapshot, build_today_dashboard,
@@ -95,6 +96,10 @@ impl StockApp {
             opportunities,
             open_positions: summary.open_count,
         })
+    }
+
+    pub(crate) fn rule_ledger_view_model(&self) -> RuleLedgerReport {
+        build_rule_ledger(&self.journal.entries)
     }
 
     pub(crate) fn open_today_action(&mut self, action: TodayAction, cx: &mut Context<Self>) {

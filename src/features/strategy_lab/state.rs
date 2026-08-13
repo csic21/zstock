@@ -39,12 +39,36 @@ impl StrategyLabPage {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TemplateFamily {
+    #[default]
+    Generic,
+    ScanPlaybooks,
+}
+
+impl TemplateFamily {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Generic => "通用模板",
+            Self::ScanPlaybooks => "扫描规则",
+        }
+    }
+
+    pub const fn hint(self) -> &'static str {
+        match self {
+            Self::Generic => "MA / RSI / 突破等通用研究模板",
+            Self::ScanPlaybooks => "雷达回踩·突破·超跌 + 寻宝低位，走同一套冻结回测",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StrategyLabForm {
     pub goal: String,
     pub strategy_count: usize,
     pub max_drawdown_pct: f64,
     pub initial_cash: f64,
+    pub template_family: TemplateFamily,
 }
 
 impl Default for StrategyLabForm {
@@ -54,6 +78,7 @@ impl Default for StrategyLabForm {
             strategy_count: 5,
             max_drawdown_pct: 20.0,
             initial_cash: 1_000_000.0,
+            template_family: TemplateFamily::Generic,
         }
     }
 }

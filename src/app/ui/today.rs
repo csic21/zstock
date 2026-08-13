@@ -9,6 +9,7 @@ use gpui_component::{
     h_flex, v_flex,
 };
 
+use crate::domain::rule_ledger::RuleLedgerReport;
 use crate::domain::today::{TodayAction, TodayActionTarget, TodayOpportunity, TodaySeverity};
 
 use super::super::{StockApp, state::PrimaryTask};
@@ -16,6 +17,7 @@ use super::super::{StockApp, state::PrimaryTask};
 impl StockApp {
     pub(crate) fn render_today_dashboard(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let dashboard = self.today_dashboard_view_model();
+        let ledger = self.rule_ledger_view_model();
         let action_count = dashboard.actions.len();
         let now = chrono::Local::now();
         let weekday = match now.weekday() {
@@ -320,6 +322,7 @@ impl StockApp {
                                             }),
                                     ),
                             )
+                            .child(self.render_rule_ledger_card(&ledger, cx))
                             .child(
                                 v_flex()
                                     .gap_1()
@@ -503,6 +506,147 @@ impl StockApp {
             )
             .into_any_element()
     }
+
+    fn render_rule_ledger_card(
+        &self,
+        ledger: &RuleLedgerReport,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let work = self.work_mode;
+        v_flex()
+            .w_full()
+            .gap_2()
+            .p_4()
+            .rounded(cx.theme().radius_lg)
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().sidebar)
+            .child(today_section_title(
+                if work { "Rule ledger" } else { "规则台账" },
+                if work {
+                    "Cross-symbol calibration · not a promotion score"
+                } else {
+                    "按策略、分数段、是否按计划和市场状态汇总 10 日真实结果，不单独用胜率晋级"
+                },
+                cx,
+            ))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().foreground)
+                    .child(ledger.headline.clone()),
+            )
+            .when(ledger.sample > 0, |card| {
+                card.child(
+                    h_flex().gap_2().flex_wrap().children(
+                        [
+                            (
+                                if work { "Win" } else { "胜率" },
+                                format_opt_pct(ledger.overall.win_rate_pct),
+                            ),
+                            (
+                                if work { "Expectancy" } else { "期望" },
+                                format_opt_signed(ledger.overall.expectancy_pct),
+                            ),
+                            ("MFE", format_opt_signed(ledger.overall.average_mfe_pct)),
+                            ("MAE", format_opt_signed(ledger.overall.average_mae_pct)),
+                            (
+                                if work { "Target hit" } else { "目标触及" },
+                                format_opt_pct(ledger.exit.target_touch_rate_pct),
+                            ),
+                        ]
+                        .into_iter()
+                        .map(|(label, value)| ledger_metric(label, &value, cx)),
+                    ),
+                )
+            })
+            .when_some(ledger.exit_hint.clone(), |card, hint| {
+                card.child(div().text_xs().text_color(cx.theme().warning).child(hint))
+            })
+            .when(ledger.sample > 0, |card| {
+                card.child(
+                    h_flex().gap_3().flex_wrap().children(
+                        [
+                            ("策略", ledger.by_strategy.as_slice()),
+                            ("分数段", ledger.by_score.as_slice()),
+                            ("纪律", ledger.by_followed.as_slice()),
+                            ("状态", ledger.by_regime.as_slice()),
+                        ]
+                        .into_iter()
+                        .filter(|(_, slices)| !slices.is_empty())
+                        .map(|(title, slices)| ledger_group(title, slices, work, cx)),
+                    ),
+                )
+            })
+            .into_any_element()
+    }
+}
+
+fn ledger_metric(label: &str, value: &str, cx: &mut Context<StockApp>) -> AnyElement {
+    v_flex()
+        .gap_0p5()
+        .px_3()
+        .py_2()
+        .rounded(cx.theme().radius)
+        .bg(cx.theme().muted.opacity(0.35))
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .text_sm()
+                .font_semibold()
+                .text_color(cx.theme().foreground)
+                .child(value.to_string()),
+        )
+        .into_any_element()
+}
+
+fn ledger_group(
+    title: &str,
+    slices: &[crate::domain::rule_ledger::LedgerSlice],
+    work: bool,
+    cx: &mut Context<StockApp>,
+) -> AnyElement {
+    v_flex()
+        .min_w(px(180.0))
+        .gap_1()
+        .child(
+            div()
+                .text_xs()
+                .font_semibold()
+                .text_color(cx.theme().muted_foreground)
+                .child(title.to_string()),
+        )
+        .children(slices.iter().take(4).map(|slice| {
+            div()
+                .text_xs()
+                .text_color(cx.theme().foreground)
+                .child(format!(
+                    "{} · {} {} · {} {}",
+                    slice.label,
+                    slice.sample,
+                    if work { "n" } else { "笔" },
+                    format_opt_pct(slice.win_rate_pct),
+                    format_opt_signed(slice.expectancy_pct)
+                ))
+        }))
+        .into_any_element()
+}
+
+fn format_opt_pct(value: Option<f64>) -> String {
+    value
+        .map(|number| format!("{number:.0}%"))
+        .unwrap_or_else(|| "—".into())
+}
+
+fn format_opt_signed(value: Option<f64>) -> String {
+    value
+        .map(|number| format!("{number:+.2}%"))
+        .unwrap_or_else(|| "—".into())
 }
 
 fn today_metric(

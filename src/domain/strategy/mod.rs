@@ -19,7 +19,7 @@ pub use spec::{
     ExitRule, PositionRule, STRATEGY_SCHEMA_VERSION, StrategyMetadata, StrategySpec, Timeframe,
     UniverseSpec,
 };
-pub use templates::{LocalTemplate, local_templates};
+pub use templates::{LocalTemplate, ScanPlaybook, local_templates, scan_playbooks};
 pub use validation::{ValidatedStrategy, ValidationError, ValidationLimits, validate};
 
 const MAX_STRATEGY_JSON_BYTES: usize = 64 * 1024;
@@ -297,6 +297,27 @@ mod tests {
             CompiledStrategy::compile(LocalTemplate::VolumeTrendConfirmation.build("fixture"))
                 .unwrap();
         assert!(volume.entry_signal(&volume_bars, 29));
+    }
+
+    #[test]
+    fn scan_playbooks_compile_and_match_scanner_names() {
+        let playbooks = scan_playbooks("fixture");
+        assert_eq!(playbooks.len(), 4);
+        for spec in &playbooks {
+            CompiledStrategy::compile(spec.clone()).unwrap();
+            assert_eq!(spec.metadata.generator, "scan-playbook");
+            assert!(spec.exit.contains_time_exit());
+        }
+        let names: Vec<_> = playbooks.iter().map(|spec| spec.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "雷达·强势回踩",
+                "雷达·放量突破",
+                "雷达·超跌反弹",
+                "寻宝·低位观察"
+            ]
+        );
     }
 
     #[test]
