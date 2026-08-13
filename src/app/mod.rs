@@ -999,7 +999,7 @@ impl Render for StockApp {
                     .min_h_0()
                     .w_full()
                     .overflow_hidden()
-                    .child(self.render_today_dashboard(cx))
+                    .child(self.render_today_dashboard(window, cx))
                     .into_any_element()
             } else if self.ui_state.primary_task == state::PrimaryTask::StrategyLab {
                 div()
@@ -1536,6 +1536,81 @@ mod layout_regression_tests {
             (root.size.height.as_f32() - 826.0).abs() < 1.0,
             "today dashboard should fill the content area, got {}",
             root.size.height.as_f32()
+        );
+    }
+
+    /// Wide / fullscreen Today used to pin opportunities at 430px and leave a
+    /// black void beside the short empty-actions card. Both columns must share
+    /// the remaining height and use the full content width.
+    #[gpui::test]
+    fn today_dashboard_fills_wide_window(cx: &mut TestAppContext) {
+        let mut window = test_window(cx, 1600.0, 900.0);
+        let handle = window.window_handle();
+        let update_result = window.cx.update_window(handle, |view, _window, cx| {
+            view.downcast::<StockApp>()
+                .expect("window root view")
+                .update(cx, |this, cx| {
+                    this.ui_state.primary_task = super::state::PrimaryTask::Today;
+                    this.market_analysis_open = false;
+                    cx.notify();
+                });
+        });
+        assert!(update_result.is_ok(), "today update should succeed");
+        window.run_until_parked();
+        window.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let root = window
+            .debug_bounds("today-dashboard-root")
+            .expect("today-dashboard-root bounds");
+        let content = window
+            .debug_bounds("today-dashboard-content")
+            .expect("today-dashboard-content bounds");
+        let board = window
+            .debug_bounds("today-board-row")
+            .expect("today-board-row bounds");
+        let actions = window
+            .debug_bounds("today-actions-column")
+            .expect("today-actions-column bounds");
+        let opportunities = window
+            .debug_bounds("today-opportunities-column")
+            .expect("today-opportunities-column bounds");
+        let empty = window
+            .debug_bounds("today-empty-actions")
+            .expect("today-empty-actions bounds");
+
+        assert!(
+            (root.size.height.as_f32() - 866.0).abs() < 1.0,
+            "today dashboard should fill 900-34, got {}",
+            root.size.height.as_f32()
+        );
+        assert!(
+            content.size.width.as_f32() > 1480.0,
+            "today content should use the wide viewport, got {}",
+            content.size.width.as_f32()
+        );
+        assert!(
+            board.size.width.as_f32() > 1480.0,
+            "today board should stretch full content width, got {}",
+            board.size.width.as_f32()
+        );
+        assert!(
+            (actions.size.height.as_f32() - opportunities.size.height.as_f32()).abs() < 2.0,
+            "action and opportunity columns should share height, got {} vs {}",
+            actions.size.height.as_f32(),
+            opportunities.size.height.as_f32()
+        );
+        assert!(
+            empty.size.height.as_f32() > 180.0,
+            "empty actions card should fill leftover column height, got {}",
+            empty.size.height.as_f32()
+        );
+        assert!(
+            actions.size.width.as_f32() > 500.0 && opportunities.size.width.as_f32() > 500.0,
+            "wide layout should split remaining width, got {} / {}",
+            actions.size.width.as_f32(),
+            opportunities.size.width.as_f32()
         );
     }
 

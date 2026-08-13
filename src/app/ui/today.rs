@@ -1,10 +1,10 @@
 use chrono::Datelike;
 use gpui::{
     AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
-    ActiveTheme, Sizable, StyledExt,
+    ActiveTheme, PixelsExt, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex, v_flex,
 };
@@ -15,10 +15,20 @@ use crate::domain::today::{TodayAction, TodayActionTarget, TodayOpportunity, Tod
 use super::super::{StockApp, state::PrimaryTask};
 
 impl StockApp {
-    pub(crate) fn render_today_dashboard(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_today_dashboard(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let dashboard = self.today_dashboard_view_model();
         let ledger = self.rule_ledger_view_model();
         let action_count = dashboard.actions.len();
+        let window_width = window.bounds().size.width.as_f32();
+        let window_height = window.bounds().size.height.as_f32();
+        let wide = window_width >= 1280.0;
+        let content_min_h = (window_height - 34.0 - 68.0 - 48.0).max(420.0);
+        let board_min_h = (content_min_h - 220.0).max(280.0);
+        let empty_min_h = (board_min_h - 52.0).max(180.0);
         let now = chrono::Local::now();
         let weekday = match now.weekday() {
             chrono::Weekday::Mon => "星期一",
@@ -107,14 +117,18 @@ impl StockApp {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .p_5()
+                    .px_5()
+                    .py_4()
                     .child(
                         v_flex()
+                            .id("today-dashboard-content")
+                            .debug_selector(|| "today-dashboard-content".into())
                             .w_full()
-                            .max_w(px(1360.0))
-                            .gap_5()
+                            .min_h(px(content_min_h))
+                            .gap_4()
                             .child(
                                 h_flex()
+                                    .w_full()
                                     .gap_2()
                                     .flex_wrap()
                                     .children([
@@ -172,14 +186,20 @@ impl StockApp {
                             )
                             .child(
                                 h_flex()
+                                    .id("today-board-row")
+                                    .debug_selector(|| "today-board-row".into())
                                     .w_full()
+                                    .flex_1()
+                                    .min_h(px(board_min_h))
                                     .gap_4()
-                                    .items_start()
-                                    .flex_wrap()
+                                    .when(!wide, |row| row.flex_wrap())
                                     .child(
                                         v_flex()
+                                            .id("today-actions-column")
+                                            .debug_selector(|| "today-actions-column".into())
                                             .flex_1()
-                                            .min_w(px(500.0))
+                                            .min_w(if wide { px(420.0) } else { px(320.0) })
+                                            .min_h(px(220.0))
                                             .gap_2()
                                             .child(today_section_title(
                                                 "需要处理",
@@ -189,11 +209,21 @@ impl StockApp {
                                             .when(dashboard.actions.is_empty(), |column| {
                                                 column.child(
                                                     v_flex()
+                                                        .id("today-empty-actions")
+                                                        .debug_selector(|| {
+                                                            "today-empty-actions".into()
+                                                        })
+                                                        .flex_1()
+                                                        .w_full()
+                                                        .min_h(px(empty_min_h))
+                                                        .justify_center()
                                                         .gap_1()
-                                                        .p_4()
+                                                        .p_5()
                                                         .rounded(cx.theme().radius_lg)
                                                         .border_1()
-                                                        .border_color(cx.theme().success.opacity(0.3))
+                                                        .border_color(
+                                                            cx.theme().success.opacity(0.3),
+                                                        )
                                                         .bg(cx.theme().success.opacity(0.05))
                                                         .child(
                                                             div()
@@ -241,8 +271,13 @@ impl StockApp {
                                     )
                                     .child(
                                         v_flex()
-                                            .w(px(430.0))
-                                            .min_w(px(340.0))
+                                            .id("today-opportunities-column")
+                                            .debug_selector(|| {
+                                                "today-opportunities-column".into()
+                                            })
+                                            .flex_1()
+                                            .min_w(if wide { px(420.0) } else { px(320.0) })
+                                            .min_h(px(220.0))
                                             .gap_2()
                                             .child(today_section_title(
                                                 "候选机会",
@@ -252,8 +287,12 @@ impl StockApp {
                                             .when(dashboard.opportunities.is_empty(), |column| {
                                                 column.child(
                                                     v_flex()
+                                                        .flex_1()
+                                                        .w_full()
+                                                        .min_h(px(empty_min_h))
+                                                        .justify_center()
                                                         .gap_2()
-                                                        .p_4()
+                                                        .p_5()
                                                         .rounded(cx.theme().radius_lg)
                                                         .border_1()
                                                         .border_color(cx.theme().border)
@@ -290,20 +329,29 @@ impl StockApp {
                                                         ),
                                                 )
                                             })
-                                            .children(
-                                                dashboard
-                                                    .opportunities
-                                                    .iter()
-                                                    .cloned()
-                                                    .enumerate()
-                                                    .map(|(index, opportunity)| {
-                                                        self.render_today_opportunity_row(
-                                                            index,
-                                                            opportunity,
-                                                            cx,
-                                                        )
-                                                    }),
-                                            )
+                                            .when(!dashboard.opportunities.is_empty(), |column| {
+                                                column.child(
+                                                    h_flex()
+                                                        .w_full()
+                                                        .gap_2()
+                                                        .flex_wrap()
+                                                        .children(
+                                                            dashboard
+                                                                .opportunities
+                                                                .iter()
+                                                                .cloned()
+                                                                .enumerate()
+                                                                .map(|(index, opportunity)| {
+                                                                    self.render_today_opportunity_row(
+                                                                        index,
+                                                                        opportunity,
+                                                                        wide,
+                                                                        cx,
+                                                                    )
+                                                                }),
+                                                        ),
+                                                )
+                                            })
                                             .when(!dashboard.opportunities.is_empty(), |column| {
                                                 column.child(
                                                     Button::new("today-all-opportunities")
@@ -430,6 +478,7 @@ impl StockApp {
         &self,
         index: usize,
         opportunity: TodayOpportunity,
+        wide: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let color = if opportunity.ready {
@@ -440,7 +489,8 @@ impl StockApp {
         let code = opportunity.code.clone();
         h_flex()
             .id(("today-opportunity", index))
-            .w_full()
+            .when(wide, |row| row.flex_1().min_w(px(280.0)))
+            .when(!wide, |row| row.w_full())
             .gap_2()
             .items_center()
             .p_3()
@@ -658,8 +708,7 @@ fn today_metric(
 ) -> AnyElement {
     v_flex()
         .flex_1()
-        .min_w(px(188.0))
-        .max_w(px(260.0))
+        .min_w(px(168.0))
         .gap_1()
         .p_4()
         .rounded(cx.theme().radius_lg)
