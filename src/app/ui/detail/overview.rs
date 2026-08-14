@@ -9,6 +9,7 @@ use gpui_component::{
 
 use crate::app::StockApp;
 use crate::app::helpers::*;
+use crate::domain::climate::NewEntryStance;
 use crate::domain::decision::{DecisionCard, DecisionStatus};
 use crate::domain::decision::{DecisionStepState, DecisionTrace};
 
@@ -159,10 +160,13 @@ impl StockApp {
         let invalidation = card.invalidation.clone().unwrap_or_else(|| "未定义".into());
         let target = card.target.clone().unwrap_or_else(|| "证据不足".into());
         let position_plan = self.position_sizing_plan(cx);
+        let climate = self.market_climate_report();
         let currency = crate::domain::money::Currency::for_code(self.selected.as_ref())
             .unwrap_or(crate::domain::money::Currency::Cny);
         let is_star_market = self.selected.starts_with("688") || self.selected.starts_with("689");
-        let can_prefill = card.status == DecisionStatus::MatchesStrategy && position_plan.is_ok();
+        let can_prefill = card.status == DecisionStatus::MatchesStrategy
+            && position_plan.is_ok()
+            && climate.stance != NewEntryStance::Freeze;
 
         v_flex()
             .w_full()
@@ -309,6 +313,18 @@ impl StockApp {
                                     .child("单票仓位上限 20%"),
                             ),
                     )
+                    .when_some(climate.sizing_note(), |column, note| {
+                        column.child(
+                            div()
+                                .text_xs()
+                                .text_color(if climate.stance == NewEntryStance::Freeze {
+                                    cx.theme().danger
+                                } else {
+                                    cx.theme().warning
+                                })
+                                .child(note),
+                        )
+                    })
                     .child(
                         h_flex()
                             .gap_2()
@@ -396,6 +412,8 @@ impl StockApp {
                                     .label("预填买入记录")
                                     .tooltip(if can_prefill {
                                         "只预填本地持仓记录，不会连接券商或自动下单"
+                                    } else if climate.stance == NewEntryStance::Freeze {
+                                        "今日市场观望，不预填买入"
                                     } else {
                                         "仅当决策卡为“符合策略”且仓位计算有效时开放"
                                     })

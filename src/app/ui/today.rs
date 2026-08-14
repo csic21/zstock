@@ -9,6 +9,7 @@ use gpui_component::{
     h_flex, v_flex,
 };
 
+use crate::domain::climate::{ClimateReport, MarketClimate, NewEntryStance};
 use crate::domain::rule_ledger::RuleLedgerReport;
 use crate::domain::today::{TodayAction, TodayActionTarget, TodayOpportunity, TodaySeverity};
 
@@ -76,18 +77,32 @@ impl StockApp {
                     )
                     .child(div().flex_1())
                     .child({
-                        let (fg, bg, text) = if action_count == 0 {
-                            (
-                                cx.theme().success,
-                                cx.theme().success.opacity(0.11),
-                                "当前没有必须操作",
-                            )
-                        } else {
-                            (
+                        let (fg, bg, text) = match dashboard.climate.stance {
+                            NewEntryStance::Freeze => (
+                                cx.theme().danger,
+                                cx.theme().danger.opacity(0.11),
+                                "今日观望，先处理持仓",
+                            ),
+                            NewEntryStance::Selective if action_count > 0 => (
+                                cx.theme().warning,
+                                cx.theme().warning.opacity(0.11),
+                                "先处理风险，再精选",
+                            ),
+                            NewEntryStance::Selective => (
+                                cx.theme().accent,
+                                cx.theme().accent.opacity(0.11),
+                                "精选，不扩散新仓",
+                            ),
+                            NewEntryStance::Open if action_count > 0 => (
                                 cx.theme().warning,
                                 cx.theme().warning.opacity(0.11),
                                 "先处理风险，再看机会",
-                            )
+                            ),
+                            NewEntryStance::Open => (
+                                cx.theme().success,
+                                cx.theme().success.opacity(0.11),
+                                "当前没有必须操作",
+                            ),
                         };
                         crate::app::helpers::status_pill(text, fg, bg)
                     })
@@ -126,6 +141,7 @@ impl StockApp {
                             .w_full()
                             .min_h(px(content_min_h))
                             .gap_4()
+                            .child(self.render_today_climate_card(&dashboard.climate, cx))
                             .child(
                                 h_flex()
                                     .w_full()
@@ -164,11 +180,23 @@ impl StockApp {
                                         today_metric(
                                             "符合观察条件",
                                             &dashboard.ready_opportunities.to_string(),
-                                            &format!(
-                                                "另有 {} 只等待触发",
-                                                dashboard.waiting_opportunities
-                                            ),
-                                            cx.theme().success,
+                                            &if dashboard.gated_opportunities > 0 {
+                                                format!(
+                                                    "另有 {} 只等待 · {} 只因市场暂缓",
+                                                    dashboard.waiting_opportunities,
+                                                    dashboard.gated_opportunities
+                                                )
+                                            } else {
+                                                format!(
+                                                    "另有 {} 只等待触发",
+                                                    dashboard.waiting_opportunities
+                                                )
+                                            },
+                                            if dashboard.ready_opportunities == 0 {
+                                                cx.theme().muted_foreground
+                                            } else {
+                                                cx.theme().success
+                                            },
                                             cx,
                                         ),
                                         today_metric(
@@ -281,7 +309,13 @@ impl StockApp {
                                             .gap_2()
                                             .child(today_section_title(
                                                 "候选机会",
-                                                "符合条件不等于立即买入，仍以观察区和失效条件为准",
+                                                if dashboard.climate.stance
+                                                    == NewEntryStance::Freeze
+                                                {
+                                                    "今日气候暂缓新开仓，列表只作观察，不作为动手依据"
+                                                } else {
+                                                    "符合条件不等于立即买入，仍以观察区和失效条件为准"
+                                                },
                                                 cx,
                                             ))
                                             .when(dashboard.opportunities.is_empty(), |column| {
@@ -391,12 +425,108 @@ impl StockApp {
                                             .text_xs()
                                             .text_color(cx.theme().muted_foreground)
                                             .child(
-                                                "先处理失效与集中风险；没有进入观察区不追价；没有定义最大亏损不新增持仓。所有结果仅供学习研究，不构成投资建议。",
+                                                format!(
+                                                    "先处理失效与集中风险；{}；没有进入观察区不追价；没有定义最大亏损不新增持仓。所有结果仅供学习研究，不构成投资建议。",
+                                                    dashboard.climate.stance.label()
+                                                ),
                                             ),
                                     ),
                             ),
                     ),
             )
+    }
+
+    fn render_today_climate_card(
+        &self,
+        climate: &ClimateReport,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let work = self.work_mode;
+        let (color, badge) = match climate.climate {
+            MarketClimate::Attack => (cx.theme().success, if work { "scale-up" } else { "进攻" }),
+            MarketClimate::Select => (cx.theme().accent, if work { "selective" } else { "精选" }),
+            MarketClimate::Defend => (cx.theme().warning, if work { "defensive" } else { "防守" }),
+            MarketClimate::StandAside => (cx.theme().danger, if work { "hold" } else { "观望" }),
+        };
+        let tape = climate
+            .reasons
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let completeness = if climate.completeness_pct < 40.0 {
+            if work {
+                "evidence incomplete · default selective"
+            } else {
+                "宽度尚未齐，先按精选处理"
+            }
+        } else {
+            ""
+        };
+
+        h_flex()
+            .id("today-climate-card")
+            .w_full()
+            .gap_3()
+            .items_center()
+            .p_4()
+            .rounded(cx.theme().radius_lg)
+            .border_1()
+            .border_color(color.opacity(0.35))
+            .bg(color.opacity(0.07))
+            .child(crate::app::helpers::status_pill(
+                badge,
+                color,
+                color.opacity(0.16),
+            ))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .text_color(cx.theme().foreground)
+                            .child(if work {
+                                climate.climate.work_label().to_string()
+                            } else {
+                                climate.headline.clone()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if completeness.is_empty() {
+                                if tape.is_empty() {
+                                    climate.detail.clone()
+                                } else {
+                                    tape
+                                }
+                            } else {
+                                completeness.to_string()
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("新开仓风险 {:.0}%", climate.risk_scale * 100.0)),
+            )
+            .child(
+                Button::new("today-climate-open-market")
+                    .ghost()
+                    .xsmall()
+                    .label(if work { "Tape" } else { "查看宽度" })
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.open_market_analysis(cx);
+                    })),
+            )
+            .into_any_element()
     }
 
     fn render_today_action_row(
@@ -419,6 +549,7 @@ impl StockApp {
             TodayActionTarget::Research => "查看决策",
             TodayActionTarget::Opportunities => "打开机会",
             TodayActionTarget::Portfolio => "处理",
+            TodayActionTarget::Market => "查看市场",
         };
         let action_for_click = action.clone();
 
@@ -481,10 +612,20 @@ impl StockApp {
         wide: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let gated = opportunity.gate_reason.is_some();
         let color = if opportunity.ready {
             cx.theme().success
+        } else if gated {
+            cx.theme().warning
         } else {
             cx.theme().muted_foreground
+        };
+        let status = if opportunity.ready {
+            "符合观察条件"
+        } else if gated {
+            "市场暂缓"
+        } else {
+            "等待触发"
         };
         let code = opportunity.code.clone();
         h_flex()
@@ -523,24 +664,27 @@ impl StockApp {
                                     .text_color(cx.theme().foreground)
                                     .child(opportunity.name),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(color)
-                                    .child(if opportunity.ready {
-                                        "符合观察条件"
-                                    } else {
-                                        "等待触发"
-                                    }),
-                            ),
+                            .child(div().text_xs().text_color(color).child(status)),
                     )
                     .child(
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "{} · 匹配度 {:.0} · 观察区 {}",
-                                opportunity.strategy, opportunity.score, opportunity.observation
+                            .child(opportunity.gate_reason.as_ref().map_or_else(
+                                || {
+                                    format!(
+                                        "{} · 匹配度 {:.0} · 观察区 {}",
+                                        opportunity.strategy,
+                                        opportunity.score,
+                                        opportunity.observation
+                                    )
+                                },
+                                |reason| {
+                                    format!(
+                                        "{} · 匹配度 {:.0} · {}",
+                                        opportunity.strategy, opportunity.score, reason
+                                    )
+                                },
                             )),
                     ),
             )

@@ -8,6 +8,7 @@
 
 mod alerts;
 mod chart_ctrl;
+mod heatmap;
 mod helpers;
 mod labels;
 mod market;
@@ -1831,5 +1832,33 @@ mod layout_regression_tests {
                 });
         });
         assert!(update_result.is_ok(), "heatmap selection should succeed");
+    }
+
+    #[gpui::test]
+    fn heatmap_industry_tile_opens_in_memory_drill(cx: &mut TestAppContext) {
+        let mut window = test_window(cx, 1320.0, 860.0);
+        let handle = window.window_handle();
+        let update_result = window.cx.update_window(handle, |view, _window, cx| {
+            view.downcast::<StockApp>()
+                .expect("window root view")
+                .update(cx, |this, cx| {
+                    this.market_analysis_open = true;
+                    this.market_heatmap_sectors = full_heatmap_fixture();
+                    this.open_industry_drill(
+                        "BK0000".into(),
+                        "一级行业00".into(),
+                        "二级行业00-0".into(),
+                        cx,
+                    );
+                    assert_eq!(this.sector_drill_code.as_deref(), Some("BK0000"));
+                    assert_eq!(
+                        this.sector_drill_name.as_ref().map(|name| name.as_ref()),
+                        Some("一级行业00 / 二级行业00-0")
+                    );
+                    assert_eq!(this.sector_drill_quotes.len(), 44);
+                    assert!(!this.sector_drill_loading);
+                });
+        });
+        assert!(update_result.is_ok(), "industry drill should succeed");
     }
 }

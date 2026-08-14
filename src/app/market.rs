@@ -456,6 +456,7 @@ impl StockApp {
 
     pub(crate) fn refresh_all(&mut self, cx: &mut Context<Self>) {
         self.reload_fundamentals(cx);
+        self.ensure_market_climate_data(cx);
         let codes: Vec<String> = self.symbols.iter().map(|s| s.code.clone()).collect();
         let selected = self.selected.to_string();
         let bars = self.current_bars();

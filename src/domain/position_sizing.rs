@@ -58,6 +58,7 @@ pub enum PositionSizingError {
     InvalidLotSize,
     BelowMinimumLot,
     ExistingPositionAtLimit,
+    NewEntriesRestricted,
 }
 
 impl PositionSizingError {
@@ -71,6 +72,7 @@ impl PositionSizingError {
             Self::InvalidLotSize => "交易单位无效",
             Self::BelowMinimumLot => "按当前风险预算不足以买入一手，先跳过更安全",
             Self::ExistingPositionAtLimit => "现有持仓已达到风险或仓位上限，不宜继续加仓",
+            Self::NewEntriesRestricted => "今日市场观望，不宜新开仓；先处理持仓风险",
         }
     }
 }

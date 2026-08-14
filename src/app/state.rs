@@ -169,6 +169,7 @@ impl super::StockApp {
         match task {
             PrimaryTask::Today => {
                 self.market_analysis_open = false;
+                self.ensure_market_climate_data(cx);
             }
             PrimaryTask::Research => {
                 self.market_analysis_open = false;

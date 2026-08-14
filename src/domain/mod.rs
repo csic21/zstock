@@ -1,6 +1,7 @@
 //! Pure business types and rules. This layer does not depend on GPUI, HTTP, or storage.
 
 pub mod backtest;
+pub mod climate;
 pub mod dataset;
 pub mod decision;
 pub mod exit_quality;

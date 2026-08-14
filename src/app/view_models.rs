@@ -1,3 +1,4 @@
+use crate::domain::climate::NewEntryStance;
 use crate::domain::decision::{
     DecisionCard, DecisionInput, DecisionStep, DecisionStepState, DecisionTrace, Eligibility,
     FactorContributions, QualityEvidence,
@@ -123,6 +124,22 @@ impl StockApp {
             }
         };
 
+        let climate = self.market_climate_report();
+        let climate_step = DecisionStep {
+            title: "市场气候".into(),
+            state: match climate.stance {
+                NewEntryStance::Open => DecisionStepState::Passed,
+                NewEntryStance::Selective => DecisionStepState::Attention,
+                NewEntryStance::Freeze => DecisionStepState::Blocked,
+            },
+            summary: format!(
+                "{} · {} · 新开仓风险 {:.0}%",
+                climate.headline,
+                climate.stance.label(),
+                climate.risk_scale * 100.0
+            ),
+        };
+
         let levels_step = match self.current_levels() {
             Some(levels) => DecisionStep {
                 title: "价位计划".into(),
@@ -162,25 +179,34 @@ impl StockApp {
             },
         };
 
-        let final_step = match (card.status, sizing_result.as_ref()) {
-            (crate::domain::decision::DecisionStatus::MatchesStrategy, Err(error)) => {
+        let final_step = match (card.status, climate.stance, sizing_result.as_ref()) {
+            (
+                crate::domain::decision::DecisionStatus::MatchesStrategy,
+                NewEntryStance::Freeze,
+                _,
+            ) => DecisionStep {
+                title: "最终动作".into(),
+                state: DecisionStepState::Attention,
+                summary: "个股符合策略，但今日市场观望，不预填买入".into(),
+            },
+            (crate::domain::decision::DecisionStatus::MatchesStrategy, _, Err(error)) => {
                 DecisionStep {
                     title: "最终动作".into(),
                     state: DecisionStepState::Attention,
                     summary: format!("策略条件符合，但暂不新增仓位：{}", error.user_message()),
                 }
             }
-            (crate::domain::decision::DecisionStatus::MatchesStrategy, Ok(_)) => DecisionStep {
+            (crate::domain::decision::DecisionStatus::MatchesStrategy, _, Ok(_)) => DecisionStep {
                 title: "最终动作".into(),
                 state: DecisionStepState::Passed,
                 summary: "可制定计划；等待进入观察区，不代表立即追价买入".into(),
             },
-            (crate::domain::decision::DecisionStatus::Waiting, _) => DecisionStep {
+            (crate::domain::decision::DecisionStatus::Waiting, _, _) => DecisionStep {
                 title: "最终动作".into(),
                 state: DecisionStepState::Attention,
                 summary: "继续观察，不预填买入；可设置价位提醒".into(),
             },
-            (crate::domain::decision::DecisionStatus::NotEligible, _) => DecisionStep {
+            (crate::domain::decision::DecisionStatus::NotEligible, _, _) => DecisionStep {
                 title: "最终动作".into(),
                 state: DecisionStepState::Blocked,
                 summary: format!(
@@ -191,7 +217,7 @@ impl StockApp {
                         .unwrap_or("资格门槛未通过")
                 ),
             },
-            (crate::domain::decision::DecisionStatus::InsufficientEvidence, _) => DecisionStep {
+            (crate::domain::decision::DecisionStatus::InsufficientEvidence, _, _) => DecisionStep {
                 title: "最终动作".into(),
                 state: if matches!(
                     self.analysis_state.fundamentals.state,
@@ -208,7 +234,7 @@ impl StockApp {
 
         let trace_status = if card.status
             == crate::domain::decision::DecisionStatus::MatchesStrategy
-            && sizing_result.is_err()
+            && (sizing_result.is_err() || climate.stance == NewEntryStance::Freeze)
         {
             crate::domain::decision::DecisionStatus::Waiting
         } else {
@@ -220,6 +246,7 @@ impl StockApp {
             trace_status,
             vec![
                 data_step,
+                climate_step,
                 technical_step,
                 fundamental_step,
                 levels_step,
@@ -235,8 +262,13 @@ impl StockApp {
     ) -> Result<PositionPlan, PositionSizingError> {
         let capital = super::helpers::parse_f64(&self.position_capital_input.read(cx).value())
             .unwrap_or_default();
+        let climate = self.market_climate_report();
+        if climate.stance == NewEntryStance::Freeze {
+            return Err(PositionSizingError::NewEntriesRestricted);
+        }
         let risk_pct = super::helpers::parse_f64(&self.position_risk_pct_input.read(cx).value())
-            .unwrap_or_default();
+            .unwrap_or_default()
+            * climate.risk_scale;
         let levels = self
             .levels_cache
             .as_ref()

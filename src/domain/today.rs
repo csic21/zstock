@@ -6,6 +6,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::climate::{
+    ClimateEvidence, ClimateReport, MarketClimate, PlaybookKind, assess_market_climate,
+    gate_playbook,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TodaySeverity {
     Critical,
@@ -28,6 +33,7 @@ pub enum TodayActionTarget {
     Research,
     Opportunities,
     Portfolio,
+    Market,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,9 +82,11 @@ pub struct TodayOpportunity {
     pub code: String,
     pub name: String,
     pub strategy: String,
+    pub playbook: PlaybookKind,
     pub score: f64,
     pub observation: String,
     pub ready: bool,
+    pub gate_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -87,6 +95,7 @@ pub struct TodayDashboardInput {
     pub risks: Vec<TodayRiskSnapshot>,
     pub plans: Vec<TodayPlanSnapshot>,
     pub opportunities: Vec<TodayOpportunity>,
+    pub climate: ClimateEvidence,
     pub open_positions: usize,
 }
 
@@ -94,18 +103,28 @@ pub struct TodayDashboardInput {
 pub struct TodayDashboard {
     pub actions: Vec<TodayAction>,
     pub opportunities: Vec<TodayOpportunity>,
+    pub climate: ClimateReport,
     pub active_alerts: usize,
     pub open_positions: usize,
     pub due_reviews: usize,
     pub ready_opportunities: usize,
     pub waiting_opportunities: usize,
+    pub gated_opportunities: usize,
 }
 
 pub fn build_today_dashboard(input: TodayDashboardInput) -> TodayDashboard {
+    let mut climate_evidence = input.climate;
+    if climate_evidence.open_positions == 0 && input.open_positions > 0 {
+        climate_evidence.open_positions = input.open_positions;
+    }
+    let climate = assess_market_climate(&climate_evidence);
     let active_alerts = input.alerts.len();
     let due_reviews = input.plans.iter().filter(|plan| plan.due).count();
     let mut actions = Vec::new();
     let mut invalidation_codes = BTreeSet::new();
+    if let Some(action) = climate_action(&climate) {
+        actions.push(action);
+    }
 
     for risk in &input.risks {
         if risk.invalidation_breached {
@@ -240,7 +259,13 @@ pub fn build_today_dashboard(input: TodayDashboardInput) -> TodayDashboard {
     });
 
     let mut best_by_code: BTreeMap<String, TodayOpportunity> = BTreeMap::new();
-    for opportunity in input.opportunities {
+    for mut opportunity in input.opportunities {
+        if opportunity.ready {
+            if let Some(reason) = gate_playbook(&climate, opportunity.playbook, opportunity.score) {
+                opportunity.ready = false;
+                opportunity.gate_reason = Some(reason);
+            }
+        }
         best_by_code
             .entry(opportunity.code.clone())
             .and_modify(|current| {
@@ -262,17 +287,39 @@ pub fn build_today_dashboard(input: TodayDashboardInput) -> TodayDashboard {
     });
     let ready_opportunities = opportunities.iter().filter(|item| item.ready).count();
     let waiting_opportunities = opportunities.len().saturating_sub(ready_opportunities);
+    let gated_opportunities = opportunities
+        .iter()
+        .filter(|item| item.gate_reason.is_some())
+        .count();
     opportunities.truncate(6);
 
     TodayDashboard {
         actions,
         opportunities,
+        climate,
         active_alerts,
         open_positions: input.open_positions,
         due_reviews,
         ready_opportunities,
         waiting_opportunities,
+        gated_opportunities,
     }
+}
+
+fn climate_action(climate: &ClimateReport) -> Option<TodayAction> {
+    let (severity, title) = match climate.climate {
+        MarketClimate::StandAside => (TodaySeverity::Warning, "今日不宜新开仓"),
+        MarketClimate::Defend => (TodaySeverity::Warning, "今日先防守，不扩散新仓"),
+        MarketClimate::Select | MarketClimate::Attack => return None,
+    };
+    Some(TodayAction {
+        id: format!("climate:{}", climate.climate.label()),
+        code: None,
+        title: title.into(),
+        detail: format!("{}。{}", climate.headline, climate.detail),
+        severity,
+        target: TodayActionTarget::Market,
+    })
 }
 
 fn display_symbol(code: &str, name: &str) -> String {
@@ -409,9 +456,68 @@ mod tests {
             code: code.into(),
             name: code.into(),
             strategy: "测试策略".into(),
+            playbook: PlaybookKind::Pullback,
             score,
             observation: "10.00–11.00".into(),
             ready,
+            gate_reason: None,
         }
+    }
+
+    #[test]
+    fn weak_tape_demotes_breakouts_and_adds_a_stand_aside_action() {
+        let dashboard = build_today_dashboard(TodayDashboardInput {
+            climate: ClimateEvidence {
+                indices: vec![
+                    crate::domain::climate::IndexMove {
+                        name: "上证综指".into(),
+                        change_pct: -1.3,
+                    },
+                    crate::domain::climate::IndexMove {
+                        name: "沪深300".into(),
+                        change_pct: -1.1,
+                    },
+                    crate::domain::climate::IndexMove {
+                        name: "创业板指".into(),
+                        change_pct: -1.6,
+                    },
+                ],
+                stock_advances: Some(160),
+                stock_declines: Some(840),
+                stock_unchanged: Some(40),
+                sector_advances: Some(8),
+                sector_declines: Some(78),
+                sector_unchanged: Some(4),
+                sector_average_change: Some(-1.4),
+                open_positions: 2,
+            },
+            opportunities: vec![TodayOpportunity {
+                code: "600000".into(),
+                name: "浦发银行".into(),
+                strategy: "放量突破".into(),
+                playbook: PlaybookKind::Breakout,
+                score: 88.0,
+                observation: "10.00–10.50".into(),
+                ready: true,
+                gate_reason: None,
+            }],
+            open_positions: 2,
+            ..TodayDashboardInput::default()
+        });
+
+        assert_eq!(
+            dashboard.climate.stance,
+            crate::domain::climate::NewEntryStance::Freeze
+        );
+        assert!(!dashboard.opportunities[0].ready);
+        assert!(dashboard.opportunities[0].gate_reason.is_some());
+        assert_eq!(dashboard.ready_opportunities, 0);
+        assert_eq!(dashboard.gated_opportunities, 1);
+        assert!(
+            dashboard
+                .actions
+                .iter()
+                .any(|item| item.id == "climate:观望")
+        );
     }
 }

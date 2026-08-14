@@ -13,6 +13,18 @@ use crate::model::shared;
 use super::{AiPanelState, AiSource, MarketRegion, StockApp, state::PrimaryTask};
 
 impl StockApp {
+    /// Load sector breadth when Today needs a climate reading but the
+    /// market page has not been opened yet. Indices arrive from the quote poll.
+    pub(crate) fn ensure_market_climate_data(&mut self, cx: &mut Context<Self>) {
+        if self.market_analysis_region != MarketRegion::AShare {
+            return;
+        }
+        if !self.market_analysis_sectors.is_empty() || self.market_analysis_loading {
+            return;
+        }
+        self.refresh_market_analysis(cx);
+    }
+
     pub(crate) fn open_market_analysis(&mut self, cx: &mut Context<Self>) {
         self.settings_open = false;
         self.palette_open = false;
@@ -254,6 +266,45 @@ impl StockApp {
             });
         })
         .detach();
+    }
+
+    /// Expand a level-2 industry using the stocks already loaded into the
+    /// panorama heatmap, so the click does not wait on another clist fetch.
+    pub(crate) fn open_industry_drill(
+        &mut self,
+        sector_code: String,
+        sector_name: String,
+        industry_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let stocks = self
+            .market_heatmap_sectors
+            .iter()
+            .find(|group| group.sector.code == sector_code)
+            .and_then(|group| {
+                group
+                    .industries
+                    .iter()
+                    .find(|industry| industry.name == industry_name)
+            })
+            .map(|industry| industry.stocks.clone())
+            .unwrap_or_default();
+        if stocks.is_empty() {
+            self.open_sector_drill(sector_code, sector_name, cx);
+            return;
+        }
+
+        self.sector_drill_gen = self.sector_drill_gen.wrapping_add(1);
+        self.sector_drill_code = Some(sector_code);
+        self.sector_drill_name = Some(shared(format!("{sector_name} / {industry_name}")));
+        self.sector_drill_quotes = stocks;
+        self.sector_drill_loading = false;
+        self.sector_drill_error = None;
+        self.status = shared(format!(
+            "行业 {industry_name} · {} 只成分",
+            self.sector_drill_quotes.len()
+        ));
+        cx.notify();
     }
 
     /// 点击行业板块 → 拉取成分股列表（下钻）。

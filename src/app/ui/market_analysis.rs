@@ -21,6 +21,9 @@ use crate::data::market_analysis::{self as analysis, FearGreedIndex, MarketPick}
 use crate::data::session::MarketId;
 use crate::model::IndexSnap;
 
+use super::super::heatmap::{
+    select_visible_stocks, should_expand_industry, tile_label_plan, weighted_change_pct,
+};
 use super::super::treemap::squarified_treemap;
 use super::super::{AiPanelState, MarketRegion, StockApp};
 
@@ -28,8 +31,6 @@ const HEATMAP_REFERENCE_WIDTH: f32 = 1248.0;
 const HEATMAP_REFERENCE_HEIGHT: f32 = 440.0;
 const HEATMAP_MAX_DEFAULT_HEIGHT: f32 = 1200.0;
 const HEATMAP_FULLSCREEN_RESERVED_HEIGHT: f32 = 148.0;
-const HEATMAP_SECTOR_HEADER_HEIGHT: f32 = 20.0;
-const HEATMAP_INDUSTRY_HEADER_HEIGHT: f32 = 16.0;
 
 fn default_heatmap_height(surface_width: f32) -> f32 {
     (surface_width * HEATMAP_REFERENCE_HEIGHT / HEATMAP_REFERENCE_WIDTH)
@@ -43,6 +44,12 @@ enum HeatmapAction {
         name: String,
         last: f64,
     },
+    Industry {
+        sector_code: String,
+        sector_name: String,
+        industry_name: String,
+    },
+    None,
 }
 
 #[derive(Clone)]
@@ -53,6 +60,7 @@ struct HeatmapTile {
     amount: f64,
     tooltip: String,
     action: HeatmapAction,
+    emphasize: bool,
 }
 
 impl StockApp {
@@ -1379,7 +1387,7 @@ impl StockApp {
                     .child(self.render_analysis_section_title(
                         "A股全景热力图（申万行业）",
                         &format!(
-                            "{sector_count} 个一级行业 · {industry_count} 个二级行业 · {stock_count} 只个股"
+                            "{sector_count} 个一级行业 · {industry_count} 个二级行业 · {stock_count} 只个股 · 小行业看涨跌，大行业看龙头"
                         ),
                         cx,
                     ))
@@ -1535,27 +1543,20 @@ impl StockApp {
     ) -> AnyElement {
         let group_width = rect.width * surface_width;
         let group_height = rect.height * surface_height;
-        let show_header = group_width >= 52.0 && group_height >= 34.0;
-        let header_height = if show_header {
-            HEATMAP_SECTOR_HEADER_HEIGHT.min(group_height * 0.24)
-        } else {
-            0.0
-        };
-        let body_height = (group_height - header_height).max(1.0);
         let weights = group
             .industries
             .iter()
             .map(|industry| industry.amount)
             .collect::<Vec<_>>();
-        let cells = squarified_treemap(&weights, f64::from(group_width / body_height));
+        let cells = squarified_treemap(&weights, f64::from(group_width / group_height.max(1.0)));
         let mut industries = Vec::with_capacity(cells.len());
         for cell in cells {
             if let Some(industry) = group.industries.get(cell.index) {
                 industries.push(self.render_heatmap_industry_group(
                     cell.rect,
                     industry,
-                    group_width,
-                    body_height,
+                    &group.sector,
+                    (group_width, group_height),
                     next_stock_id,
                     cx,
                 ));
@@ -1564,109 +1565,20 @@ impl StockApp {
         let code = group.sector.code.clone();
         let name = group.sector.name.clone();
         let tooltip_name = name.clone();
+        let change_pct = group.sector.change_pct;
+        let change_color = self.chg_color(change_pct >= 0.0, cx);
         let stock_count: usize = group
             .industries
             .iter()
             .map(|industry| industry.stocks.len())
             .sum();
-
-        div()
-            .absolute()
-            .left(relative(rect.x))
-            .top(relative(rect.y))
-            .w(relative(rect.width))
-            .h(relative(rect.height))
-            .overflow_hidden()
-            .border_2()
-            .border_color(cx.theme().background)
-            .bg(cx.theme().sidebar)
-            .when(show_header, |sector| {
-                sector.child(
-                    div()
-                        .id(gpui::SharedString::from(format!(
-                            "heatmap-sector-{}",
-                            group.sector.code
-                        )))
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .h(px(header_height))
-                        .px_1()
-                        .flex()
-                        .items_center()
-                        .cursor_pointer()
-                        .bg(cx.theme().background.opacity(0.94))
-                        .text_xs()
-                        .font_semibold()
-                        .text_color(cx.theme().foreground)
-                        .truncate()
-                        .tooltip(move |window, cx| {
-                            Tooltip::new(format!(
-                                "{tooltip_name} · {stock_count} 只个股\n点击放大该行业"
-                            ))
-                            .build(window, cx)
-                        })
-                        .on_click(cx.listener(move |this, _, _window, cx| {
-                            this.open_sector_drill(code.clone(), name.clone(), cx);
-                        }))
-                        .child(group.sector.name.clone()),
-                )
-            })
-            .child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .top(px(header_height))
-                    .bottom_0()
-                    .overflow_hidden()
-                    .children(industries),
-            )
-            .into_any_element()
-    }
-
-    fn render_heatmap_industry_group(
-        &self,
-        rect: super::super::treemap::TreemapRect,
-        industry: &IndustryStockGroup,
-        surface_width: f32,
-        surface_height: f32,
-        next_stock_id: &mut u32,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let group_width = rect.width * surface_width;
-        let group_height = rect.height * surface_height;
-        let show_header = group_width >= 44.0 && group_height >= 28.0;
-        let header_height = if show_header {
-            HEATMAP_INDUSTRY_HEADER_HEIGHT.min(group_height * 0.28)
+        let show_badge = group_width >= 44.0 && group_height >= 16.0;
+        let show_change = group_width >= 78.0;
+        let badge_label = if show_change {
+            format!("{} {:+.2}%", group.sector.name, change_pct)
         } else {
-            0.0
+            group.sector.name.clone()
         };
-        let stock_height = (group_height - header_height).max(1.0);
-        let weights = industry
-            .stocks
-            .iter()
-            .map(|stock| stock.amount)
-            .collect::<Vec<_>>();
-        let cells = squarified_treemap(&weights, f64::from(group_width / stock_height));
-        let mut stocks = Vec::with_capacity(cells.len());
-        for cell in cells {
-            if let Some(stock) = industry.stocks.get(cell.index) {
-                let id = *next_stock_id;
-                *next_stock_id = next_stock_id.saturating_add(1);
-                stocks.push(self.render_heatmap_tile(
-                    id as usize,
-                    cell.rect,
-                    stock_heatmap_tile(stock),
-                    group_width,
-                    stock_height,
-                    cx,
-                ));
-            }
-        }
-        let stock_count = industry.stocks.len();
-        let label = industry.name.clone();
 
         div()
             .absolute()
@@ -1676,9 +1588,115 @@ impl StockApp {
             .h(relative(rect.height))
             .overflow_hidden()
             .border_1()
-            .border_color(cx.theme().background.opacity(0.92))
-            .bg(cx.theme().muted.opacity(0.3))
-            .when(show_header, |group| {
+            .border_color(cx.theme().background)
+            .bg(cx.theme().background)
+            .children(industries)
+            .when(show_badge, |sector| {
+                sector.child(
+                    div()
+                        .id(gpui::SharedString::from(format!(
+                            "heatmap-sector-{}",
+                            group.sector.code
+                        )))
+                        .absolute()
+                        .top(px(2.))
+                        .left(px(2.))
+                        .max_w(px((group_width - 6.0).max(24.0)))
+                        .px(px(4.))
+                        .py(px(1.))
+                        .rounded_sm()
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .bg(cx.theme().background.opacity(0.82))
+                        .text_size(px(10.))
+                        .line_height(px(14.))
+                        .font_semibold()
+                        .text_color(change_color)
+                        .truncate()
+                        .tooltip(move |window, cx| {
+                            Tooltip::new(format!(
+                                "{tooltip_name} {change_pct:+.2}% · {stock_count} 只个股\n点击放大该一级行业"
+                            ))
+                            .build(window, cx)
+                        })
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.open_sector_drill(code.clone(), name.clone(), cx);
+                        }))
+                        .child(badge_label),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_heatmap_industry_group(
+        &self,
+        rect: super::super::treemap::TreemapRect,
+        industry: &IndustryStockGroup,
+        sector: &SectorTick,
+        surface: (f32, f32),
+        next_stock_id: &mut u32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let group_width = rect.width * surface.0;
+        let group_height = rect.height * surface.1;
+        let tiles = present_industry_tiles(industry, sector, group_width, group_height);
+        let expand = tiles.len() > 1;
+        let mut children = Vec::new();
+        if expand {
+            let weights = tiles.iter().map(|tile| tile.amount).collect::<Vec<_>>();
+            let cells =
+                squarified_treemap(&weights, f64::from(group_width / group_height.max(1.0)));
+            for cell in cells {
+                if let Some(tile) = tiles.get(cell.index).cloned() {
+                    let id = *next_stock_id;
+                    *next_stock_id = next_stock_id.saturating_add(1);
+                    children.push(self.render_heatmap_tile(
+                        id as usize,
+                        cell.rect,
+                        tile,
+                        group_width,
+                        group_height,
+                        cx,
+                    ));
+                }
+            }
+        } else if let Some(tile) = tiles.into_iter().next() {
+            let id = *next_stock_id;
+            *next_stock_id = next_stock_id.saturating_add(1);
+            children.push(self.render_heatmap_tile(
+                id as usize,
+                super::super::treemap::TreemapRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+                tile,
+                group_width,
+                group_height,
+                cx,
+            ));
+        }
+        let show_overlay = expand && group_width >= 40.0 && group_height >= 16.0;
+        let overlay_name = industry.name.clone();
+        let overlay_count = industry.stocks.len();
+        let sector_code = sector.code.clone();
+        let sector_name = sector.name.clone();
+        let industry_name = industry.name.clone();
+
+        div()
+            .absolute()
+            .left(relative(rect.x))
+            .top(relative(rect.y))
+            .w(relative(rect.width))
+            .h(relative(rect.height))
+            .overflow_hidden()
+            .border_1()
+            .border_color(cx.theme().background)
+            .bg(cx.theme().background)
+            .children(children)
+            .when(show_overlay, |group| {
                 group.child(
                     div()
                         .id(gpui::SharedString::from(format!(
@@ -1686,35 +1704,38 @@ impl StockApp {
                             industry.name
                         )))
                         .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .h(px(header_height))
-                        .px_1()
+                        .bottom(px(2.))
+                        .left(px(2.))
+                        .max_w(px((group_width - 6.0).max(20.0)))
+                        .px(px(3.))
+                        .py(px(1.))
+                        .rounded_sm()
                         .flex()
                         .items_center()
-                        .bg(cx.theme().sidebar.opacity(0.96))
-                        .text_xs()
+                        .cursor_pointer()
+                        .bg(cx.theme().background.opacity(0.72))
+                        .text_size(px(10.))
+                        .line_height(px(13.))
                         .font_semibold()
-                        .text_color(cx.theme().foreground.opacity(0.92))
+                        .text_color(cx.theme().foreground.opacity(0.9))
                         .truncate()
                         .tooltip(move |window, cx| {
-                            Tooltip::new(format!("{label} · {stock_count} 只个股"))
-                                .build(window, cx)
+                            Tooltip::new(format!(
+                                "{overlay_name} · {overlay_count} 只个股\n点击查看该二级行业"
+                            ))
+                            .build(window, cx)
                         })
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.open_industry_drill(
+                                sector_code.clone(),
+                                sector_name.clone(),
+                                industry_name.clone(),
+                                cx,
+                            );
+                        }))
                         .child(industry.name.clone()),
                 )
             })
-            .child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .top(px(header_height))
-                    .bottom_0()
-                    .overflow_hidden()
-                    .children(stocks),
-            )
             .into_any_element()
     }
 
@@ -1727,6 +1748,7 @@ impl StockApp {
         empty_message: &str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let tiles = select_heatmap_tiles(&tiles, surface_width * surface_height);
         let weights: Vec<f64> = tiles.iter().map(|tile| tile.amount).collect();
         let cells = squarified_treemap(&weights, f64::from(surface_width / surface_height));
         let tile_elements: Vec<_> = cells
@@ -1793,9 +1815,7 @@ impl StockApp {
     ) -> AnyElement {
         let estimated_width = rect.width * surface_width;
         let estimated_height = rect.height * surface_height;
-        let show_name = estimated_width >= 48.0 && estimated_height >= 24.0;
-        let show_change = estimated_width >= 68.0 && estimated_height >= 42.0;
-        let show_amount = estimated_width >= 118.0 && estimated_height >= 68.0;
+        let labels = tile_label_plan(estimated_width, estimated_height, tile.emphasize);
         let move_color = self.chg_color(tile.change_pct >= 0.0, cx);
         let opacity = heatmap_opacity(tile.change_pct, self.work_mode);
         let fill = if tile.change_pct.abs() < 0.05 {
@@ -1805,6 +1825,10 @@ impl StockApp {
         };
         let tooltip = tile.tooltip.clone();
         let action = tile.action.clone();
+        let compact = !labels.show_amount && estimated_height < 36.0;
+        let name_label = tile.name.clone();
+        let change_label = format!("{:+.2}%", tile.change_pct);
+        let amount_label = format_sector_amount(tile.amount);
 
         div()
             .id(("market-heatmap-tile", index as u32))
@@ -1816,25 +1840,55 @@ impl StockApp {
             .top(relative(rect.y))
             .w(relative(rect.width))
             .h(relative(rect.height))
-            .p_1()
+            .p(px(if compact { 1. } else { 2. }))
             .flex()
             .items_center()
             .justify_center()
             .overflow_hidden()
             .cursor_pointer()
             .border_1()
-            .border_color(cx.theme().background.opacity(0.72))
+            .border_color(cx.theme().background.opacity(0.55))
             .bg(fill)
             .hover(|cell| {
-                cell.border_2()
-                    .border_color(cx.theme().foreground.opacity(0.8))
+                cell.border_1()
+                    .border_color(cx.theme().foreground.opacity(0.85))
             })
             .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
             .on_click(cx.listener(move |this, _, _window, cx| {
                 this.activate_heatmap_tile(action.clone(), cx);
             }))
-            .when(show_name, |cell| {
-                cell.child(
+            .when(labels.show_name, |cell| {
+                cell.child(if labels.horizontal {
+                    h_flex()
+                        .max_w_full()
+                        .items_center()
+                        .justify_center()
+                        .gap_1()
+                        .px(px(1.))
+                        .text_color(cx.theme().foreground)
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_shrink()
+                                .truncate()
+                                .text_size(px(10.))
+                                .line_height(px(12.))
+                                .font_semibold()
+                                .child(name_label),
+                        )
+                        .when(labels.show_change, |row| {
+                            row.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(10.))
+                                    .line_height(px(12.))
+                                    .font_family("Menlo")
+                                    .font_semibold()
+                                    .child(change_label),
+                            )
+                        })
+                        .into_any_element()
+                } else {
                     v_flex()
                         .max_w_full()
                         .items_center()
@@ -1845,29 +1899,40 @@ impl StockApp {
                             div()
                                 .max_w_full()
                                 .truncate()
-                                .when(show_change, |name| name.text_sm())
-                                .when(!show_change, |name| name.text_xs())
+                                .text_size(px(if labels.show_change && !compact {
+                                    12.
+                                } else {
+                                    10.
+                                }))
+                                .line_height(px(if labels.show_change && !compact {
+                                    14.
+                                } else {
+                                    12.
+                                }))
                                 .font_semibold()
-                                .child(tile.name.clone()),
+                                .child(name_label),
                         )
-                        .when(show_change, |content| {
+                        .when(labels.show_change, |content| {
                             content.child(
                                 div()
-                                    .text_xs()
+                                    .text_size(px(10.))
+                                    .line_height(px(12.))
                                     .font_family("Menlo")
                                     .font_semibold()
-                                    .child(format!("{:+.2}%", tile.change_pct)),
+                                    .child(change_label),
                             )
                         })
-                        .when(show_amount, |content| {
+                        .when(labels.show_amount, |content| {
                             content.child(
                                 div()
-                                    .text_xs()
+                                    .text_size(px(10.))
+                                    .line_height(px(12.))
                                     .text_color(cx.theme().foreground.opacity(0.72))
-                                    .child(format_sector_amount(tile.amount)),
+                                    .child(amount_label),
                             )
-                        }),
-                )
+                        })
+                        .into_any_element()
+                })
             })
             .into_any_element()
     }
@@ -1976,6 +2041,12 @@ impl StockApp {
             HeatmapAction::Stock { code, name, last } => {
                 self.select_sector_constituent(code, name, last, cx)
             }
+            HeatmapAction::Industry {
+                sector_code,
+                sector_name,
+                industry_name,
+            } => self.open_industry_drill(sector_code, sector_name, industry_name, cx),
+            HeatmapAction::None => {}
         }
     }
 
@@ -2191,6 +2262,128 @@ impl StockApp {
     }
 }
 
+fn present_industry_tiles(
+    industry: &IndustryStockGroup,
+    sector: &SectorTick,
+    width: f32,
+    height: f32,
+) -> Vec<HeatmapTile> {
+    if industry.stocks.is_empty() || !should_expand_industry(width, height) {
+        return vec![industry_heatmap_tile(industry, sector)];
+    }
+    let amounts: Vec<f64> = industry
+        .stocks
+        .iter()
+        .map(|stock| stock.amount.max(0.0))
+        .collect();
+    let visible = select_visible_stocks(&amounts, width * height);
+    let keep = visible.keep.min(industry.stocks.len());
+    let mut tiles: Vec<HeatmapTile> = industry.stocks[..keep]
+        .iter()
+        .map(stock_heatmap_tile)
+        .collect();
+    if let Some(others) = visible.others {
+        let tail = &industry.stocks[keep..];
+        let change = weighted_change_pct(tail.iter().map(|stock| (stock.amount, stock.change_pct)));
+        tiles.push(others_heatmap_tile(
+            others.count,
+            others.amount,
+            change,
+            HeatmapAction::Industry {
+                sector_code: sector.code.clone(),
+                sector_name: sector.name.clone(),
+                industry_name: industry.name.clone(),
+            },
+        ));
+    }
+    if tiles.is_empty() {
+        tiles.push(industry_heatmap_tile(industry, sector));
+    }
+    tiles
+}
+
+fn select_heatmap_tiles(tiles: &[HeatmapTile], area_px: f32) -> Vec<HeatmapTile> {
+    if tiles.len() <= 1 {
+        return tiles.to_vec();
+    }
+    let amounts: Vec<f64> = tiles.iter().map(|tile| tile.amount.max(0.0)).collect();
+    let visible = select_visible_stocks(&amounts, area_px);
+    let keep = visible.keep.min(tiles.len());
+    let mut out = tiles[..keep].to_vec();
+    if let Some(others) = visible.others {
+        let tail = &tiles[keep..];
+        let change = weighted_change_pct(tail.iter().map(|tile| (tile.amount, tile.change_pct)));
+        out.push(others_heatmap_tile(
+            others.count,
+            others.amount,
+            change,
+            HeatmapAction::None,
+        ));
+    }
+    out
+}
+
+fn industry_heatmap_tile(industry: &IndustryStockGroup, sector: &SectorTick) -> HeatmapTile {
+    let change = weighted_change_pct(
+        industry
+            .stocks
+            .iter()
+            .map(|stock| (stock.amount, stock.change_pct)),
+    );
+    let amount = if industry.amount > 0.0 {
+        industry.amount
+    } else {
+        industry
+            .stocks
+            .iter()
+            .map(|stock| stock.amount.max(0.0))
+            .sum()
+    };
+    HeatmapTile {
+        name: industry.name.clone(),
+        code: String::new(),
+        change_pct: change,
+        amount,
+        tooltip: format!(
+            "{} · {} 只个股\n加权涨跌 {:+.2}%\n成交 {}\n点击查看该行业全部个股",
+            industry.name,
+            industry.stocks.len(),
+            change,
+            format_sector_amount(amount)
+        ),
+        action: HeatmapAction::Industry {
+            sector_code: sector.code.clone(),
+            sector_name: sector.name.clone(),
+            industry_name: industry.name.clone(),
+        },
+        emphasize: true,
+    }
+}
+
+fn others_heatmap_tile(
+    count: usize,
+    amount: f64,
+    change_pct: f64,
+    action: HeatmapAction,
+) -> HeatmapTile {
+    let click_hint = match action {
+        HeatmapAction::Industry { .. } => "\n点击查看该行业全部个股",
+        _ => "",
+    };
+    HeatmapTile {
+        name: "其他".into(),
+        code: String::new(),
+        change_pct,
+        amount,
+        tooltip: format!(
+            "其余 {count} 只已按成交额合并\n加权涨跌 {change_pct:+.2}%\n成交 {}{click_hint}",
+            format_sector_amount(amount)
+        ),
+        action,
+        emphasize: true,
+    }
+}
+
 fn stock_heatmap_tile(quote: &QuoteTick) -> HeatmapTile {
     let amount = if quote.amount > 0.0 {
         quote.amount
@@ -2216,6 +2409,7 @@ fn stock_heatmap_tile(quote: &QuoteTick) -> HeatmapTile {
             name: quote.name.clone(),
             last: quote.last,
         },
+        emphasize: false,
     }
 }
 
