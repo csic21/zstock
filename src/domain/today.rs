@@ -260,11 +260,11 @@ pub fn build_today_dashboard(input: TodayDashboardInput) -> TodayDashboard {
 
     let mut best_by_code: BTreeMap<String, TodayOpportunity> = BTreeMap::new();
     for mut opportunity in input.opportunities {
-        if opportunity.ready {
-            if let Some(reason) = gate_playbook(&climate, opportunity.playbook, opportunity.score) {
-                opportunity.ready = false;
-                opportunity.gate_reason = Some(reason);
-            }
+        if opportunity.ready
+            && let Some(reason) = gate_playbook(&climate, opportunity.playbook, opportunity.score)
+        {
+            opportunity.ready = false;
+            opportunity.gate_reason = Some(reason);
         }
         best_by_code
             .entry(opportunity.code.clone())
