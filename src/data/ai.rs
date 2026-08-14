@@ -480,6 +480,9 @@ pub struct PositionAdviceSnap {
     pub action: PositionAction,
     /// 规则依据短句。
     pub action_reasons: Vec<String>,
+    /// Optional cost-vs-last multi-dimension review. Local code owns stance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review: Option<crate::domain::position_review::PositionReview>,
 }
 
 /// 结合技术快照与持仓成本，生成买卖观察建议。
@@ -545,6 +548,7 @@ pub fn build_position_advice(
         price_vs_cost_pct,
         action,
         action_reasons,
+        review: None,
     })
 }
 
@@ -673,6 +677,23 @@ pub fn local_position_advice(snap: &PositionAdviceSnap) -> String {
         lines.push(format!("【依据】{}。", snap.action_reasons.join("；")));
     }
 
+    if let Some(review) = &snap.review {
+        lines.push(format!(
+            "【多维结论】{} · {}",
+            review.stance.label(false),
+            review.headline
+        ));
+        for item in &review.dimensions {
+            lines.push(format!(
+                "【{}·{}】{}。{}",
+                item.title,
+                item.tone.label(false),
+                item.headline,
+                item.detail
+            ));
+        }
+    }
+
     // 复用部分技术点评
     lines.push(format!(
         "【趋势】{}。{}",
@@ -739,21 +760,21 @@ pub fn local_position_advice(snap: &PositionAdviceSnap) -> String {
 pub fn llm_position_advice(cfg: &AiConfig, snap: &PositionAdviceSnap) -> Result<String> {
     let body = serde_json::to_string(snap).context("序列化持仓建议快照失败")?;
     let user_prompt = format!(
-        "请基于以下「持仓 + 技术面」量化快照给出买卖观察建议：\n```json\n{body}\n```\n\
-         要求：1) 明确回应当前建议倾向（可观察建仓/加仓/持有/减仓/观察清仓）及理由；\
+        "请基于以下「持仓 + 技术面 + 多维复盘」量化快照给出观察建议：\n```json\n{body}\n```\n\
+         要求：1) 明确回应当地 review.stance（优先防守/持有观望/观察减仓/观察补仓）及六维结论，不得改写 tone 或 stance；\
          2) 结合成本价、浮盈亏%、现价与 levels 参考带，用「约 X–Y 元」写出观察价；\
-         3) 区分「有持仓」与「空仓」场景；4) 不超过 480 字；\
+         3) 区分「有持仓」与「空仓」场景；4) 不超过 520 字；\
          5) 不得编造快照外数据；结尾必须含“不构成投资建议”。"
     );
     llm_complete(cfg, POSITION_SYSTEM_PROMPT, &user_prompt)
 }
 
 const POSITION_SYSTEM_PROMPT: &str = "你是一名严谨的 A 股持仓助手。\
-你只会获得本地计算的技术快照 + 用户持仓成本/股数/浮盈亏（无原始 K 线、无基本面新闻）。\
-请：1) 在快照 action 倾向基础上做可解释的中文建议，可微调但需说明依据；\
+你只会获得本地计算的技术快照 + 用户持仓成本/股数/浮盈亏 + 可选的多维复盘（无原始 K 线、无基本面新闻）。\
+请：1) 把 review 六维（盈亏/价位/趋势/风险/纪律/时间）用中文解释清楚，不得改写 stance 或 tone；\
 2) 给出观察性的加仓/减仓价位带（优先用 levels），强调非交易指令；\
 3) 对深浮亏避免鼓吹死扛或报复性加仓；对大浮盈提醒兑现纪律；\
-4) 全文不超过 480 字；结尾必须“不构成投资建议”；不得编造数值。";
+4) 全文不超过 520 字；结尾必须“不构成投资建议”；不得编造数值。";
 
 fn regime_sentence(regime: &str) -> &'static str {
     match regime {
@@ -1054,6 +1075,7 @@ mod tests {
         assert!(text.contains("【建议倾向】"));
         assert!(text.contains("【持仓】"));
         assert!(text.contains("不构成任何投资建议"));
+        assert!(!text.contains("【多维结论】"));
     }
 
     #[test]

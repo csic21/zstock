@@ -1,12 +1,13 @@
 use gpui::{
-    div, prelude::FluentBuilder, px, relative, AnyElement, Context, InteractiveElement,
-    IntoElement, ParentElement, StatefulInteractiveElement, Styled, Window,
+    AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, relative,
 };
 use gpui_component::{
+    ActiveTheme, Disableable, PixelsExt, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
     scroll::ScrollableElement,
-    v_flex, ActiveTheme, Disableable, PixelsExt, Sizable, StyledExt,
+    v_flex,
 };
 
 use crate::app::StockApp;
@@ -15,7 +16,7 @@ use crate::domain::dataset::DatasetManifest;
 use crate::domain::experiment::{ExperimentRecord, ExperimentStatus};
 use crate::domain::strategy_library::{LibraryFilter, LibrarySort};
 
-use super::presenter::{leaderboard, StrategyLabLayout};
+use super::presenter::{StrategyLabLayout, leaderboard};
 use super::state::{StrategyLabPage, StrategyLabState, TemplateFamily};
 
 impl StockApp {

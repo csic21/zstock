@@ -2,17 +2,17 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
 
-use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension, Transaction, MAIN_DB};
+use anyhow::{Context, Result, bail};
+use rusqlite::{Connection, MAIN_DB, OptionalExtension, Transaction, params};
 
 use crate::domain::backtest::validation::{RobustnessReport, SealedTestResult};
 use crate::domain::dataset::{
-    dataset_content_sha256, validate_series, DatasetManifest, FrozenDataset, FrozenSeries,
+    DatasetManifest, FrozenDataset, FrozenSeries, dataset_content_sha256, validate_series,
 };
 use crate::domain::experiment::{ExperimentCandidate, ExperimentRecord};
 use crate::domain::market::{Adjustment, AssetType, CandleRecord, InstrumentId, Market};
 use crate::domain::paper::{PaperCandidate, PaperRunResult};
-use crate::domain::strategy::{normalized_json, strategy_id, StrategySpec};
+use crate::domain::strategy::{StrategySpec, normalized_json, strategy_id};
 use crate::domain::strategy_library::{LibraryStatus, StrategyLibraryRecord};
 use crate::services::backtest_repository::{
     BacktestRepository, StoredBacktestRun, StoredRunStatus,
@@ -946,7 +946,7 @@ mod tests {
     use crate::domain::experiment::{
         CandidateSource, ExperimentDefinition, ExperimentStatus, GenerationAudit, RiskLimits,
     };
-    use crate::domain::paper::{run_paper_history, PaperCandidate, PaperCandidateStatus};
+    use crate::domain::paper::{PaperCandidate, PaperCandidateStatus, run_paper_history};
     use crate::domain::strategy::{CompiledStrategy, LocalTemplate};
 
     fn instrument() -> InstrumentId {
@@ -1122,9 +1122,11 @@ mod tests {
                 normalized_hash: None,
                 validation_errors: vec![],
             };
-            assert!(store
-                .save_experiment(&invalid, &[invalid_candidate])
-                .is_err());
+            assert!(
+                store
+                    .save_experiment(&invalid, &[invalid_candidate])
+                    .is_err()
+            );
             assert!(store.load_experiment("must-rollback").unwrap().is_none());
             (expected, candidate)
         };

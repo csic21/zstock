@@ -588,7 +588,7 @@ impl StockApp {
             return;
         }
 
-        let Some(snap) = ai::build_position_advice(
+        let Some(mut snap) = ai::build_position_advice(
             &self.candles,
             &code,
             &name,
@@ -606,6 +606,7 @@ impl StockApp {
             cx.notify();
             return;
         };
+        snap.review = self.position_review_view_model();
 
         let local = ai::local_position_advice(&snap);
         super::types::insert_ai_cache(

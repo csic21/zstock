@@ -375,6 +375,32 @@ impl Portfolio {
         self.trades.iter().filter(|t| t.code == code).collect()
     }
 
+    /// Local timestamp of the buy that opened the current lot.
+    ///
+    /// A full exit resets the clock so a later re-entry is a new hold.
+    pub fn open_lot_opened_on(&self, code: &str) -> Option<String> {
+        let mut shares = 0.0;
+        let mut opened = None;
+        for trade in self.trades.iter().filter(|trade| trade.code == code) {
+            match trade.side {
+                TradeSide::Buy => {
+                    if shares <= 1e-9 {
+                        opened = Some(trade.time.clone());
+                    }
+                    shares += trade.shares;
+                }
+                TradeSide::Sell => {
+                    shares = (shares - trade.shares).max(0.0);
+                    if shares <= 1e-9 {
+                        opened = None;
+                        shares = 0.0;
+                    }
+                }
+            }
+        }
+        opened.filter(|_| shares > 1e-9)
+    }
+
     /// 用最新价标记组合。
     ///
     /// `quote_fn(code) -> (last, day_change_pct, name_hint)`
@@ -763,6 +789,49 @@ mod tests {
         assert!(p.position_of("600519").is_none());
         let st = p.position_state_of("600519").unwrap();
         assert!((st.realized_pnl - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn open_lot_clock_resets_after_full_exit() {
+        let mut p = Portfolio::default();
+        p.record_trade(TradeDraft {
+            code: "600519",
+            name: "测试",
+            side: TradeSide::Buy,
+            shares: 100.0,
+            price: 10.0,
+            fee: 0.0,
+            note: "",
+            time: Some("2026-01-02 10:00:00".into()),
+        })
+        .unwrap();
+        p.record_trade(TradeDraft {
+            code: "600519",
+            name: "测试",
+            side: TradeSide::Sell,
+            shares: 100.0,
+            price: 11.0,
+            fee: 0.0,
+            note: "",
+            time: Some("2026-01-10 10:00:00".into()),
+        })
+        .unwrap();
+        assert!(p.open_lot_opened_on("600519").is_none());
+        p.record_trade(TradeDraft {
+            code: "600519",
+            name: "测试",
+            side: TradeSide::Buy,
+            shares: 100.0,
+            price: 12.0,
+            fee: 0.0,
+            note: "",
+            time: Some("2026-03-01 10:00:00".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            p.open_lot_opened_on("600519").as_deref(),
+            Some("2026-03-01 10:00:00")
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ use crate::domain::fundamentals::{
 };
 use crate::domain::journal::{DecisionPlan, EvidenceSnapshot, PlanStatus};
 use crate::domain::money::Currency;
+use crate::domain::position_review::{PositionReview, PositionReviewInput, analyze_position};
 use crate::domain::position_sizing::{
     PositionPlan, PositionSizingError, PositionSizingInput, calculate_position_plan,
 };
@@ -601,5 +602,121 @@ impl StockApp {
         self.persist_journal();
         self.status = crate::model::shared("已创建计划，并保存当时证据快照");
         cx.notify();
+    }
+
+    /// Cost-vs-last review of the selected open lot. Always local and
+    /// deterministic; missing quotes or K-lines only mark those dimensions
+    /// unknown instead of inventing a stance.
+    pub(crate) fn position_review_view_model(&self) -> Option<PositionReview> {
+        let code = self.selected.to_string();
+        let position = self.portfolio.position_of(&code)?;
+        let candles_match = self
+            .candles_code
+            .as_ref()
+            .is_some_and(|value| value == code.as_str());
+        let symbol = self.symbols.iter().find(|item| item.code == code);
+        let last = symbol
+            .map(|item| item.last)
+            .filter(|price| price.is_finite() && *price > 0.0)
+            .or_else(|| {
+                candles_match
+                    .then(|| self.candles.last().map(|candle| candle.close))
+                    .flatten()
+                    .filter(|price| price.is_finite() && *price > 0.0)
+            })
+            .unwrap_or(0.0);
+        let mark = crate::data::portfolio::PositionMark::from_position(position, last, 0.0);
+        let signal = candles_match.then(|| self.current_signal()).flatten();
+        let levels = candles_match.then(|| self.levels_cache.as_ref()).flatten();
+        let alert = self.buy_alerts.get(&code);
+        let climate = self.market_climate_report();
+        let quote_stale = match &self.services.market.quotes.state {
+            crate::controller::state::RequestState::Ready(records) => records
+                .iter()
+                .find(|record| record.code == code)
+                .is_none_or(|record| {
+                    !record.usable() || record.freshness == crate::domain::market::Freshness::Stale
+                }),
+            crate::controller::state::RequestState::Idle
+            | crate::controller::state::RequestState::Loading => last <= 0.0,
+            crate::controller::state::RequestState::Failed(_) => true,
+        };
+        let weight = self
+            .portfolio_risk_view(&self.portfolio_summary())
+            .items
+            .iter()
+            .find(|item| item.code == code)
+            .map(|item| item.position_weight_pct);
+        let open_plan = self.journal.for_code(&code).into_iter().find_map(|entry| {
+            entry.plan.as_ref().filter(|plan| {
+                matches!(
+                    plan.status,
+                    PlanStatus::Planned | PlanStatus::Executed | PlanStatus::DueForReview
+                )
+            })
+        });
+        let as_of = if candles_match {
+            self.candles
+                .last()
+                .map(|candle| candle.date.to_string())
+                .unwrap_or_else(|| chrono::Local::now().date_naive().to_string())
+        } else {
+            chrono::Local::now().date_naive().to_string()
+        };
+        let range_position_60_pct = levels.and_then(|item| {
+            let low = item.low_60?;
+            let high = item.high_60?;
+            (high > low).then_some((last - low) / (high - low) * 100.0)
+        });
+        analyze_position(&PositionReviewInput {
+            code,
+            shares: mark.position.shares,
+            avg_cost: mark.position.avg_cost,
+            last,
+            unrealized_pnl: mark.unrealized_pnl,
+            unrealized_pnl_pct: mark.unrealized_pnl_pct,
+            realized_pnl: mark.position.realized_pnl,
+            held_calendar_days: held_calendar_days(
+                self.portfolio
+                    .open_lot_opened_on(&mark.position.code)
+                    .as_deref(),
+                &as_of,
+            ),
+            trade_count: mark.position.trade_count,
+            quote_stale,
+            regime_label: signal.as_ref().map(|item| item.regime.label().to_string()),
+            score: signal.as_ref().map(|item| item.score),
+            rsi14: signal.as_ref().and_then(|item| item.rsi14),
+            price_vs_ma20_pct: signal.as_ref().map(|item| item.price_vs_ma20_pct),
+            range_position_60_pct,
+            atr14: levels.and_then(|item| item.atr14),
+            buy_low: levels.map(|item| item.buy_low),
+            buy_high: levels.map(|item| item.buy_high),
+            sell_low: levels.map(|item| item.sell_low),
+            sell_high: levels.map(|item| item.sell_high),
+            stop_price: alert.and_then(|item| item.stop_price),
+            take_profit: alert.and_then(|item| item.sell_price),
+            stop_triggered: alert.is_some_and(|item| item.stop_triggered),
+            take_profit_triggered: alert.is_some_and(|item| item.sell_triggered),
+            position_weight_pct: weight,
+            climate_label: Some(climate.climate.label().into()),
+            new_entries_frozen: climate.stance == NewEntryStance::Freeze,
+            has_open_plan: open_plan.is_some(),
+            plan_invalidation: open_plan.as_ref().map(|plan| plan.invalidation.clone()),
+            plan_target: open_plan.and_then(|plan| plan.target.clone()),
+        })
+    }
+}
+
+fn held_calendar_days(opened_on: Option<&str>, as_of: &str) -> Option<u32> {
+    let opened = opened_on?.get(..10)?;
+    let as_of = as_of.get(..10)?;
+    let start = chrono::NaiveDate::parse_from_str(opened, "%Y-%m-%d").ok()?;
+    let end = chrono::NaiveDate::parse_from_str(as_of, "%Y-%m-%d").ok()?;
+    let days = end.signed_duration_since(start).num_days();
+    if days < 0 {
+        Some(0)
+    } else {
+        u32::try_from(days).ok()
     }
 }

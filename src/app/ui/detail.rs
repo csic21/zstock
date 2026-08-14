@@ -3,6 +3,7 @@
 mod ai;
 mod indicators;
 mod overview;
+mod position;
 mod strategy;
 
 use gpui::{
@@ -1149,6 +1150,9 @@ impl StockApp {
                         )),
                 );
             }
+            if let Some(review) = self.position_review_view_model() {
+                col = col.child(self.render_position_review(&review, cx));
+            }
         } else if let Some(p) = &pos {
             col = col.child(
                 div()
@@ -1275,7 +1279,7 @@ impl StockApp {
                     .child(if work {
                         "Click Advice for cost-aware buy/sell guidance."
                     } else {
-                        "点击「AI 建议」：结合成本、现价与技术面给出买卖观察倾向。"
+                        "上方多维分析按成本与现价即时计算。点「AI 建议」只解释这些维度，不改结论。"
                     }),
             );
         }

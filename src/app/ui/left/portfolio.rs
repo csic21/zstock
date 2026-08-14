@@ -370,6 +370,7 @@ impl StockApp {
 
         // 持仓行
         let rows: Vec<_> = summary.positions.to_vec();
+        let selected_review = self.position_review_view_model();
         root = root.child(
             div()
                 .id("portfolio-scroll")
@@ -434,17 +435,32 @@ impl StockApp {
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
                                         .truncate()
-                                        .child(if name_show.is_empty() {
-                                            format!(
-                                                "成本 {} · 现 {}",
-                                                format_price(mark.position.avg_cost),
-                                                format_price(mark.last)
-                                            )
-                                        } else {
-                                            format!(
-                                                "{name_show} · 成本 {}",
-                                                format_price(mark.position.avg_cost)
-                                            )
+                                        .child({
+                                            let cost_line = if name_show.is_empty() {
+                                                format!(
+                                                    "成本 {} · 现 {}",
+                                                    format_price(mark.position.avg_cost),
+                                                    format_price(mark.last)
+                                                )
+                                            } else {
+                                                format!(
+                                                    "{name_show} · 成本 {}",
+                                                    format_price(mark.position.avg_cost)
+                                                )
+                                            };
+                                            if is_selected {
+                                                if let Some(review) = &selected_review {
+                                                    format!(
+                                                        "{} · {}",
+                                                        review.stance.label(work),
+                                                        cost_line
+                                                    )
+                                                } else {
+                                                    cost_line
+                                                }
+                                            } else {
+                                                cost_line
+                                            }
                                         }),
                                 ),
                         )

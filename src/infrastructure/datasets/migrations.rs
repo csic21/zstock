@@ -1,5 +1,5 @@
-use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection};
+use anyhow::{Context, Result, bail};
+use rusqlite::{Connection, params};
 
 pub const LATEST_SCHEMA_VERSION: i64 = 5;
 

@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 use crate::domain::backtest::config::PortfolioBacktestConfig;
 use crate::domain::backtest::validation::{
-    consume_sealed_test, evaluate_robustness, RobustnessConfig, RobustnessReport, SealedTestResult,
+    RobustnessConfig, RobustnessReport, SealedTestResult, consume_sealed_test, evaluate_robustness,
 };
 use crate::domain::dataset::{DateInterval, FrozenDataset, FrozenSeries};
 use crate::domain::experiment::{
@@ -12,12 +12,12 @@ use crate::domain::experiment::{
     GenerationAudit, RiskLimits,
 };
 use crate::domain::paper::{
-    compare_with_backtest, PaperBehaviorComparison, PaperCandidate, PaperCandidateStatus,
-    PaperRunResult,
+    PaperBehaviorComparison, PaperCandidate, PaperCandidateStatus, PaperRunResult,
+    compare_with_backtest,
 };
-use crate::domain::strategy::{local_templates, scan_playbooks, CompiledStrategy};
+use crate::domain::strategy::{CompiledStrategy, local_templates, scan_playbooks};
 use crate::domain::strategy_library::{
-    highest_win_rate, rank_library, LibraryFilter, LibrarySort, StrategyLibraryRecord,
+    LibraryFilter, LibrarySort, StrategyLibraryRecord, highest_win_rate, rank_library,
 };
 use crate::infrastructure::datasets::ingest::ingest_instruments;
 use crate::infrastructure::datasets::sqlite::SqliteLabStore;
@@ -1183,11 +1183,13 @@ mod tests {
             crate::features::strategy_lab::state::TemplateFamily::ScanPlaybooks;
         feature.create_local_experiment(series()).unwrap();
         assert_eq!(feature.state.drafts.len(), 4);
-        assert!(feature
-            .state
-            .drafts
-            .iter()
-            .all(|draft| draft.spec.metadata.generator == "scan-playbook"));
+        assert!(
+            feature
+                .state
+                .drafts
+                .iter()
+                .all(|draft| draft.spec.metadata.generator == "scan-playbook")
+        );
     }
 
     #[test]
