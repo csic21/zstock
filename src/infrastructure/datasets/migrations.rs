@@ -1,7 +1,7 @@
-use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, params};
+use anyhow::{bail, Context, Result};
+use rusqlite::{params, Connection};
 
-pub const LATEST_SCHEMA_VERSION: i64 = 4;
+pub const LATEST_SCHEMA_VERSION: i64 = 5;
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE instruments (
@@ -181,6 +181,23 @@ CREATE TABLE sealed_test_reports (
 );
 "#;
 
+const MIGRATION_5: &str = r#"
+CREATE TABLE strategy_library (
+    record_id TEXT PRIMARY KEY,
+    experiment_id TEXT NOT NULL REFERENCES experiments(experiment_id) ON DELETE CASCADE,
+    strategy_id TEXT NOT NULL REFERENCES strategies(strategy_id) ON DELETE RESTRICT,
+    dataset_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    win_rate_pct REAL NOT NULL,
+    retained_at TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    UNIQUE(experiment_id, strategy_id)
+);
+
+CREATE INDEX strategy_library_status_win_rate
+    ON strategy_library(status, win_rate_pct DESC, retained_at DESC);
+"#;
+
 pub fn migrate(connection: &mut Connection) -> Result<()> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (\
@@ -202,6 +219,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             2 => MIGRATION_2,
             3 => MIGRATION_3,
             4 => MIGRATION_4,
+            5 => MIGRATION_5,
             _ => bail!("missing migration {version}"),
         };
         apply_one(connection, version, sql)?;

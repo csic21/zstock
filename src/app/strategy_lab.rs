@@ -304,6 +304,46 @@ impl super::StockApp {
         cx.notify();
     }
 
+    pub(crate) fn strategy_lab_set_library_sort(
+        &mut self,
+        sort: crate::domain::strategy_library::LibrarySort,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.strategy_lab_feature.set_library_sort(sort);
+        cx.notify();
+    }
+
+    pub(crate) fn strategy_lab_set_library_filter(
+        &mut self,
+        filter: crate::domain::strategy_library::LibraryFilter,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.strategy_lab_feature.set_library_filter(filter);
+        cx.notify();
+    }
+
+    pub(crate) fn strategy_lab_dismiss_library(
+        &mut self,
+        record_id: String,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if let Err(error) = self.strategy_lab_feature.dismiss_library_record(record_id) {
+            self.strategy_lab_feature.state.status = format!("无法删除策略库条目：{error:#}");
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn strategy_lab_open_library(
+        &mut self,
+        record_id: String,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if let Err(error) = self.strategy_lab_feature.open_library_record(&record_id) {
+            self.strategy_lab_feature.state.status = format!("无法打开策略库条目：{error:#}");
+        }
+        cx.notify();
+    }
+
     pub(crate) fn strategy_lab_promote_paper(&mut self, cx: &mut gpui::Context<Self>) {
         if let Err(error) = self.strategy_lab_feature.promote_selected_to_paper() {
             self.strategy_lab_feature.state.status = format!("无法加入模拟观察：{error:#}");

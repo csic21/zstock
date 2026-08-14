@@ -1,21 +1,21 @@
 use gpui::{
-    AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, relative,
+    div, prelude::FluentBuilder, px, relative, AnyElement, Context, InteractiveElement,
+    IntoElement, ParentElement, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, PixelsExt, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
     scroll::ScrollableElement,
-    v_flex,
+    v_flex, ActiveTheme, Disableable, PixelsExt, Sizable, StyledExt,
 };
 
 use crate::app::StockApp;
 use crate::domain::backtest::validation::PromotionConclusion;
 use crate::domain::dataset::DatasetManifest;
 use crate::domain::experiment::{ExperimentRecord, ExperimentStatus};
+use crate::domain::strategy_library::{LibraryFilter, LibrarySort};
 
-use super::presenter::{StrategyLabLayout, leaderboard};
+use super::presenter::{leaderboard, StrategyLabLayout};
 use super::state::{StrategyLabPage, StrategyLabState, TemplateFamily};
 
 impl StockApp {
@@ -210,6 +210,7 @@ impl StockApp {
             StrategyLabPage::Leaderboard => self.render_strategy_lab_leaderboard(cx),
             StrategyLabPage::Report => self.render_strategy_lab_report(layout, cx),
             StrategyLabPage::PaperCandidates => self.render_strategy_lab_paper(cx),
+            StrategyLabPage::Library => self.render_strategy_lab_library(cx),
         }
     }
 
@@ -1132,6 +1133,7 @@ impl StockApp {
                                 format!("{:.2}%", row.drawdown_pct),
                                 cx,
                             ))
+                            .child(metric_tile("胜率", format!("{:.1}%", row.win_rate_pct), cx))
                             .child(metric_tile("完成交易", format!("{} 笔", row.trades), cx)),
                     )
                     .child(
@@ -1566,6 +1568,297 @@ impl StockApp {
             }))
             .into_any_element()
     }
+
+    fn render_strategy_lab_library(&self, cx: &mut Context<Self>) -> AnyElement {
+        let state = &self.strategy_lab_feature.state;
+        let rows = self.strategy_lab_feature.ranked_library();
+        let top = self.strategy_lab_feature.top_win_rate_strategy();
+        v_flex()
+            .w_full()
+            .gap_4()
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_end()
+                    .justify_between()
+                    .gap_3()
+                    .flex_wrap()
+                    .child(section_title(
+                        "历史策略库",
+                        "跨实验保留已完成回测。删除只影响策略库，不改原始实验。胜率用于浏览排序，不能单独作为晋级依据。",
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!(
+                                "保留 {} 条 · 当前列表 {} 条",
+                                state.library.len(),
+                                rows.len()
+                            )),
+                    ),
+            )
+            .when_some(top.as_ref(), |column, record| {
+                column.child(
+                    v_flex()
+                        .w_full()
+                        .gap_1()
+                        .p_4()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(cx.theme().success.opacity(0.35))
+                        .bg(cx.theme().success.opacity(0.07))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().success)
+                                .child("当前胜率最高"),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_semibold()
+                                .child(format!(
+                                    "{} · {:.1}% · {} 笔 · 超额 {:+.2}%",
+                                    record.strategy_name,
+                                    record.win_rate_pct,
+                                    record.trade_count,
+                                    record.excess_return_pct
+                                )),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!(
+                                    "来自实验 {} · {}",
+                                    short_id(&record.experiment_id),
+                                    record
+                                        .conclusion
+                                        .map(library_conclusion_label)
+                                        .unwrap_or("尚未生成稳健性结论")
+                                )),
+                        ),
+                )
+            })
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .flex_wrap()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("排序"),
+                            )
+                            .children(LibrarySort::ALL.into_iter().map(|sort| {
+                                Button::new(("library-sort", sort as usize))
+                                    .xsmall()
+                                    .when(state.library_sort == sort, |button| button.primary())
+                                    .when(state.library_sort != sort, |button| button.ghost())
+                                    .label(sort.label())
+                                    .on_click(cx.listener(move |this, _, _window, cx| {
+                                        this.strategy_lab_set_library_sort(sort, cx);
+                                    }))
+                            })),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .flex_wrap()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("筛选"),
+                            )
+                            .children(LibraryFilter::ALL.into_iter().map(|filter| {
+                                Button::new(("library-filter", filter as usize))
+                                    .xsmall()
+                                    .when(state.library_filter == filter, |button| button.primary())
+                                    .when(state.library_filter != filter, |button| button.ghost())
+                                    .label(filter.label())
+                                    .on_click(cx.listener(move |this, _, _window, cx| {
+                                        this.strategy_lab_set_library_filter(filter, cx);
+                                    }))
+                            })),
+                    ),
+            )
+            .when(rows.is_empty(), |column| {
+                column.child(empty_state(
+                    if state.library.is_empty() {
+                        "策略库还是空的"
+                    } else {
+                        "当前筛选没有条目"
+                    },
+                    "完成一次批量回测后，未取消的策略会自动进入这里。之后可以按胜率排序，或删除不再需要的条目。",
+                    cx,
+                ))
+            })
+            .children(rows.into_iter().enumerate().map(|(index, record)| {
+                let record_id = record.id.clone();
+                let open_id = record.id.clone();
+                let conclusion = record
+                    .conclusion
+                    .map(library_conclusion_label)
+                    .unwrap_or("尚未评级");
+                let conclusion_color = match record.conclusion {
+                    Some(PromotionConclusion::PaperCandidate) => cx.theme().success,
+                    Some(PromotionConclusion::Rejected) => cx.theme().danger,
+                    _ => cx.theme().warning,
+                };
+                v_flex()
+                    .id(("strategy-library", index))
+                    .w_full()
+                    .gap_3()
+                    .p_4()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_start()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .w(px(42.0))
+                                            .h(px(42.0))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded_lg()
+                                            .bg(cx.theme().muted)
+                                            .font_semibold()
+                                            .child(format!("#{:02}", index + 1)),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .gap_0p5()
+                                            .child(
+                                                div()
+                                                    .font_semibold()
+                                                    .child(record.strategy_name.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(format!(
+                                                        "{} · 实验 {}",
+                                                        short_id(&record.strategy_id),
+                                                        short_id(&record.experiment_id)
+                                                    )),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .flex_wrap()
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded_full()
+                                            .bg(cx.theme().muted)
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(record.evidence.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded_full()
+                                            .bg(conclusion_color.opacity(0.10))
+                                            .text_xs()
+                                            .font_semibold()
+                                            .text_color(conclusion_color)
+                                            .child(conclusion),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .flex_wrap()
+                            .child(metric_tile(
+                                "胜率",
+                                format!("{:.1}%", record.win_rate_pct),
+                                cx,
+                            ))
+                            .child(metric_tile(
+                                "样本外胜率",
+                                record
+                                    .oos_win_rate_pct
+                                    .map(|value| format!("{value:.1}%"))
+                                    .unwrap_or_else(|| "—".into()),
+                                cx,
+                            ))
+                            .child(metric_tile(
+                                "成本后超额",
+                                format!("{:+.2}%", record.excess_return_pct),
+                                cx,
+                            ))
+                            .child(metric_tile(
+                                "最大回撤",
+                                format!("{:.2}%", record.max_drawdown_pct),
+                                cx,
+                            ))
+                            .child(metric_tile(
+                                "完成交易",
+                                format!("{} 笔", record.trade_count),
+                                cx,
+                            ))
+                            .child(metric_tile(
+                                "盈亏比",
+                                format!("{:.2}", record.payoff_ratio),
+                                cx,
+                            )),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .flex_wrap()
+                            .child(
+                                Button::new(("library-open", index))
+                                    .primary()
+                                    .label("查看证据报告")
+                                    .on_click(cx.listener(move |this, _, _window, cx| {
+                                        this.strategy_lab_open_library(open_id.clone(), cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new(("library-delete", index))
+                                    .danger()
+                                    .label("从策略库删除")
+                                    .on_click(cx.listener(move |this, _, _window, cx| {
+                                        this.strategy_lab_dismiss_library(record_id.clone(), cx);
+                                    })),
+                            ),
+                    )
+            }))
+            .into_any_element()
+    }
+}
+
+fn library_conclusion_label(conclusion: PromotionConclusion) -> &'static str {
+    match conclusion {
+        PromotionConclusion::Rejected => "淘汰",
+        PromotionConclusion::ContinueResearch => "继续研究",
+        PromotionConclusion::PaperCandidate => "模拟盘候选",
+    }
 }
 
 fn selected_manifest(state: &StrategyLabState) -> Option<&DatasetManifest> {
@@ -1669,6 +1962,7 @@ fn page_available(page: StrategyLabPage, state: &StrategyLabState) -> bool {
         StrategyLabPage::Leaderboard => !state.reports.is_empty(),
         StrategyLabPage::Report => state.selected_report().is_some(),
         StrategyLabPage::PaperCandidates => !state.paper_candidates.is_empty(),
+        StrategyLabPage::Library => true,
     }
 }
 

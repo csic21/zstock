@@ -4,6 +4,7 @@ use crate::domain::dataset::DatasetManifest;
 use crate::domain::experiment::ExperimentRecord;
 use crate::domain::paper::{PaperBehaviorComparison, PaperCandidate, PaperRunResult};
 use crate::domain::strategy::StrategySpec;
+use crate::domain::strategy_library::{LibraryFilter, LibrarySort, StrategyLibraryRecord};
 use crate::services::backtest_runner::{BacktestProgressSnapshot, StrategyRunFailure};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -15,16 +16,18 @@ pub enum StrategyLabPage {
     Leaderboard,
     Report,
     PaperCandidates,
+    Library,
 }
 
 impl StrategyLabPage {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Configure,
         Self::Drafts,
         Self::Progress,
         Self::Leaderboard,
         Self::Report,
         Self::PaperCandidates,
+        Self::Library,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -35,6 +38,7 @@ impl StrategyLabPage {
             Self::Leaderboard => "排行榜",
             Self::Report => "证据报告",
             Self::PaperCandidates => "模拟候选",
+            Self::Library => "策略库",
         }
     }
 }
@@ -111,6 +115,9 @@ pub struct StrategyLabState {
     pub paper_candidates: Vec<PaperCandidate>,
     pub paper_runs: Vec<PaperRunResult>,
     pub paper_comparisons: Vec<(String, PaperBehaviorComparison)>,
+    pub library: Vec<StrategyLibraryRecord>,
+    pub library_sort: LibrarySort,
+    pub library_filter: LibraryFilter,
     pub busy: bool,
 }
 

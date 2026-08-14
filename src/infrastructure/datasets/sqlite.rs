@@ -2,23 +2,25 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
 
-use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, MAIN_DB, OptionalExtension, Transaction, params};
+use anyhow::{bail, Context, Result};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, MAIN_DB};
 
 use crate::domain::backtest::validation::{RobustnessReport, SealedTestResult};
 use crate::domain::dataset::{
-    DatasetManifest, FrozenDataset, FrozenSeries, dataset_content_sha256, validate_series,
+    dataset_content_sha256, validate_series, DatasetManifest, FrozenDataset, FrozenSeries,
 };
 use crate::domain::experiment::{ExperimentCandidate, ExperimentRecord};
 use crate::domain::market::{Adjustment, AssetType, CandleRecord, InstrumentId, Market};
 use crate::domain::paper::{PaperCandidate, PaperRunResult};
-use crate::domain::strategy::{StrategySpec, normalized_json, strategy_id};
+use crate::domain::strategy::{normalized_json, strategy_id, StrategySpec};
+use crate::domain::strategy_library::{LibraryStatus, StrategyLibraryRecord};
 use crate::services::backtest_repository::{
     BacktestRepository, StoredBacktestRun, StoredRunStatus,
 };
 use crate::services::dataset_repository::{DatasetRepository, FreezeDatasetRequest, IngestSummary};
 use crate::services::experiment_repository::ExperimentRepository;
 use crate::services::paper_trading::PaperTradingRepository;
+use crate::services::strategy_library::StrategyLibraryRepository;
 use crate::services::validation_repository::ValidationRepository;
 
 use super::migrations;
@@ -689,6 +691,83 @@ impl ValidationRepository for SqliteLabStore {
     }
 }
 
+impl StrategyLibraryRepository for SqliteLabStore {
+    fn save_library_record(&self, record: &StrategyLibraryRecord) -> Result<()> {
+        let connection = self.connection();
+        connection.execute(
+            r#"INSERT INTO strategy_library(
+                record_id, experiment_id, strategy_id, dataset_id, status, win_rate_pct, retained_at, record_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(experiment_id, strategy_id) DO UPDATE SET
+                dataset_id=excluded.dataset_id,
+                win_rate_pct=excluded.win_rate_pct,
+                retained_at=excluded.retained_at,
+                record_json=excluded.record_json
+             WHERE strategy_library.status = 'retained'"#,
+            params![
+                record.id,
+                record.experiment_id,
+                record.strategy_id,
+                record.dataset_id,
+                library_status_name(record.status),
+                record.win_rate_pct,
+                record.retained_at,
+                serde_json::to_string(record)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn list_library_records(&self) -> Result<Vec<StrategyLibraryRecord>> {
+        let connection = self.connection();
+        let mut statement = connection.prepare(
+            "SELECT record_json FROM strategy_library WHERE status='retained' \
+             ORDER BY win_rate_pct DESC, retained_at DESC, record_id",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|row| Ok(serde_json::from_str(&row?)?))
+            .collect()
+    }
+
+    fn dismiss_library_record(&self, record_id: &str) -> Result<bool> {
+        let connection = self.connection();
+        let json: Option<String> = connection
+            .query_row(
+                "SELECT record_json FROM strategy_library WHERE record_id=?1",
+                [record_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(json) = json else {
+            return Ok(false);
+        };
+        let mut record: StrategyLibraryRecord = serde_json::from_str(&json)?;
+        record.status = LibraryStatus::Dismissed;
+        let updated = connection.execute(
+            "UPDATE strategy_library SET status='dismissed', record_json=?1 WHERE record_id=?2",
+            params![serde_json::to_string(&record)?, record_id],
+        )?;
+        Ok(updated > 0)
+    }
+
+    fn library_initialized(&self) -> Result<bool> {
+        let connection = self.connection();
+        let count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM strategy_library", [], |row| {
+                row.get(0)
+            })?;
+        Ok(count > 0)
+    }
+}
+
+fn library_status_name(status: LibraryStatus) -> &'static str {
+    match status {
+        LibraryStatus::Retained => "retained",
+        LibraryStatus::Dismissed => "dismissed",
+    }
+}
+
 fn insert_instrument(transaction: &Transaction<'_>, instrument: &InstrumentId) -> Result<()> {
     transaction.execute(
         r#"INSERT OR IGNORE INTO instruments(instrument_key, market, asset_type, code)
@@ -867,7 +946,7 @@ mod tests {
     use crate::domain::experiment::{
         CandidateSource, ExperimentDefinition, ExperimentStatus, GenerationAudit, RiskLimits,
     };
-    use crate::domain::paper::{PaperCandidate, PaperCandidateStatus, run_paper_history};
+    use crate::domain::paper::{run_paper_history, PaperCandidate, PaperCandidateStatus};
     use crate::domain::strategy::{CompiledStrategy, LocalTemplate};
 
     fn instrument() -> InstrumentId {
@@ -1043,11 +1122,9 @@ mod tests {
                 normalized_hash: None,
                 validation_errors: vec![],
             };
-            assert!(
-                store
-                    .save_experiment(&invalid, &[invalid_candidate])
-                    .is_err()
-            );
+            assert!(store
+                .save_experiment(&invalid, &[invalid_candidate])
+                .is_err());
             assert!(store.load_experiment("must-rollback").unwrap().is_none());
             (expected, candidate)
         };
@@ -1168,6 +1245,55 @@ mod tests {
 
         assert_eq!(store.list_candidates().unwrap(), vec![candidate.clone()]);
         assert_eq!(store.load_latest_run(&candidate.id).unwrap(), Some(result));
+    }
+
+    #[test]
+    fn strategy_library_keeps_metrics_and_honors_dismiss() {
+        use crate::domain::strategy_library::LibraryStatus;
+        use crate::services::strategy_library::StrategyLibraryRepository;
+
+        let store = SqliteLabStore::open_in_memory().unwrap();
+        let manifest = seed_dataset(&store);
+        let spec = LocalTemplate::NDayHighBreakout.build(&manifest.id);
+        let strategy_id = store.save_strategy(&spec).unwrap();
+        let experiment = experiment(&manifest.id, &strategy_id);
+        let candidate = ExperimentCandidate {
+            experiment_id: experiment.definition.id.clone(),
+            ordinal: 0,
+            strategy_id: Some(strategy_id.clone()),
+            parent_strategy_id: None,
+            source: CandidateSource::LocalTemplate,
+            normalized_hash: Some(strategy_id.clone()),
+            validation_errors: vec![],
+        };
+        store.save_experiment(&experiment, &[candidate]).unwrap();
+        let record = StrategyLibraryRecord {
+            id: StrategyLibraryRecord::id_for(&experiment.definition.id, &strategy_id),
+            experiment_id: experiment.definition.id.clone(),
+            strategy_id: strategy_id.clone(),
+            dataset_id: manifest.id.clone(),
+            strategy_name: spec.name,
+            retained_at: "2026-08-14T00:00:00Z".into(),
+            status: LibraryStatus::Retained,
+            conclusion: None,
+            evidence: "样本内探索".into(),
+            win_rate_pct: 62.5,
+            oos_win_rate_pct: None,
+            total_return_pct: 8.0,
+            excess_return_pct: 3.0,
+            max_drawdown_pct: 12.0,
+            trade_count: 16,
+            payoff_ratio: 1.4,
+            profit_factor: 1.2,
+        };
+        store.save_library_record(&record).unwrap();
+        store.save_library_record(&record).unwrap();
+        assert_eq!(store.list_library_records().unwrap(), vec![record.clone()]);
+        assert!(store.dismiss_library_record(&record.id).unwrap());
+        assert!(store.list_library_records().unwrap().is_empty());
+        store.save_library_record(&record).unwrap();
+        assert!(store.list_library_records().unwrap().is_empty());
+        assert!(store.library_initialized().unwrap());
     }
 
     fn unique_path(suffix: &str) -> std::path::PathBuf {

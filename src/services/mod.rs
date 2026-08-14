@@ -12,5 +12,6 @@ pub mod performance;
 pub mod repositories;
 pub mod secrets;
 pub mod strategy_generator;
+pub mod strategy_library;
 pub mod task_metrics;
 pub mod validation_repository;

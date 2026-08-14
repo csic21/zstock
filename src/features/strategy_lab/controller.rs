@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 
 use crate::domain::backtest::config::PortfolioBacktestConfig;
 use crate::domain::backtest::validation::{
-    RobustnessConfig, RobustnessReport, SealedTestResult, consume_sealed_test, evaluate_robustness,
+    consume_sealed_test, evaluate_robustness, RobustnessConfig, RobustnessReport, SealedTestResult,
 };
 use crate::domain::dataset::{DateInterval, FrozenDataset, FrozenSeries};
 use crate::domain::experiment::{
@@ -12,10 +12,13 @@ use crate::domain::experiment::{
     GenerationAudit, RiskLimits,
 };
 use crate::domain::paper::{
-    PaperBehaviorComparison, PaperCandidate, PaperCandidateStatus, PaperRunResult,
-    compare_with_backtest,
+    compare_with_backtest, PaperBehaviorComparison, PaperCandidate, PaperCandidateStatus,
+    PaperRunResult,
 };
-use crate::domain::strategy::{CompiledStrategy, local_templates, scan_playbooks};
+use crate::domain::strategy::{local_templates, scan_playbooks, CompiledStrategy};
+use crate::domain::strategy_library::{
+    highest_win_rate, rank_library, LibraryFilter, LibrarySort, StrategyLibraryRecord,
+};
 use crate::infrastructure::datasets::ingest::ingest_instruments;
 use crate::infrastructure::datasets::sqlite::SqliteLabStore;
 use crate::infrastructure::market::eastmoney::EastmoneyProvider;
@@ -32,6 +35,7 @@ use crate::services::paper_trading::{PaperTradingRepository, PaperTradingService
 use crate::services::strategy_generator::{
     DraftSource, StrategyBatchDraft, StrategyGenerationInput,
 };
+use crate::services::strategy_library::StrategyLibraryRepository;
 use crate::services::validation_repository::ValidationRepository;
 
 use super::state::{StrategyDraftView, StrategyLabPage, StrategyLabState};
@@ -107,6 +111,7 @@ impl StrategyLabFeature {
         self.state.datasets = self.store.list_manifests()?;
         self.state.experiments = self.store.list_experiments()?;
         self.restore_paper()?;
+        self.sync_strategy_library()?;
         if self.state.selected_experiment_id.is_none() {
             self.state.selected_experiment_id = self
                 .state
@@ -127,6 +132,59 @@ impl StrategyLabFeature {
             .collect::<Result<Vec<_>>>()?;
         self.rebuild_paper_comparisons();
         Ok(())
+    }
+
+    fn restore_library(&mut self) -> Result<()> {
+        self.state.library = self.store.list_library_records()?;
+        Ok(())
+    }
+
+    fn sync_strategy_library(&mut self) -> Result<()> {
+        if !self.store.library_initialized()? {
+            let experiment_ids: Vec<_> = self
+                .state
+                .experiments
+                .iter()
+                .map(|experiment| experiment.definition.id.clone())
+                .collect();
+            for experiment_id in experiment_ids {
+                self.retain_experiment_reports(&experiment_id)?;
+            }
+        }
+        self.restore_library()
+    }
+
+    fn retain_experiment_reports(&self, experiment_id: &str) -> Result<usize> {
+        let robustness = self.store.list_robustness_reports(experiment_id)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut retained = 0;
+        for run in self.store.list_runs(experiment_id)? {
+            let Some(report) = run.report else {
+                continue;
+            };
+            if report.cancelled {
+                continue;
+            }
+            let name = self
+                .store
+                .load_strategy(&report.strategy_id)?
+                .map(|spec| spec.name)
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| report.strategy_id.clone());
+            let robust = robustness
+                .iter()
+                .find(|item| item.strategy_id == report.strategy_id);
+            self.store
+                .save_library_record(&StrategyLibraryRecord::from_completed_run(
+                    experiment_id,
+                    &name,
+                    &report,
+                    robust,
+                    &now,
+                ))?;
+            retained += 1;
+        }
+        Ok(retained)
     }
 
     fn rebuild_paper_comparisons(&mut self) {
@@ -742,13 +800,15 @@ impl StrategyLabFeature {
             .first()
             .map(|report| report.strategy_id.clone());
         self.state.page = StrategyLabPage::Leaderboard;
+        let retained = self.retain_experiment_reports(&result.experiment_id)?;
+        self.restore_library()?;
         self.state.status = match experiment.status {
             ExperimentStatus::Completed => {
                 if result.robustness_errors.is_empty() {
-                    "实验完成；确定性报告与稳健性门槛已计算".into()
+                    format!("实验完成；确定性报告与稳健性门槛已计算；{retained} 个策略已写入策略库")
                 } else {
                     format!(
-                        "实验完成；{} 个稳健性报告因数据区间不足未生成",
+                        "实验完成；{} 个稳健性报告因数据区间不足未生成；{retained} 个策略已写入策略库",
                         result.robustness_errors.len()
                     )
                 }
@@ -936,6 +996,51 @@ impl StrategyLabFeature {
         Ok(path)
     }
 
+    pub fn set_library_sort(&mut self, sort: LibrarySort) {
+        self.state.library_sort = sort;
+    }
+
+    pub fn set_library_filter(&mut self, filter: LibraryFilter) {
+        self.state.library_filter = filter;
+    }
+
+    pub fn ranked_library(&self) -> Vec<StrategyLibraryRecord> {
+        rank_library(
+            &self.state.library,
+            self.state.library_sort,
+            self.state.library_filter,
+        )
+    }
+
+    pub fn top_win_rate_strategy(&self) -> Option<StrategyLibraryRecord> {
+        highest_win_rate(&self.state.library).cloned()
+    }
+
+    pub fn dismiss_library_record(&mut self, record_id: String) -> Result<()> {
+        if !self.store.dismiss_library_record(&record_id)? {
+            return Err(anyhow!("策略库记录不存在或已删除"));
+        }
+        self.restore_library()?;
+        self.state.status = "已从策略库移除；原始实验与证据报告仍保留".into();
+        Ok(())
+    }
+
+    pub fn open_library_record(&mut self, record_id: &str) -> Result<()> {
+        let record = self
+            .state
+            .library
+            .iter()
+            .find(|item| item.id == record_id)
+            .cloned()
+            .context("策略库记录不存在")?;
+        self.select_experiment(record.experiment_id)?;
+        self.state.selected_strategy_id = Some(record.strategy_id);
+        self.state.selected_trade_index = None;
+        self.state.page = StrategyLabPage::Report;
+        self.state.status = format!("已打开策略库条目：{}", record.strategy_name);
+        Ok(())
+    }
+
     pub fn paper_comparison(&self, candidate_id: &str) -> Option<&PaperBehaviorComparison> {
         self.state
             .paper_comparisons
@@ -1041,6 +1146,22 @@ mod tests {
             selected
         );
         assert!(!feature.state.robustness.is_empty());
+        assert!(!feature.state.library.is_empty());
+        assert_eq!(
+            feature.state.library.len(),
+            feature
+                .state
+                .reports
+                .iter()
+                .filter(|report| !report.cancelled)
+                .count()
+        );
+        let first_id = feature.state.library[0].id.clone();
+        feature.dismiss_library_record(first_id.clone()).unwrap();
+        assert!(!feature.state.library.iter().any(|item| item.id == first_id));
+        feature.state.library.clear();
+        feature.restore().unwrap();
+        assert!(!feature.state.library.iter().any(|item| item.id == first_id));
         let sealed_work = feature.prepare_sealed_test().unwrap();
         let sealed = StrategyLabFeature::execute_sealed_test(&sealed_work).unwrap();
         feature.finish_sealed_test(&experiment_id, sealed).unwrap();
@@ -1062,13 +1183,11 @@ mod tests {
             crate::features::strategy_lab::state::TemplateFamily::ScanPlaybooks;
         feature.create_local_experiment(series()).unwrap();
         assert_eq!(feature.state.drafts.len(), 4);
-        assert!(
-            feature
-                .state
-                .drafts
-                .iter()
-                .all(|draft| draft.spec.metadata.generator == "scan-playbook")
-        );
+        assert!(feature
+            .state
+            .drafts
+            .iter()
+            .all(|draft| draft.spec.metadata.generator == "scan-playbook"));
     }
 
     #[test]
