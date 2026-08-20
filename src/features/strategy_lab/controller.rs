@@ -1,10 +1,14 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 
 use crate::domain::backtest::config::PortfolioBacktestConfig;
+use crate::domain::backtest::portfolio::run_portfolio_backtest;
+use crate::domain::backtest::report::PortfolioBacktestReport;
 use crate::domain::backtest::validation::{
-    RobustnessConfig, RobustnessReport, SealedTestResult, consume_sealed_test, evaluate_robustness,
+    PromotionConclusion, RobustnessConfig, RobustnessReport, SealedTestResult, consume_sealed_test,
+    evaluate_robustness,
 };
 use crate::domain::dataset::{DateInterval, FrozenDataset, FrozenSeries};
 use crate::domain::experiment::{
@@ -15,9 +19,13 @@ use crate::domain::paper::{
     PaperBehaviorComparison, PaperCandidate, PaperCandidateStatus, PaperRunResult,
     compare_with_backtest,
 };
-use crate::domain::strategy::{CompiledStrategy, local_templates, scan_playbooks};
+use crate::domain::strategy::{CompiledStrategy, StrategySpec, local_templates, scan_playbooks};
+use crate::domain::strategy_arena::{
+    ArenaSnapshot, ArenaStanding, LiveObservation, MAX_LINEAGE_DEPTH, evaluate_arena,
+    evolution_headline, propose_offspring, should_keep_offspring,
+};
 use crate::domain::strategy_library::{
-    LibraryFilter, LibrarySort, StrategyLibraryRecord, highest_win_rate, rank_library,
+    LibraryFilter, LibrarySort, StrategyLibraryRecord, rank_library,
 };
 use crate::infrastructure::datasets::ingest::ingest_instruments;
 use crate::infrastructure::datasets::sqlite::SqliteLabStore;
@@ -72,6 +80,26 @@ pub struct SealedTestWork {
     pub config: PortfolioBacktestConfig,
     pub robustness: RobustnessReport,
     pub consumed_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct EvolutionWork {
+    pub parent: StrategyLibraryRecord,
+    pub generation: usize,
+    pub dataset: FrozenDataset,
+    pub config: PortfolioBacktestConfig,
+    pub proposals: Vec<StrategySpec>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EvolutionBatchResult {
+    pub parent_name: String,
+    pub generation: usize,
+    pub considered: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub kept: Vec<(StrategySpec, StrategyLibraryRecord, PortfolioBacktestReport)>,
+    pub discarded: Vec<(StrategySpec, StrategyLibraryRecord)>,
 }
 
 impl Default for StrategyLabFeature {
@@ -802,13 +830,16 @@ impl StrategyLabFeature {
         self.state.page = StrategyLabPage::Leaderboard;
         let retained = self.retain_experiment_reports(&result.experiment_id)?;
         self.restore_library()?;
+        let arena_note = self.arena_status_note();
         self.state.status = match experiment.status {
             ExperimentStatus::Completed => {
                 if result.robustness_errors.is_empty() {
-                    format!("实验完成；确定性报告与稳健性门槛已计算；{retained} 个策略已写入策略库")
+                    format!(
+                        "实验完成；确定性报告与稳健性门槛已计算；{retained} 个策略已写入策略库{arena_note}"
+                    )
                 } else {
                     format!(
-                        "实验完成；{} 个稳健性报告因数据区间不足未生成；{retained} 个策略已写入策略库",
+                        "实验完成；{} 个稳健性报告因数据区间不足未生成；{retained} 个策略已写入策略库{arena_note}",
                         result.robustness_errors.len()
                     )
                 }
@@ -930,10 +961,23 @@ impl StrategyLabFeature {
             .filter_map(|(id, result)| result.as_ref().err().map(|error| format!("{id}: {error}")))
             .collect();
         self.restore_paper()?;
-        self.state.status = if failures.is_empty() {
-            format!("每日模拟观察已更新：{} 个候选", results.len())
+        let pruned = self.prune_weak_strategies()?;
+        let arena_note = self.arena_status_note();
+        let prune_note = if pruned == 0 {
+            String::new()
         } else {
-            format!("模拟观察更新完成，{} 个候选失败", failures.len())
+            format!("；已淘汰 {pruned} 个弱势策略")
+        };
+        self.state.status = if failures.is_empty() {
+            format!(
+                "每日模拟观察已更新：{} 个候选{prune_note}{arena_note}",
+                results.len()
+            )
+        } else {
+            format!(
+                "模拟观察更新完成，{} 个候选失败{prune_note}{arena_note}",
+                failures.len()
+            )
         };
         Ok(())
     }
@@ -1004,16 +1048,256 @@ impl StrategyLabFeature {
         self.state.library_filter = filter;
     }
 
-    pub fn ranked_library(&self) -> Vec<StrategyLibraryRecord> {
-        rank_library(
-            &self.state.library,
-            self.state.library_sort,
-            self.state.library_filter,
-        )
+    pub fn live_observations(&self) -> Vec<LiveObservation> {
+        self.state
+            .paper_runs
+            .iter()
+            .map(|run| LiveObservation::from_paper(run, self.paper_comparison(&run.candidate_id)))
+            .collect()
     }
 
-    pub fn top_win_rate_strategy(&self) -> Option<StrategyLibraryRecord> {
-        highest_win_rate(&self.state.library).cloned()
+    pub fn arena_snapshot(&self) -> ArenaSnapshot {
+        let as_of = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        evaluate_arena(&self.state.library, &self.live_observations(), &as_of)
+    }
+
+    pub fn prune_weak_strategies(&mut self) -> Result<usize> {
+        let ids: Vec<_> = self
+            .arena_snapshot()
+            .standings
+            .iter()
+            .filter(|row| row.prune_reason.is_some())
+            .map(|row| row.record.id.clone())
+            .collect();
+        let mut pruned = 0;
+        for id in ids {
+            if self.store.dismiss_library_record(&id)? {
+                pruned += 1;
+            }
+        }
+        if pruned > 0 {
+            self.restore_library()?;
+        }
+        Ok(pruned)
+    }
+
+    pub fn prepare_evolution(&mut self) -> Result<Option<EvolutionWork>> {
+        if self.state.busy {
+            return Ok(None);
+        }
+        let Some(champion) = self.champion_strategy() else {
+            return Ok(None);
+        };
+        let Some(parent_spec) = self.store.load_strategy(&champion.record.strategy_id)? else {
+            return Ok(None);
+        };
+        let generation = self.lineage_generation(&parent_spec)?;
+        if generation >= MAX_LINEAGE_DEPTH {
+            return Ok(None);
+        }
+        let Some(dataset) = self.store.load_dataset(&champion.record.dataset_id)? else {
+            return Ok(None);
+        };
+        let existing: BTreeSet<_> = self
+            .store
+            .list_library_strategy_ids()?
+            .into_iter()
+            .collect();
+        let proposals = propose_offspring(&parent_spec, generation, &existing);
+        if proposals.is_empty() {
+            return Ok(None);
+        }
+        let config = self
+            .store
+            .list_runs(&champion.record.experiment_id)?
+            .into_iter()
+            .find(|run| run.strategy_id == champion.record.strategy_id && run.report.is_some())
+            .map(|run| run.config)
+            .unwrap_or_default();
+        self.state.busy = true;
+        self.state.status = format!(
+            "正在从冠军「{}」派生 {} 个邻域变体…",
+            champion.record.strategy_name,
+            proposals.len()
+        );
+        Ok(Some(EvolutionWork {
+            parent: champion.record,
+            generation,
+            dataset,
+            config,
+            proposals,
+        }))
+    }
+
+    fn lineage_generation(&self, spec: &StrategySpec) -> Result<usize> {
+        let mut generation = 0usize;
+        let mut parent = spec.metadata.parent_strategy_id.clone();
+        let mut seen = BTreeSet::new();
+        while let Some(id) = parent {
+            if !seen.insert(id.clone()) {
+                break;
+            }
+            generation += 1;
+            if generation >= MAX_LINEAGE_DEPTH {
+                break;
+            }
+            parent = self
+                .store
+                .load_strategy(&id)?
+                .and_then(|item| item.metadata.parent_strategy_id);
+        }
+        Ok(generation)
+    }
+
+    pub fn execute_evolution(work: EvolutionWork) -> EvolutionBatchResult {
+        let now = chrono::Utc::now().to_rfc3339();
+        let considered = work.proposals.len();
+        let mut kept = Vec::new();
+        let mut discarded = Vec::new();
+        let mut failed = 0usize;
+        for spec in work.proposals {
+            let compiled = match CompiledStrategy::compile(spec.clone()) {
+                Ok(compiled) => compiled,
+                Err(_) => {
+                    failed += 1;
+                    continue;
+                }
+            };
+            let report = match run_portfolio_backtest(&work.dataset, &compiled, &work.config) {
+                Ok(report) => report,
+                Err(_) => {
+                    failed += 1;
+                    continue;
+                }
+            };
+            let mut record = StrategyLibraryRecord::from_completed_run(
+                &work.parent.experiment_id,
+                &spec.name,
+                &report,
+                None,
+                &now,
+            );
+            record.conclusion = Some(PromotionConclusion::ContinueResearch);
+            record.evidence = "自我进化".into();
+            if should_keep_offspring(&work.parent, &record) {
+                kept.push((spec, record, report));
+            } else {
+                record.status = crate::domain::strategy_library::LibraryStatus::Dismissed;
+                discarded.push((spec, record));
+            }
+        }
+        EvolutionBatchResult {
+            parent_name: work.parent.strategy_name,
+            generation: work.generation,
+            considered,
+            skipped: 0,
+            failed,
+            kept,
+            discarded,
+        }
+    }
+
+    pub fn finish_evolution(&mut self, result: EvolutionBatchResult) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        for (spec, record, report) in &result.kept {
+            self.store.save_strategy(spec)?;
+            self.store.save_run(&StoredBacktestRun {
+                run_id: format!("evolve:{}:{}", record.experiment_id, record.strategy_id),
+                experiment_id: record.experiment_id.clone(),
+                strategy_id: record.strategy_id.clone(),
+                status: StoredRunStatus::Completed,
+                config: report.config.clone(),
+                report: Some(report.clone()),
+                failure_message: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            })?;
+            self.store.save_library_record(record)?;
+        }
+        for (spec, record) in &result.discarded {
+            self.store.save_strategy(spec)?;
+            self.store.save_library_record(record)?;
+        }
+        self.restore_library()?;
+        let pruned = self.prune_weak_strategies()?;
+        self.state.busy = false;
+        let mut status = evolution_headline(
+            &result.parent_name,
+            result.generation,
+            result.considered,
+            result.kept.len(),
+            result.discarded.len(),
+        );
+        if result.failed > 0 {
+            status.push_str(&format!("；{} 个变体回测失败", result.failed));
+        }
+        if pruned > 0 {
+            status.push_str(&format!("；已淘汰 {pruned} 个弱势策略"));
+        }
+        status.push_str(&self.arena_status_note());
+        self.state.status = status;
+        Ok(())
+    }
+
+    fn arena_status_note(&self) -> String {
+        self.arena_snapshot()
+            .champion
+            .as_ref()
+            .map(|row| format!("；当前冠军 {}", row.record.strategy_name))
+            .unwrap_or_default()
+    }
+
+    pub fn ranked_library(&self) -> Vec<StrategyLibraryRecord> {
+        self.ranked_library_rows()
+            .into_iter()
+            .map(|row| row.record)
+            .collect()
+    }
+
+    pub fn ranked_library_rows(&self) -> Vec<ArenaStanding> {
+        let filter = self.state.library_filter;
+        let mut rows = self.arena_snapshot().standings;
+        rows.retain(|row| match filter {
+            LibraryFilter::All => true,
+            LibraryFilter::PaperCandidate => {
+                row.record.conclusion == Some(PromotionConclusion::PaperCandidate)
+            }
+            LibraryFilter::ContinueResearch => {
+                row.record.conclusion == Some(PromotionConclusion::ContinueResearch)
+            }
+            LibraryFilter::Rejected => row.record.conclusion == Some(PromotionConclusion::Rejected),
+        });
+        if self.state.library_sort != LibrarySort::Robustness {
+            let order: Vec<_> = rank_library(&self.state.library, self.state.library_sort, filter)
+                .into_iter()
+                .map(|record| record.id)
+                .collect();
+            rows.sort_by_key(|row| {
+                order
+                    .iter()
+                    .position(|id| id == &row.record.id)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        rows
+    }
+
+    pub fn champion_strategy(&self) -> Option<ArenaStanding> {
+        self.arena_snapshot().champion
+    }
+
+    pub fn compiled_champion(&self) -> Option<(String, CompiledStrategy)> {
+        let champion = self.champion_strategy()?;
+        let spec = self
+            .store
+            .load_strategy(&champion.record.strategy_id)
+            .ok()
+            .flatten()?;
+        let compiled = CompiledStrategy::compile(spec).ok()?;
+        Some((champion.record.strategy_name, compiled))
     }
 
     pub fn dismiss_library_record(&mut self, record_id: String) -> Result<()> {
@@ -1190,6 +1474,85 @@ mod tests {
                 .iter()
                 .all(|draft| draft.spec.metadata.generator == "scan-playbook")
         );
+    }
+
+    #[test]
+    fn arena_crowns_robust_champion_and_marks_unused_records() {
+        use crate::domain::strategy_library::LibraryStatus;
+
+        let mut feature = feature();
+        let weak = StrategyLibraryRecord {
+            id: "library:exp:empty".into(),
+            experiment_id: "exp".into(),
+            strategy_id: "empty".into(),
+            dataset_id: "dataset".into(),
+            strategy_name: "空转".into(),
+            retained_at: "2026-08-20T00:00:00Z".into(),
+            status: LibraryStatus::Retained,
+            conclusion: Some(PromotionConclusion::ContinueResearch),
+            evidence: "fixture".into(),
+            win_rate_pct: 0.0,
+            oos_win_rate_pct: None,
+            total_return_pct: 0.0,
+            excess_return_pct: 0.0,
+            max_drawdown_pct: 0.0,
+            trade_count: 0,
+            payoff_ratio: 0.0,
+            profit_factor: 0.0,
+        };
+        let mut champion = weak.clone();
+        champion.id = "library:exp:steady".into();
+        champion.strategy_id = "steady".into();
+        champion.strategy_name = "稳健回踩".into();
+        champion.conclusion = Some(PromotionConclusion::PaperCandidate);
+        champion.win_rate_pct = 58.0;
+        champion.oos_win_rate_pct = Some(55.0);
+        champion.total_return_pct = 8.0;
+        champion.excess_return_pct = 8.0;
+        champion.max_drawdown_pct = 7.0;
+        champion.trade_count = 64;
+        champion.payoff_ratio = 1.4;
+        champion.profit_factor = 1.5;
+        feature.state.library = vec![weak, champion];
+        assert_eq!(
+            feature
+                .champion_strategy()
+                .map(|row| row.record.strategy_id),
+            Some("steady".into())
+        );
+        let rows = feature.ranked_library_rows();
+        assert_eq!(rows[0].record.strategy_id, "steady");
+        assert!(
+            rows.iter()
+                .any(|row| row.record.strategy_id == "empty" && row.prune_reason.is_some())
+        );
+    }
+
+    #[test]
+    fn evolution_is_skipped_without_a_stored_champion_spec() {
+        let mut feature = feature();
+        assert!(feature.prepare_evolution().unwrap().is_none());
+        feature.state.library = vec![StrategyLibraryRecord {
+            id: "library:exp:steady".into(),
+            experiment_id: "exp".into(),
+            strategy_id: "steady".into(),
+            dataset_id: "dataset".into(),
+            strategy_name: "稳健回踩".into(),
+            retained_at: "2026-08-20T00:00:00Z".into(),
+            status: crate::domain::strategy_library::LibraryStatus::Retained,
+            conclusion: Some(PromotionConclusion::PaperCandidate),
+            evidence: "fixture".into(),
+            win_rate_pct: 58.0,
+            oos_win_rate_pct: Some(55.0),
+            total_return_pct: 8.0,
+            excess_return_pct: 8.0,
+            max_drawdown_pct: 7.0,
+            trade_count: 64,
+            payoff_ratio: 1.4,
+            profit_factor: 1.5,
+        }];
+        assert!(feature.prepare_evolution().unwrap().is_none());
+        assert!(!feature.state.busy);
     }
 
     #[test]

@@ -16,5 +16,7 @@ pub mod position_review;
 pub mod position_sizing;
 pub mod rule_ledger;
 pub mod strategy;
+pub mod strategy_application;
+pub mod strategy_arena;
 pub mod strategy_library;
 pub mod today;

@@ -3,4 +3,7 @@ pub mod presenter;
 pub mod state;
 pub mod view;
 
-pub use controller::{StrategyLabFeature, StrategyLabRunWork, StrategyLabWorkerResult};
+pub use controller::{
+    EvolutionBatchResult, EvolutionWork, StrategyLabFeature, StrategyLabRunWork,
+    StrategyLabWorkerResult,
+};

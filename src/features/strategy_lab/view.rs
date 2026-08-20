@@ -14,6 +14,7 @@ use crate::app::StockApp;
 use crate::domain::backtest::validation::PromotionConclusion;
 use crate::domain::dataset::DatasetManifest;
 use crate::domain::experiment::{ExperimentRecord, ExperimentStatus};
+use crate::domain::strategy_arena::ArenaRole;
 use crate::domain::strategy_library::{LibraryFilter, LibrarySort};
 
 use super::presenter::{StrategyLabLayout, leaderboard};
@@ -1572,8 +1573,9 @@ impl StockApp {
 
     fn render_strategy_lab_library(&self, cx: &mut Context<Self>) -> AnyElement {
         let state = &self.strategy_lab_feature.state;
-        let rows = self.strategy_lab_feature.ranked_library();
-        let top = self.strategy_lab_feature.top_win_rate_strategy();
+        let rows = self.strategy_lab_feature.ranked_library_rows();
+        let arena = self.strategy_lab_feature.arena_snapshot();
+        let prune_count = rows.iter().filter(|row| row.prune_reason.is_some()).count();
         v_flex()
             .w_full()
             .gap_4()
@@ -1586,21 +1588,47 @@ impl StockApp {
                     .flex_wrap()
                     .child(section_title(
                         "历史策略库",
-                        "跨实验保留已完成回测。删除只影响策略库，不改原始实验。胜率用于浏览排序，不能单独作为晋级依据。",
+                        "跨实验角逐最强策略。每日从冠军派生有界邻域变体，回测更强才保留；弱势策略会淘汰。胜率不能单独作为冠军或晋级依据。",
                         cx,
                     ))
                     .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "保留 {} 条 · 当前列表 {} 条",
-                                state.library.len(),
-                                rows.len()
-                            )),
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!(
+                                        "保留 {} 条 · 当前列表 {} 条",
+                                        state.library.len(),
+                                        rows.len()
+                                    )),
+                            )
+                            .child(
+                                Button::new("library-evolve")
+                                    .xsmall()
+                                    .primary()
+                                    .disabled(state.busy || arena.champion.is_none())
+                                    .label("从冠军进化一代")
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.strategy_lab_start_evolution(cx);
+                                    })),
+                            )
+                            .when(prune_count > 0, |row| {
+                                row.child(
+                                    Button::new("library-prune")
+                                        .xsmall()
+                                        .danger()
+                                        .label(format!("精简 {prune_count} 个弱势策略"))
+                                        .on_click(cx.listener(|this, _, _window, cx| {
+                                            this.strategy_lab_prune_library(cx);
+                                        })),
+                                )
+                            }),
                     ),
             )
-            .when_some(top.as_ref(), |column, record| {
+            .when_some(arena.champion.as_ref(), |column, champion| {
                 column.child(
                     v_flex()
                         .w_full()
@@ -1614,18 +1642,23 @@ impl StockApp {
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().success)
-                                .child("当前胜率最高"),
+                                .child(if champion.record.is_evolved() {
+                                    "当前冠军 · 自我进化"
+                                } else {
+                                    "当前冠军 · 综合稳健分"
+                                }),
                         )
                         .child(
                             div()
                                 .text_sm()
                                 .font_semibold()
                                 .child(format!(
-                                    "{} · {:.1}% · {} 笔 · 超额 {:+.2}%",
-                                    record.strategy_name,
-                                    record.win_rate_pct,
-                                    record.trade_count,
-                                    record.excess_return_pct
+                                    "{} · 稳健分 {:.1} · 胜率 {:.1}% · {} 笔 · 超额 {:+.2}%",
+                                    champion.record.strategy_name,
+                                    champion.score,
+                                    champion.record.win_rate_pct,
+                                    champion.record.trade_count,
+                                    champion.record.excess_return_pct
                                 )),
                         )
                         .child(
@@ -1633,12 +1666,14 @@ impl StockApp {
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(format!(
-                                    "来自实验 {} · {}",
-                                    short_id(&record.experiment_id),
-                                    record
+                                    "来自实验 {} · {} · {}",
+                                    short_id(&champion.record.experiment_id),
+                                    champion
+                                        .record
                                         .conclusion
                                         .map(library_conclusion_label)
-                                        .unwrap_or("尚未生成稳健性结论")
+                                        .unwrap_or("尚未生成稳健性结论"),
+                                    champion.reasons.first().cloned().unwrap_or_default()
                                 )),
                         ),
                 )
@@ -1696,11 +1731,12 @@ impl StockApp {
                     } else {
                         "当前筛选没有条目"
                     },
-                    "完成一次批量回测后，未取消的策略会自动进入这里。之后可以按胜率排序，或删除不再需要的条目。",
+                    "完成一次批量回测后，未取消的策略会自动进入这里并按稳健分角逐。弱势或被占优的策略会在每日观察后淘汰。",
                     cx,
                 ))
             })
-            .children(rows.into_iter().enumerate().map(|(index, record)| {
+            .children(rows.into_iter().enumerate().map(|(index, standing)| {
+                let record = standing.record;
                 let record_id = record.id.clone();
                 let open_id = record.id.clone();
                 let conclusion = record
@@ -1712,6 +1748,12 @@ impl StockApp {
                     Some(PromotionConclusion::Rejected) => cx.theme().danger,
                     _ => cx.theme().warning,
                 };
+                let role_color = match standing.role {
+                    ArenaRole::Champion => cx.theme().success,
+                    ArenaRole::Challenger => cx.theme().accent,
+                    ArenaRole::Contender => cx.theme().muted_foreground,
+                    ArenaRole::PruneCandidate => cx.theme().danger,
+                };
                 v_flex()
                     .id(("strategy-library", index))
                     .w_full()
@@ -1719,7 +1761,11 @@ impl StockApp {
                     .p_4()
                     .rounded_lg()
                     .border_1()
-                    .border_color(cx.theme().border)
+                    .border_color(if standing.role == ArenaRole::Champion {
+                        cx.theme().success.opacity(0.45)
+                    } else {
+                        cx.theme().border
+                    })
                     .child(
                         h_flex()
                             .w_full()
@@ -1740,7 +1786,7 @@ impl StockApp {
                                             .rounded_lg()
                                             .bg(cx.theme().muted)
                                             .font_semibold()
-                                            .child(format!("#{:02}", index + 1)),
+                                            .child(format!("#{:02}", standing.rank)),
                                     )
                                     .child(
                                         v_flex()
@@ -1771,6 +1817,30 @@ impl StockApp {
                                             .px_2()
                                             .py_0p5()
                                             .rounded_full()
+                                            .bg(role_color.opacity(0.10))
+                                            .text_xs()
+                                            .font_semibold()
+                                            .text_color(role_color)
+                                            .child(standing.role.label()),
+                                    )
+                                    .when(record.is_evolved(), |row| {
+                                        row.child(
+                                            div()
+                                                .px_2()
+                                                .py_0p5()
+                                                .rounded_full()
+                                                .bg(cx.theme().accent.opacity(0.10))
+                                                .text_xs()
+                                                .font_semibold()
+                                                .text_color(cx.theme().accent)
+                                                .child("进化"),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded_full()
                                             .bg(cx.theme().muted)
                                             .text_xs()
                                             .text_color(cx.theme().muted_foreground)
@@ -1794,6 +1864,11 @@ impl StockApp {
                             .w_full()
                             .gap_2()
                             .flex_wrap()
+                            .child(metric_tile(
+                                "稳健分",
+                                format!("{:.1}", standing.score),
+                                cx,
+                            ))
                             .child(metric_tile(
                                 "胜率",
                                 format!("{:.1}%", record.win_rate_pct),
@@ -1828,6 +1903,14 @@ impl StockApp {
                                 cx,
                             )),
                     )
+                    .when(!standing.reasons.is_empty(), |card| {
+                        card.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(standing.reasons.iter().take(3).cloned().collect::<Vec<_>>().join(" · ")),
+                        )
+                    })
                     .child(
                         h_flex()
                             .gap_2()

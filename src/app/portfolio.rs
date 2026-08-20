@@ -55,6 +55,59 @@ impl StockApp {
         cx.notify();
     }
 
+    pub(crate) fn prefill_champion_stock_plan(
+        &mut self,
+        code: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (_, plans) = self.champion_stock_plans(cx);
+        let Some(plan) = plans.into_iter().find(|plan| plan.code == code) else {
+            self.status = shared("当前冠军策略还没有这只股票的买卖计划");
+            cx.notify();
+            return;
+        };
+        match plan.kind {
+            crate::domain::strategy_application::StockPlanKind::Buy
+            | crate::domain::strategy_application::StockPlanKind::Sell => {}
+            _ => {
+                self.status = shared("这只股票目前不是买入或卖出计划，不能预填成交");
+                cx.notify();
+                return;
+            }
+        }
+        self.ensure_today_symbol(&plan.code);
+        self.select_symbol(shared(plan.code.clone()), cx);
+        let side = if plan.kind == crate::domain::strategy_application::StockPlanKind::Buy {
+            TradeSide::Buy
+        } else {
+            TradeSide::Sell
+        };
+        self.open_trade_form(side, window, cx);
+        self.trade_shares_input.update(cx, |state, cx| {
+            state.set_value(plan.shares.to_string(), window, cx);
+        });
+        self.trade_price_input.update(cx, |state, cx| {
+            state.set_value(format_price(plan.price), window, cx);
+        });
+        self.trade_note_input.update(cx, |state, cx| {
+            state.set_value(
+                format!(
+                    "冠军策略「{}」：{} {} 股 @ {}。{}",
+                    plan.strategy_name,
+                    plan.kind.label(),
+                    plan.shares,
+                    format_price(plan.price),
+                    plan.reason
+                ),
+                window,
+                cx,
+            );
+        });
+        self.status = shared("已按冠军策略预填本地记录；次日开盘成交，不会自动下单");
+        cx.notify();
+    }
+
     /// Write config.json immediately (structural changes: add/remove symbol, trades).
     pub(crate) fn persist(&self) {
         let mut dock = self.dock.clone();

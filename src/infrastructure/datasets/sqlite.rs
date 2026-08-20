@@ -759,6 +759,26 @@ impl StrategyLibraryRepository for SqliteLabStore {
             })?;
         Ok(count > 0)
     }
+
+    fn library_contains_strategy(&self, strategy_id: &str) -> Result<bool> {
+        let connection = self.connection();
+        let found: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM strategy_library WHERE strategy_id=?1",
+            [strategy_id],
+            |row| row.get(0),
+        )?;
+        Ok(found > 0)
+    }
+
+    fn list_library_strategy_ids(&self) -> Result<Vec<String>> {
+        let connection = self.connection();
+        let mut statement =
+            connection.prepare("SELECT DISTINCT strategy_id FROM strategy_library")?;
+        statement
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .map_err(Into::into)
+    }
 }
 
 fn library_status_name(status: LibraryStatus) -> &'static str {
@@ -1291,7 +1311,9 @@ mod tests {
         store.save_library_record(&record).unwrap();
         store.save_library_record(&record).unwrap();
         assert_eq!(store.list_library_records().unwrap(), vec![record.clone()]);
+        assert!(store.library_contains_strategy(&strategy_id).unwrap());
         assert!(store.dismiss_library_record(&record.id).unwrap());
+        assert!(store.library_contains_strategy(&strategy_id).unwrap());
         assert!(store.list_library_records().unwrap().is_empty());
         store.save_library_record(&record).unwrap();
         assert!(store.list_library_records().unwrap().is_empty());

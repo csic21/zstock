@@ -5,10 +5,15 @@ use gpui::Context;
 use crate::data::radar::RadarStrategy;
 use crate::data::scout::ScoutVerdict;
 use crate::domain::climate::{
-    ClimateEvidence, ClimateReport, IndexMove, PlaybookKind, assess_market_climate,
+    ClimateEvidence, ClimateReport, IndexMove, NewEntryStance, PlaybookKind, assess_market_climate,
 };
 use crate::domain::journal::PlanStatus;
+use crate::domain::market::CandleRecord;
+use crate::domain::money::Currency;
 use crate::domain::rule_ledger::{RuleLedgerReport, build_rule_ledger};
+use crate::domain::strategy_application::{
+    HoldingSnapshot, SizingLimits, StrategyStockPlan, apply_strategy_to_stock,
+};
 use crate::domain::today::{
     TodayAction, TodayActionTarget, TodayAlertSnapshot, TodayDashboard, TodayDashboardInput,
     TodayOpportunity, TodayPlanSnapshot, TodayRiskSnapshot, build_today_dashboard,
@@ -198,6 +203,105 @@ impl StockApp {
         build_rule_ledger(&self.journal.entries)
     }
 
+    pub(crate) fn champion_stock_plans(
+        &self,
+        cx: &Context<Self>,
+    ) -> (Option<String>, Vec<StrategyStockPlan>) {
+        let Some((strategy_name, compiled)) = self.strategy_lab_feature.compiled_champion() else {
+            return (None, Vec::new());
+        };
+        let climate = self.market_climate_report();
+        let capital = super::helpers::parse_f64(&self.position_capital_input.read(cx).value())
+            .unwrap_or(100_000.0);
+        let risk_pct = super::helpers::parse_f64(&self.position_risk_pct_input.read(cx).value())
+            .unwrap_or(1.0)
+            * climate.risk_scale;
+        let mut codes = Vec::new();
+        for position in self.portfolio.positions() {
+            if position.is_open() && !codes.iter().any(|code| code == &position.code) {
+                codes.push(position.code);
+            }
+        }
+        for symbol in &self.symbols {
+            if !codes.iter().any(|code| code == &symbol.code) {
+                codes.push(symbol.code.clone());
+            }
+        }
+        codes.truncate(40);
+        let max_position_pct = compiled.spec().position.size_pct.clamp(1.0, 20.0);
+        let plans = codes
+            .into_iter()
+            .map(|code| {
+                let name = self
+                    .symbols
+                    .iter()
+                    .find(|symbol| symbol.code == code)
+                    .map(|symbol| symbol.name.to_string())
+                    .or_else(|| {
+                        self.portfolio
+                            .position_of(&code)
+                            .map(|position| position.name)
+                    })
+                    .unwrap_or_else(|| code.clone());
+                let candles = self.daily_records_for(&code);
+                let holding = self.portfolio.position_of(&code).and_then(|position| {
+                    position.is_open().then(|| HoldingSnapshot {
+                        shares: position.shares.floor().max(0.0) as u64,
+                        avg_cost: position.avg_cost,
+                        opened_on: self.portfolio.open_lot_opened_on(&code),
+                    })
+                });
+                let currency = Currency::for_code(&code).unwrap_or(Currency::Cny);
+                let star = code.starts_with("688") || code.starts_with("689");
+                apply_strategy_to_stock(
+                    &compiled,
+                    &code,
+                    &name,
+                    candles.as_deref().unwrap_or(&[]),
+                    holding.as_ref(),
+                    SizingLimits {
+                        capital,
+                        risk_pct,
+                        max_position_pct,
+                        lot_size: if star {
+                            1
+                        } else if currency == Currency::Cny {
+                            100
+                        } else {
+                            1
+                        },
+                        minimum_shares: if star {
+                            200
+                        } else if currency == Currency::Cny {
+                            100
+                        } else {
+                            1
+                        },
+                        allow_new_entries: climate.stance != NewEntryStance::Freeze,
+                    },
+                )
+            })
+            .collect();
+        (Some(strategy_name), plans)
+    }
+
+    fn daily_records_for(&self, code: &str) -> Option<Vec<CandleRecord>> {
+        if let Some(cached) =
+            self.series_cache
+                .lookup_klines(super::types::ChartKind::DayK, code, 0)
+            && !cached.candles.is_empty()
+        {
+            return Some(candles_to_records(&cached.candles));
+        }
+        if self.selected.as_ref() == code
+            && self.chart_kind == super::types::ChartKind::DayK
+            && !self.candles.is_empty()
+        {
+            return Some(candles_to_records(&self.candles));
+        }
+        None
+    }
+
     pub(crate) fn open_today_action(&mut self, action: TodayAction, cx: &mut Context<Self>) {
         self.open_today_target(action.target, action.code.as_deref(), cx);
     }
@@ -255,7 +359,7 @@ impl StockApp {
         }
     }
 
-    fn ensure_today_symbol(&mut self, code: &str) {
+    pub(crate) fn ensure_today_symbol(&mut self, code: &str) {
         if self.symbols.iter().any(|symbol| symbol.code == code) {
             return;
         }
@@ -278,6 +382,20 @@ impl StockApp {
             self.ensure_in_watchlist(code, &name, close);
         }
     }
+}
+
+fn candles_to_records(candles: &[crate::model::Candle]) -> Vec<CandleRecord> {
+    candles
+        .iter()
+        .map(|candle| CandleRecord {
+            time: candle.date.to_string(),
+            open: candle.open,
+            high: candle.high,
+            low: candle.low,
+            close: candle.close,
+            volume: candle.volume,
+        })
+        .collect()
 }
 
 fn playbook_for_radar(strategy: RadarStrategy) -> PlaybookKind {

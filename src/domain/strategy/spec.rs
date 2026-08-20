@@ -72,6 +72,28 @@ impl ExitRule {
             _ => false,
         }
     }
+
+    pub fn stop_loss_pct(&self) -> Option<f64> {
+        match self {
+            Self::StopLossPct { stop_loss_pct } => Some(*stop_loss_pct),
+            Self::All { all } | Self::Any { any: all } => all
+                .iter()
+                .filter_map(Self::stop_loss_pct)
+                .min_by(|left, right| left.total_cmp(right)),
+            _ => None,
+        }
+    }
+
+    pub fn take_profit_pct(&self) -> Option<f64> {
+        match self {
+            Self::TakeProfitPct { take_profit_pct } => Some(*take_profit_pct),
+            Self::All { all } | Self::Any { any: all } => all
+                .iter()
+                .filter_map(Self::take_profit_pct)
+                .max_by(|left, right| left.total_cmp(right)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -1671,6 +1671,11 @@ mod layout_regression_tests {
             row.size.width.as_f32(),
             column.size.width.as_f32()
         );
+        assert!(
+            row.size.height.as_f32() < 88.0,
+            "opportunity row should hug content instead of stretching with the board, got {}",
+            row.size.height.as_f32()
+        );
     }
 
     fn radar_hit(

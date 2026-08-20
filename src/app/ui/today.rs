@@ -11,6 +11,8 @@ use gpui_component::{
 
 use crate::domain::climate::{ClimateReport, MarketClimate, NewEntryStance};
 use crate::domain::rule_ledger::RuleLedgerReport;
+use crate::domain::strategy_application::{StockPlanKind, actionable_plans};
+use crate::domain::strategy_arena::ArenaRole;
 use crate::domain::today::{TodayAction, TodayActionTarget, TodayOpportunity, TodaySeverity};
 
 use super::super::{StockApp, state::PrimaryTask};
@@ -373,29 +375,44 @@ impl StockApp {
                                                         .flex_1()
                                                         .w_full()
                                                         .min_h(px(empty_min_h))
+                                                        .justify_start()
+                                                        .content_start()
                                                         .gap_2()
                                                         .p_3()
                                                         .rounded(cx.theme().radius_lg)
                                                         .border_1()
                                                         .border_color(cx.theme().border)
                                                         .bg(cx.theme().sidebar)
-                                                        .children(
-                                                            dashboard
-                                                                .opportunities
-                                                                .iter()
-                                                                .cloned()
-                                                                .enumerate()
-                                                                .map(|(index, opportunity)| {
-                                                                    self.render_today_opportunity_row(
-                                                                        index,
-                                                                        opportunity,
-                                                                        cx,
-                                                                    )
-                                                                }),
+                                                        .child(
+                                                            v_flex()
+                                                                .id("today-opportunities-list")
+                                                                .w_full()
+                                                                .flex_none()
+                                                                .gap_2()
+                                                                .children(
+                                                                    dashboard
+                                                                        .opportunities
+                                                                        .iter()
+                                                                        .cloned()
+                                                                        .enumerate()
+                                                                        .map(
+                                                                            |(
+                                                                                index,
+                                                                                opportunity,
+                                                                            )| {
+                                                                                self.render_today_opportunity_row(
+                                                                                    index,
+                                                                                    opportunity,
+                                                                                    cx,
+                                                                                )
+                                                                            },
+                                                                        ),
+                                                                ),
                                                         )
                                                         .child(
                                                             h_flex()
                                                                 .w_full()
+                                                                .flex_none()
                                                                 .justify_center()
                                                                 .pt_1()
                                                                 .child(
@@ -419,6 +436,8 @@ impl StockApp {
                                             }),
                                     ),
                             )
+                            .child(self.render_today_arena_card(cx))
+                            .child(self.render_today_champion_orders(cx))
                             .child(self.render_rule_ledger_card(&ledger, cx))
                             .child(
                                 v_flex()
@@ -646,10 +665,11 @@ impl StockApp {
             .id(("today-opportunity", index))
             .debug_selector(move || format!("today-opportunity-{index}"))
             .w_full()
-            .flex_shrink_0()
+            .flex_none()
             .gap_3()
             .items_center()
-            .p_3()
+            .px_3()
+            .py_2()
             .rounded(cx.theme().radius_lg)
             .border_1()
             .border_color(cx.theme().border)
@@ -657,7 +677,7 @@ impl StockApp {
             .child(
                 div()
                     .w(px(58.0))
-                    .flex_shrink_0()
+                    .flex_none()
                     .text_xs()
                     .font_family("Menlo")
                     .font_semibold()
@@ -668,16 +688,20 @@ impl StockApp {
                 v_flex()
                     .flex_1()
                     .min_w_0()
+                    .justify_start()
                     .gap_0p5()
                     .child(
                         h_flex()
+                            .w_full()
+                            .flex_none()
                             .gap_1()
                             .items_center()
                             .min_w_0()
                             .child(
                                 div()
+                                    .flex_1()
                                     .min_w_0()
-                                    .overflow_hidden()
+                                    .truncate()
                                     .text_sm()
                                     .font_semibold()
                                     .text_color(cx.theme().foreground)
@@ -692,7 +716,8 @@ impl StockApp {
                     .child(
                         div()
                             .w_full()
-                            .overflow_hidden()
+                            .flex_none()
+                            .truncate()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(opportunity.gate_reason.as_ref().map_or_else(
@@ -724,6 +749,279 @@ impl StockApp {
                         this.open_today_opportunity(&code, cx);
                     })),
             )
+            .into_any_element()
+    }
+
+    fn render_today_arena_card(&self, cx: &mut Context<Self>) -> AnyElement {
+        let work = self.work_mode;
+        let arena = self.strategy_lab_feature.arena_snapshot();
+        let challengers: Vec<_> = arena
+            .standings
+            .iter()
+            .filter(|row| row.role == ArenaRole::Challenger)
+            .take(2)
+            .cloned()
+            .collect();
+        v_flex()
+            .id("today-strategy-arena")
+            .w_full()
+            .gap_2()
+            .p_4()
+            .rounded(cx.theme().radius_lg)
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().sidebar)
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_start()
+                    .justify_between()
+                    .gap_3()
+                    .child(today_section_title(
+                        if work {
+                            "Strategy arena"
+                        } else {
+                            "策略角逐"
+                        },
+                        if work {
+                            "Composite robustness, not win rate alone. Daily paper and bounded offspring can dethrone the leader."
+                        } else {
+                            "按稳健分角逐最强策略；每日观察会校正排名，并从冠军进化有界变体。冠军不等于建议实盘"
+                        },
+                        cx,
+                    ))
+                    .child(
+                        Button::new("today-open-arena")
+                            .ghost()
+                            .xsmall()
+                            .label(if work { "Library" } else { "打开策略库" })
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.strategy_lab_open_library_page(cx);
+                            })),
+                    ),
+            )
+            .when_some(arena.champion.as_ref(), |card, champion| {
+                card.child(
+                    v_flex()
+                        .w_full()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_semibold()
+                                .text_color(cx.theme().success)
+                                .child(format!(
+                                    "{} · {} · 稳健分 {:.1}",
+                                    if work { "Champion" } else { "当前冠军" },
+                                    champion.record.strategy_name,
+                                    champion.score
+                                )),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!(
+                                    "{}{:.1}% · {} {:+.2}% · {} {:.1}% · {} {}",
+                                    if work { "win " } else { "胜率 " },
+                                    champion.record.win_rate_pct,
+                                    if work { "excess" } else { "超额" },
+                                    champion.record.excess_return_pct,
+                                    if work { "DD" } else { "回撤" },
+                                    champion.record.max_drawdown_pct,
+                                    champion.record.trade_count,
+                                    if work { "trades" } else { "笔" }
+                                )),
+                        ),
+                )
+            })
+            .when(arena.champion.is_none(), |card| {
+                card.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(arena.headline.clone()),
+                )
+            })
+            .when(!challengers.is_empty(), |card| {
+                card.child(
+                    v_flex()
+                        .gap_1()
+                        .children(challengers.into_iter().map(|row| {
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!(
+                                    "{} #{:02} {} · {:.1}",
+                                    if work { "Challenger" } else { "挑战者" },
+                                    row.rank,
+                                    row.record.strategy_name,
+                                    row.score
+                                ))
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_today_champion_orders(&self, cx: &mut Context<Self>) -> AnyElement {
+        let work = self.work_mode;
+        let (champion_name, plans) = self.champion_stock_plans(cx);
+        let actions = actionable_plans(&plans);
+        let hold_count = plans
+            .iter()
+            .filter(|plan| plan.kind == StockPlanKind::Hold)
+            .count();
+        let wait_count = plans
+            .iter()
+            .filter(|plan| plan.kind == StockPlanKind::Wait)
+            .count();
+        v_flex()
+            .id("today-champion-orders")
+            .w_full()
+            .gap_2()
+            .p_4()
+            .rounded(cx.theme().radius_lg)
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().sidebar)
+            .child(today_section_title(
+                if work {
+                    "Champion on your stocks"
+                } else {
+                    "冠军落到个股"
+                },
+                if work {
+                    "Sized lots from the arena champion. Next-open proxy, local records only."
+                } else {
+                    "用当前冠军策略扫自选和持仓：买入/卖出股数按计划本金与止损计算，次日开盘成交，不自动下单"
+                },
+                cx,
+            ))
+            .when_some(champion_name.as_ref(), |card, name| {
+                card.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "{}{} · {} {} · {} {} · {} {}",
+                            if work { "Using " } else { "正在用 " },
+                            name,
+                            actions
+                                .iter()
+                                .filter(|plan| plan.kind == StockPlanKind::Buy)
+                                .count(),
+                            if work { "buys" } else { "只买入" },
+                            actions
+                                .iter()
+                                .filter(|plan| plan.kind == StockPlanKind::Sell)
+                                .count(),
+                            if work { "sells" } else { "只卖出" },
+                            hold_count,
+                            if work { "holds" } else { "只继续持有" }
+                        )),
+                )
+            })
+            .when(champion_name.is_none(), |card| {
+                card.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if work {
+                            "Run Strategy Lab until a champion exists, then lots can be sized here."
+                        } else {
+                            "先在策略实验室跑出冠军。有冠军后，这里会告诉你每只股票买多少、卖多少。"
+                        }),
+                )
+            })
+            .when(champion_name.is_some() && actions.is_empty(), |card| {
+                card.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if wait_count > 0 {
+                            format!(
+                                "{}{}{}",
+                                if work {
+                                    "No buy/sell today. "
+                                } else {
+                                    "今天没有买卖计划。"
+                                },
+                                wait_count,
+                                if work {
+                                    " names waiting for a signal or daily bars."
+                                } else {
+                                    " 只在等待信号或日 K。"
+                                }
+                            )
+                        } else if work {
+                            "Open a stock's daily chart so the champion can see enough bars.".into()
+                        } else {
+                            "打开自选或持仓的日 K 后，才能按冠军策略计算股数。".into()
+                        }),
+                )
+            })
+            .children(actions.into_iter().take(8).enumerate().map(|(index, plan)| {
+                let code = plan.code.clone();
+                let kind_color = match plan.kind {
+                    StockPlanKind::Buy => cx.theme().success,
+                    StockPlanKind::Sell => cx.theme().danger,
+                    StockPlanKind::Hold => cx.theme().accent,
+                    StockPlanKind::Wait => cx.theme().muted_foreground,
+                };
+                h_flex()
+                    .id(("today-champion-order", index))
+                    .w_full()
+                    .gap_3()
+                    .items_center()
+                    .px_3()
+                    .py_2()
+                    .rounded(cx.theme().radius_lg)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background.opacity(0.35))
+                    .child(
+                        div()
+                            .w(px(48.0))
+                            .flex_none()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(kind_color)
+                            .child(plan.kind.label()),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .child(format!("{} {}", plan.code, plan.name)),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!(
+                                        "{} 股 · {:.2} · {}",
+                                        plan.shares, plan.price, plan.reason
+                                    )),
+                            ),
+                    )
+                    .child(
+                        Button::new(("today-champion-prefill", index))
+                            .xsmall()
+                            .primary()
+                            .label(if work { "Prefill" } else { "预填记录" })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.prefill_champion_stock_plan(&code, window, cx);
+                            })),
+                    )
+            }))
             .into_any_element()
     }
 

@@ -14,6 +14,7 @@ pub enum LibraryStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum LibrarySort {
     #[default]
+    Robustness,
     WinRate,
     ExcessReturn,
     Drawdown,
@@ -22,7 +23,8 @@ pub enum LibrarySort {
 }
 
 impl LibrarySort {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
+        Self::Robustness,
         Self::WinRate,
         Self::ExcessReturn,
         Self::Drawdown,
@@ -32,6 +34,7 @@ impl LibrarySort {
 
     pub const fn label(self) -> &'static str {
         match self {
+            Self::Robustness => "稳健分",
             Self::WinRate => "胜率",
             Self::ExcessReturn => "超额收益",
             Self::Drawdown => "回撤",
@@ -129,6 +132,49 @@ impl StrategyLibraryRecord {
             profit_factor: report.metrics.profit_factor,
         }
     }
+
+    pub fn is_evolved(&self) -> bool {
+        self.evidence.starts_with("自我进化")
+    }
+}
+
+/// Deterministic research score used by the library sort and the arena.
+/// Win rate is only one component; promotion quality, sample, excess and
+/// drawdown all participate. Live paper drift is applied separately.
+pub fn research_score(record: &StrategyLibraryRecord) -> f64 {
+    if record.status != LibraryStatus::Retained {
+        return f64::NEG_INFINITY;
+    }
+    promotion_points(record) + trading_fitness(record)
+}
+
+fn promotion_points(record: &StrategyLibraryRecord) -> f64 {
+    match record.conclusion {
+        Some(PromotionConclusion::PaperCandidate) => 30.0,
+        Some(PromotionConclusion::ContinueResearch) => 16.0,
+        Some(PromotionConclusion::Rejected) => 0.0,
+        None => 8.0,
+    }
+}
+
+/// Trading quality without promotion. Used to keep evolved offspring that
+/// actually improve the parent, even if they have not passed paper gates.
+pub fn trading_fitness(record: &StrategyLibraryRecord) -> f64 {
+    if record.status != LibraryStatus::Retained {
+        return f64::NEG_INFINITY;
+    }
+    let sample = (record.trade_count as f64 / 50.0).clamp(0.0, 1.0) * 12.0;
+    let win = record.oos_win_rate_pct.unwrap_or(record.win_rate_pct);
+    let edge = ((win - 40.0) / 40.0).clamp(0.0, 1.0) * 18.0;
+    let excess = if record.excess_return_pct >= 0.0 {
+        (record.excess_return_pct / 20.0).clamp(0.0, 1.0) * 18.0
+    } else {
+        (record.excess_return_pct / 20.0).clamp(-1.0, 0.0) * 8.0
+    };
+    let drawdown = (1.0 - (record.max_drawdown_pct / 20.0).clamp(0.0, 1.0)) * 12.0;
+    let payoff = ((record.payoff_ratio - 1.0) / 1.0).clamp(0.0, 1.0) * 5.0
+        + ((record.profit_factor - 1.0) / 1.0).clamp(0.0, 1.0) * 5.0;
+    sample + edge + excess + drawdown + payoff
 }
 
 pub fn rank_library(
@@ -152,6 +198,11 @@ pub fn rank_library(
         .cloned()
         .collect();
     rows.sort_by(|left, right| match sort {
+        LibrarySort::Robustness => research_score(right)
+            .total_cmp(&research_score(left))
+            .then_with(|| right.trade_count.cmp(&left.trade_count))
+            .then_with(|| right.excess_return_pct.total_cmp(&left.excess_return_pct))
+            .then_with(|| left.strategy_id.cmp(&right.strategy_id)),
         LibrarySort::WinRate => right
             .win_rate_pct
             .total_cmp(&left.win_rate_pct)
@@ -222,6 +273,31 @@ mod tests {
             payoff_ratio: 1.2,
             profit_factor: 1.1,
         }
+    }
+
+    #[test]
+    fn default_sort_is_robustness_not_raw_win_rate() {
+        assert_eq!(LibrarySort::default(), LibrarySort::Robustness);
+        let mut rejected = record("hot", 92.0, 80, -3.0);
+        rejected.conclusion = Some(PromotionConclusion::Rejected);
+        rejected.max_drawdown_pct = 24.0;
+        rejected.payoff_ratio = 0.8;
+        rejected.profit_factor = 0.7;
+        let mut paper = record("steady", 56.0, 70, 9.0);
+        paper.conclusion = Some(PromotionConclusion::PaperCandidate);
+        paper.oos_win_rate_pct = Some(55.0);
+        paper.max_drawdown_pct = 8.0;
+        paper.payoff_ratio = 1.5;
+        paper.profit_factor = 1.6;
+        let ranked = rank_library(
+            &[rejected, paper],
+            LibrarySort::default(),
+            LibraryFilter::All,
+        );
+        assert_eq!(ranked[0].strategy_id, "steady");
+        assert!(research_score(&ranked[0]) > research_score(&ranked[1]));
+        assert!(trading_fitness(&ranked[0]) > trading_fitness(&ranked[1]));
+        assert!(research_score(&ranked[0]) - trading_fitness(&ranked[0]) > 20.0);
     }
 
     #[test]

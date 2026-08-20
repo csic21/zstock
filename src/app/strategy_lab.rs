@@ -72,7 +72,32 @@ impl super::StockApp {
                 });
         if !self.strategy_lab_feature.state.paper_candidates.is_empty() && !already_current {
             self.strategy_lab_run_paper(cx);
+            return;
         }
+        self.strategy_lab_start_evolution(cx);
+    }
+
+    pub(crate) fn strategy_lab_refresh_arena(
+        &mut self,
+        announce_unchanged: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        match self.strategy_lab_feature.prune_weak_strategies() {
+            Ok(0) if announce_unchanged => {
+                self.strategy_lab_feature.state.status =
+                    self.strategy_lab_feature.arena_snapshot().headline;
+            }
+            Ok(0) => {}
+            Ok(pruned) => {
+                let headline = self.strategy_lab_feature.arena_snapshot().headline;
+                self.strategy_lab_feature.state.status =
+                    format!("已按稳健分淘汰 {pruned} 个弱势策略。{headline}");
+            }
+            Err(error) => {
+                self.strategy_lab_feature.state.status = format!("策略角逐更新失败：{error:#}");
+            }
+        }
+        cx.notify();
     }
 
     pub(crate) fn strategy_lab_set_page(
@@ -344,6 +369,46 @@ impl super::StockApp {
         cx.notify();
     }
 
+    pub(crate) fn strategy_lab_open_library_page(&mut self, cx: &mut gpui::Context<Self>) {
+        self.set_primary_task(crate::app::state::PrimaryTask::StrategyLab, cx);
+        self.strategy_lab_feature.state.page = StrategyLabPage::Library;
+        cx.notify();
+    }
+
+    pub(crate) fn strategy_lab_prune_library(&mut self, cx: &mut gpui::Context<Self>) {
+        self.strategy_lab_refresh_arena(true, cx);
+    }
+
+    pub(crate) fn strategy_lab_start_evolution(&mut self, cx: &mut gpui::Context<Self>) {
+        match self.strategy_lab_feature.prepare_evolution() {
+            Ok(Some(work)) => {
+                cx.spawn(async move |this, cx| {
+                    let result =
+                        smol::unblock(move || StrategyLabFeature::execute_evolution(work)).await;
+                    let _ = this.update(cx, |app, cx| {
+                        if let Err(error) = app.strategy_lab_feature.finish_evolution(result) {
+                            app.strategy_lab_feature.state.busy = false;
+                            app.strategy_lab_feature.state.status =
+                                format!("自我进化失败：{error:#}");
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+                cx.notify();
+            }
+            Ok(None) => {
+                if !self.strategy_lab_feature.state.library.is_empty() {
+                    self.strategy_lab_refresh_arena(false, cx);
+                }
+            }
+            Err(error) => {
+                self.strategy_lab_feature.state.status = format!("无法开始自我进化：{error:#}");
+                cx.notify();
+            }
+        }
+    }
+
     pub(crate) fn strategy_lab_promote_paper(&mut self, cx: &mut gpui::Context<Self>) {
         if let Err(error) = self.strategy_lab_feature.promote_selected_to_paper() {
             self.strategy_lab_feature.state.status = format!("无法加入模拟观察：{error:#}");
@@ -404,8 +469,10 @@ impl super::StockApp {
                 if let Err(error) = app.strategy_lab_feature.finish_paper_runs(results) {
                     app.strategy_lab_feature.state.busy = false;
                     app.strategy_lab_feature.state.status = format!("保存模拟观察失败：{error:#}");
+                    cx.notify();
+                    return;
                 }
-                cx.notify();
+                app.strategy_lab_start_evolution(cx);
             });
         })
         .detach();
