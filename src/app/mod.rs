@@ -1615,6 +1615,88 @@ mod layout_regression_tests {
         );
     }
 
+    /// Wide Today used to wrap candidate cards at min 280px, splitting
+    /// observation prices and stretching "查看全部机会" into a full-width bar.
+    /// Rows must use the column width and sit inside a board that fills height.
+    #[gpui::test]
+    fn today_opportunity_rows_fill_column_on_wide_window(cx: &mut TestAppContext) {
+        let mut window = test_window(cx, 1600.0, 900.0);
+        let handle = window.window_handle();
+        let update_result = window.cx.update_window(handle, |view, _window, cx| {
+            view.downcast::<StockApp>()
+                .expect("window root view")
+                .update(cx, |this, cx| {
+                    this.ui_state.primary_task = super::state::PrimaryTask::Today;
+                    this.market_analysis_open = false;
+                    this.radar_hits = vec![
+                        radar_hit("688235", "百济神州", 271.28, 283.97),
+                        radar_hit("688702", "盛科通信-U", 367.30, 388.10),
+                    ];
+                    cx.notify();
+                });
+        });
+        assert!(update_result.is_ok(), "today update should succeed");
+        window.run_until_parked();
+        window.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let column = window
+            .debug_bounds("today-opportunities-column")
+            .expect("today-opportunities-column bounds");
+        let board = window
+            .debug_bounds("today-opportunities-board")
+            .expect("today-opportunities-board bounds");
+        let row = window
+            .debug_bounds("today-opportunity-0")
+            .expect("today-opportunity-0 bounds");
+        let empty = window
+            .debug_bounds("today-empty-actions")
+            .expect("today-empty-actions bounds");
+
+        assert!(
+            board.size.height.as_f32() > 180.0,
+            "opportunity board should fill leftover column height, got {}",
+            board.size.height.as_f32()
+        );
+        assert!(
+            (board.size.height.as_f32() - empty.size.height.as_f32()).abs() < 8.0,
+            "opportunity board should match empty-actions height, got {} vs {}",
+            board.size.height.as_f32(),
+            empty.size.height.as_f32()
+        );
+        assert!(
+            row.size.width.as_f32() > column.size.width.as_f32() * 0.8,
+            "opportunity row should use the column width, not wrap into two tiles, got row {} / column {}",
+            row.size.width.as_f32(),
+            column.size.width.as_f32()
+        );
+    }
+
+    fn radar_hit(
+        code: &str,
+        name: &str,
+        watch_low: f64,
+        watch_high: f64,
+    ) -> crate::data::radar::RadarHit {
+        crate::data::radar::RadarHit {
+            code: code.into(),
+            name: name.into(),
+            strategy: crate::data::radar::RadarStrategy::Pullback,
+            score: 94.0,
+            close: (watch_low + watch_high) / 2.0,
+            change_pct: 0.5,
+            rsi14: None,
+            volume_ratio_20: None,
+            regime: String::new(),
+            reasons: Vec::new(),
+            risks: Vec::new(),
+            headline: String::new(),
+            watch_low,
+            watch_high,
+        }
+    }
+
     /// Regression test: chart quote header must sit flush under the title bar
     /// (same y as the left sidebar), not centered with a black band above it.
     #[gpui::test]

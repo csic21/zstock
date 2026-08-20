@@ -365,10 +365,20 @@ impl StockApp {
                                             })
                                             .when(!dashboard.opportunities.is_empty(), |column| {
                                                 column.child(
-                                                    h_flex()
+                                                    v_flex()
+                                                        .id("today-opportunities-board")
+                                                        .debug_selector(|| {
+                                                            "today-opportunities-board".into()
+                                                        })
+                                                        .flex_1()
                                                         .w_full()
+                                                        .min_h(px(empty_min_h))
                                                         .gap_2()
-                                                        .flex_wrap()
+                                                        .p_3()
+                                                        .rounded(cx.theme().radius_lg)
+                                                        .border_1()
+                                                        .border_color(cx.theme().border)
+                                                        .bg(cx.theme().sidebar)
                                                         .children(
                                                             dashboard
                                                                 .opportunities
@@ -379,27 +389,32 @@ impl StockApp {
                                                                     self.render_today_opportunity_row(
                                                                         index,
                                                                         opportunity,
-                                                                        wide,
                                                                         cx,
                                                                     )
                                                                 }),
+                                                        )
+                                                        .child(
+                                                            h_flex()
+                                                                .w_full()
+                                                                .justify_center()
+                                                                .pt_1()
+                                                                .child(
+                                                                    Button::new(
+                                                                        "today-all-opportunities",
+                                                                    )
+                                                                    .ghost()
+                                                                    .xsmall()
+                                                                    .label("查看全部机会")
+                                                                    .on_click(cx.listener(
+                                                                        |this, _, _window, cx| {
+                                                                            this.set_primary_task(
+                                                                                PrimaryTask::Opportunities,
+                                                                                cx,
+                                                                            );
+                                                                        },
+                                                                    )),
+                                                                ),
                                                         ),
-                                                )
-                                            })
-                                            .when(!dashboard.opportunities.is_empty(), |column| {
-                                                column.child(
-                                                    Button::new("today-all-opportunities")
-                                                        .ghost()
-                                                        .xsmall()
-                                                        .label("查看全部机会")
-                                                        .on_click(cx.listener(
-                                                            |this, _, _window, cx| {
-                                                                this.set_primary_task(
-                                                                    PrimaryTask::Opportunities,
-                                                                    cx,
-                                                                );
-                                                            },
-                                                        )),
                                                 )
                                             }),
                                     ),
@@ -609,7 +624,6 @@ impl StockApp {
         &self,
         index: usize,
         opportunity: TodayOpportunity,
-        wide: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let gated = opportunity.gate_reason.is_some();
@@ -630,18 +644,20 @@ impl StockApp {
         let code = opportunity.code.clone();
         h_flex()
             .id(("today-opportunity", index))
-            .when(wide, |row| row.flex_1().min_w(px(280.0)))
-            .when(!wide, |row| row.w_full())
-            .gap_2()
+            .debug_selector(move || format!("today-opportunity-{index}"))
+            .w_full()
+            .flex_shrink_0()
+            .gap_3()
             .items_center()
             .p_3()
             .rounded(cx.theme().radius_lg)
             .border_1()
             .border_color(cx.theme().border)
-            .bg(cx.theme().sidebar)
+            .bg(cx.theme().background)
             .child(
                 div()
                     .w(px(58.0))
+                    .flex_shrink_0()
                     .text_xs()
                     .font_family("Menlo")
                     .font_semibold()
@@ -657,17 +673,26 @@ impl StockApp {
                         h_flex()
                             .gap_1()
                             .items_center()
+                            .min_w_0()
                             .child(
                                 div()
+                                    .min_w_0()
+                                    .overflow_hidden()
                                     .text_sm()
                                     .font_semibold()
                                     .text_color(cx.theme().foreground)
                                     .child(opportunity.name),
                             )
-                            .child(div().text_xs().text_color(color).child(status)),
+                            .child(crate::app::helpers::status_pill(
+                                status,
+                                color,
+                                color.opacity(0.14),
+                            )),
                     )
                     .child(
                         div()
+                            .w_full()
+                            .overflow_hidden()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(opportunity.gate_reason.as_ref().map_or_else(
@@ -691,6 +716,7 @@ impl StockApp {
             .child(
                 Button::new(("today-opportunity-open", index))
                     .xsmall()
+                    .flex_shrink_0()
                     .when(opportunity.ready, |button| button.primary())
                     .when(!opportunity.ready, |button| button.ghost())
                     .label("查看")
