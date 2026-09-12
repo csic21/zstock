@@ -1,23 +1,23 @@
 {
-  "version": "0.0.56",
+  "version": "0.0.57",
   "notes": "",
-  "release_url": "https://github.com/csic21/zstock/releases/tag/v0.0.56",
+  "release_url": "https://github.com/csic21/zstock/releases/tag/v0.0.57",
   "platforms": {
     "macos-arm64": {
-      "url": "https://github.com/csic21/zstock/releases/download/v0.0.56/zstock-macos-arm64.zip",
-      "sha256": "6d88980c22f24564c9fd2095e8ca2b0df744fce0cc9badfdd17863d2792f92ea"
+      "url": "https://github.com/csic21/zstock/releases/download/v0.0.57/zstock-macos-arm64.zip",
+      "sha256": "eebcafa1fb932baf09e21bec5aebf5807305d03f19a4baa13488ac635ddaf966"
     },
     "macos-x64": {
-      "url": "https://github.com/csic21/zstock/releases/download/v0.0.56/zstock-macos-x64.zip",
-      "sha256": "3cc41e9e58854c3094882f6e3f95cc854f3529e4b2d0957d8d2baf6e9c0b9f6b"
+      "url": "https://github.com/csic21/zstock/releases/download/v0.0.57/zstock-macos-x64.zip",
+      "sha256": "065dba9501c8a6d011508d3b88a6b8e26e0f847304649267bd3f0164b7e9f61b"
     },
     "windows-x64": {
-      "url": "https://github.com/csic21/zstock/releases/download/v0.0.56/zstock-windows-x64.zip",
-      "sha256": "a08e7e1d03b14f662a6871538fd001ec6405a0dc23526dc94da6c14e9bf869ee"
+      "url": "https://github.com/csic21/zstock/releases/download/v0.0.57/zstock-windows-x64.zip",
+      "sha256": "67bb82024415a9ca67e3a784b84a42a1731aa26eeaba00d48c7e8e16b3dcdc96"
     },
     "linux-x64": {
-      "url": "https://github.com/csic21/zstock/releases/download/v0.0.56/zstock-linux-x64.zip",
-      "sha256": "450132a76f360b94bc5ccc9047447082904554395fd95a97c502b08f24bb01f7"
+      "url": "https://github.com/csic21/zstock/releases/download/v0.0.57/zstock-linux-x64.zip",
+      "sha256": "a34416d5755729fcc40f7b1c9bd8b3cfe5ca42f52bb0569a299d58bc692acc37"
     }
   }
 }
