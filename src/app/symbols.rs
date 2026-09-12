@@ -5,6 +5,10 @@ use std::collections::HashMap;
 use gpui::{Context, SharedString, Timer, Window};
 
 use crate::data::groups::{FindMode, WatchTag};
+use crate::data::limitup::{
+    self, LIMITUP_KLINE_LIMIT, LIMITUP_PROBE_N, LIMITUP_RESULT_N, LIMITUP_UNIVERSE_N, LimitUpHit,
+    LimitVerdict, RawDay, TodayQuote,
+};
 use crate::data::radar::{
     self, RADAR_KLINE_LIMIT, RADAR_PROBE_N, RADAR_RESULT_N, RadarHit, RadarStrategy,
 };
@@ -1006,6 +1010,18 @@ impl StockApp {
                     cx.notify();
                 }
             }
+            FindMode::LimitUp => {
+                if self.limitup_hits.is_empty() || self.limitup_scanning {
+                    self.start_limitup_scan(cx);
+                } else {
+                    self.status = shared(if self.work_mode {
+                        "Boards ready · rescan or pick"
+                    } else {
+                        "连板梯队已就绪 · 可重扫或点清单"
+                    });
+                    cx.notify();
+                }
+            }
         }
     }
 
@@ -1276,6 +1292,268 @@ impl StockApp {
             .filter(|h| match self.radar_filter {
                 None => true,
                 Some(st) => h.strategy == st,
+            })
+            .collect()
+    }
+
+    pub(crate) fn start_limitup_scan(&mut self, cx: &mut Context<Self>) {
+        if self.limitup_scanning {
+            self.status = shared(if self.work_mode {
+                "Boards running…"
+            } else {
+                "连板梯队扫描中…"
+            });
+            cx.notify();
+            return;
+        }
+        if self.treasure_scanning {
+            self.status = shared("请等长线搜罗结束后再扫连板");
+            cx.notify();
+            return;
+        }
+
+        self.limitup_gen = self.limitup_gen.wrapping_add(1);
+        let scan_id = self.limitup_gen;
+        self.limitup_scanning = true;
+        self.limitup_done = 0;
+        self.limitup_total = 0;
+        self.limitup_hits.clear();
+        self.limitup_summary = shared("");
+        self.find_mode = FindMode::LimitUp;
+        self.left_tab = LeftTab::Treasure;
+        self.limitup_status = shared("拉取今日涨幅榜…");
+        self.status = shared(if self.work_mode {
+            "Boards · gainers"
+        } else {
+            "🧱 连板梯队 · 拉取涨幅榜"
+        });
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let universe =
+                smol::unblock(|| eastmoney::fetch_rising_a_shares(LIMITUP_UNIVERSE_N)).await;
+            let mut rows = match universe {
+                Ok(u) if !u.is_empty() => u,
+                Ok(_) => {
+                    let _ = this.update(cx, |app, cx| {
+                        if app.limitup_gen != scan_id {
+                            return;
+                        }
+                        app.limitup_scanning = false;
+                        app.limitup_status = shared("涨幅榜为空");
+                        app.status = shared("连板扫描失败：无候选");
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(e) => {
+                    let _ = this.update(cx, |app, cx| {
+                        if app.limitup_gen != scan_id {
+                            return;
+                        }
+                        app.limitup_scanning = false;
+                        app.limitup_status = shared(format!("涨幅榜失败：{e}"));
+                        app.status = shared("连板扫描失败");
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+
+            // 涨幅榜已按涨跌幅降序：头部是今日封板，尾部覆盖昨日首板（今日待确认）。
+            if rows.len() > LIMITUP_PROBE_N {
+                rows.truncate(LIMITUP_PROBE_N);
+            }
+            let total = rows.len();
+            let _ = this.update(cx, |app, cx| {
+                if app.limitup_gen != scan_id {
+                    return;
+                }
+                app.limitup_total = total;
+                app.limitup_status = shared(format!("深评 0/{total} · 首板/二连/炸板"));
+                app.status = shared(format!("🧱 连板深评 0/{total}"));
+                cx.notify();
+            });
+
+            let mut hits: Vec<LimitUpHit> = Vec::new();
+            for (i, row) in rows.into_iter().enumerate() {
+                let cancelled = this
+                    .read_with(cx, |app, _| app.limitup_gen != scan_id)
+                    .unwrap_or(true);
+                if cancelled {
+                    return;
+                }
+
+                let code = row.code.clone();
+                let code_fetch = code.clone();
+                let result = smol::unblock(move || {
+                    eastmoney::fetch_klines_unadjusted(&code_fetch, LIMITUP_KLINE_LIMIT)
+                })
+                .await;
+
+                if let Ok((_c, returned_name, days)) = result {
+                    let name = if is_real_name(&returned_name, &code) {
+                        returned_name
+                    } else {
+                        row.name.clone()
+                    };
+                    // 不复权 K 自带涨跌幅：转成 RawDay 并串起昨收链。
+                    let mut hist: Vec<RawDay> = Vec::with_capacity(days.len());
+                    for (ix, d) in days.iter().enumerate() {
+                        hist.push(RawDay {
+                            open: d.open,
+                            high: d.high,
+                            low: d.low,
+                            close: d.close,
+                            chg_pct: d.chg_pct,
+                            prev_close: if ix == 0 {
+                                None
+                            } else {
+                                Some(days[ix - 1].close)
+                            },
+                        });
+                    }
+                    // K 线常包含今日：涨跌幅与榜单一致即视为重复，去掉避免连板数多算一板。
+                    if let Some(last) = hist.last() {
+                        let same_day = last
+                            .chg_pct
+                            .is_some_and(|c| (c - row.change_pct).abs() < 0.5)
+                            && (last.close - row.last).abs() <= row.last.max(0.01) * 0.02;
+                        if same_day {
+                            hist.pop();
+                        }
+                    }
+                    let today = TodayQuote {
+                        code: code.clone(),
+                        name,
+                        last: row.last,
+                        change_pct: row.change_pct,
+                        open: row.open,
+                        high: row.high,
+                        low: row.low,
+                        prev_close: row.prev_close,
+                        amount: row.amount,
+                    };
+                    if let Some(hit) = limitup::evaluate(&today, &hist)
+                        && hit.verdict != LimitVerdict::Skip
+                    {
+                        hits.push(hit);
+                    }
+                }
+
+                let done = i + 1;
+                let _ = this.update(cx, |app, cx| {
+                    if app.limitup_gen != scan_id {
+                        return;
+                    }
+                    app.limitup_done = done;
+                    let mut partial = hits.clone();
+                    limitup::sort_hits(&mut partial);
+                    if partial.len() > LIMITUP_RESULT_N {
+                        partial.truncate(LIMITUP_RESULT_N);
+                    }
+                    app.limitup_hits = partial;
+                    app.limitup_status = shared(format!(
+                        "深评 {done}/{total} · 命中 {}",
+                        app.limitup_hits.len()
+                    ));
+                    if done == total || done % 5 == 0 {
+                        app.status = shared(format!("🧱 连板深评 {done}/{total}"));
+                    }
+                    cx.notify();
+                });
+
+                if done < total {
+                    Timer::after(TREASURE_SCAN_GAP).await;
+                }
+            }
+
+            limitup::sort_hits(&mut hits);
+            if hits.len() > LIMITUP_RESULT_N {
+                hits.truncate(LIMITUP_RESULT_N);
+            }
+            let summary = limitup::local_summary(&hits);
+            let updated_at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+            // 刻意不写磁盘缓存：连板是当日盘面，跨日复用旧榜会误导追高。
+
+            let _ = this.update(cx, |app, cx| {
+                if app.limitup_gen != scan_id {
+                    return;
+                }
+                app.limitup_scanning = false;
+                app.limitup_hits = hits;
+                app.limitup_updated_at = updated_at.clone();
+                app.limitup_done = total;
+                app.limitup_summary = shared(summary);
+                app.limitup_status = shared(format!(
+                    "完成 · {} 只 · {updated_at}",
+                    app.limitup_hits.len()
+                ));
+                app.status = shared(format!("🧱 连板梯队完成 · {} 只", app.limitup_hits.len()));
+                if let Some(first) = app.limitup_hits.first().cloned() {
+                    app.select_limitup_hit(&first, cx);
+                } else {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn cancel_limitup_scan(&mut self, cx: &mut Context<Self>) {
+        if !self.limitup_scanning {
+            return;
+        }
+        self.limitup_gen = self.limitup_gen.wrapping_add(1);
+        self.limitup_scanning = false;
+        self.limitup_status = shared(format!("已取消 · 保留 {} 条", self.limitup_hits.len()));
+        self.status = shared("已取消连板扫描");
+        cx.notify();
+    }
+
+    pub(crate) fn set_limitup_filter(
+        &mut self,
+        filter: Option<LimitVerdict>,
+        cx: &mut Context<Self>,
+    ) {
+        self.limitup_filter = filter;
+        cx.notify();
+    }
+
+    pub(crate) fn select_limitup_hit(&mut self, hit: &LimitUpHit, cx: &mut Context<Self>) {
+        let code = hit.code.clone();
+        let display = display_name_str(&hit.name, &code);
+        if !self.symbols.iter().any(|s| s.code == code) {
+            self.symbols.push(Symbol {
+                code: code.clone(),
+                name: shared(display),
+                last: hit.close,
+                change_pct: hit.change_pct,
+                volume: 0,
+                board: board_for_code(&code),
+            });
+            self.filtered_local = (0..self.symbols.len()).collect();
+        }
+        // 连板默认标为短线池，方便后续盯盘与分组筛选。
+        self.watch_tags
+            .entry(code.clone())
+            .or_insert(WatchTag::Short);
+        self.left_tab = LeftTab::Treasure;
+        self.find_mode = FindMode::LimitUp;
+        self.detail_tab = DetailTab::Strategy;
+        self.schedule_persist(cx);
+        if !matches!(self.range, ChartRange::M1 | ChartRange::M3) {
+            self.range = ChartRange::M3;
+        }
+        self.select_symbol(shared(code), cx);
+    }
+
+    pub(crate) fn visible_limitup_hits(&self) -> Vec<&LimitUpHit> {
+        self.limitup_hits
+            .iter()
+            .filter(|h| match self.limitup_filter {
+                None => true,
+                Some(v) => h.verdict == v,
             })
             .collect()
     }
@@ -1625,6 +1903,15 @@ impl StockApp {
                 | "找短线"
                 | "short"
                 | "雷达"
+                | "连板"
+                | "找连板"
+                | "涨停"
+                | "打板"
+                | "二进一"
+                | "二板"
+                | "首板"
+                | "limitup"
+                | "boards"
                 | "市场"
                 | "板块"
                 | "情绪"
@@ -1634,6 +1921,10 @@ impl StockApp {
             match q_intent.as_str() {
                 "短线" | "找短线" | "short" | "雷达" => {
                     self.open_find_and_scan(FindMode::Short, cx);
+                }
+                "连板" | "找连板" | "涨停" | "打板" | "二进一" | "二板" | "首板" | "limitup"
+                | "boards" => {
+                    self.open_find_and_scan(FindMode::LimitUp, cx);
                 }
                 "市场" | "板块" | "情绪" | "market" => {
                     self.open_market_analysis(cx);

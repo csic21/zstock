@@ -56,6 +56,7 @@ pub enum PlaybookKind {
     Pullback,
     Breakout,
     OversoldBounce,
+    LimitUp,
 }
 
 impl PlaybookKind {
@@ -65,6 +66,7 @@ impl PlaybookKind {
             Self::Pullback => "强势回踩",
             Self::Breakout => "放量突破",
             Self::OversoldBounce => "超跌反弹",
+            Self::LimitUp => "连板接力",
         }
     }
 }
@@ -260,11 +262,18 @@ pub fn gate_playbook(report: &ClimateReport, kind: PlaybookKind, score: f64) -> 
             PlaybookKind::Breakout if score < 58.0 => {
                 Some("突破匹配度不足，避免在强势里追劣质放量".into())
             }
+            // 连板即使在进攻日也要高质量才保留：炸板/高位不参与。
+            PlaybookKind::LimitUp if score < 66.0 => {
+                Some("连板只保留封板质量很高的首板/二板".into())
+            }
             _ => None,
         },
         MarketClimate::Select => match kind {
             PlaybookKind::Breakout if score < 78.0 => Some("精选日不追突破，除非匹配度很高".into()),
             PlaybookKind::OversoldBounce => Some("精选日不做超跌博弈".into()),
+            PlaybookKind::LimitUp if score < 75.0 => {
+                Some("精选日连板只保留高质量二板以下，炸板与高板不做".into())
+            }
             PlaybookKind::Pullback if score < 58.0 => Some("精选日只保留质量足够的回踩".into()),
             PlaybookKind::LowPosition if score < 62.0 => {
                 Some("精选日只保留达到关注门槛的低位".into())
@@ -274,6 +283,7 @@ pub fn gate_playbook(report: &ClimateReport, kind: PlaybookKind, score: f64) -> 
         MarketClimate::Defend => match kind {
             PlaybookKind::Breakout => Some("防守日不追突破".into()),
             PlaybookKind::OversoldBounce => Some("防守日不抄超跌".into()),
+            PlaybookKind::LimitUp => Some("防守日不做连板接力".into()),
             PlaybookKind::Pullback if score < 70.0 => Some("防守日只保留高质量回踩".into()),
             PlaybookKind::LowPosition if score < 68.0 => Some("防守日只保留高质量低位".into()),
             _ => None,

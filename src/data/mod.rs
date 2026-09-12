@@ -10,6 +10,7 @@ pub mod groups;
 pub mod indicators;
 pub mod journal;
 pub mod levels;
+pub mod limitup;
 pub mod market;
 pub mod market_analysis;
 pub mod portfolio;

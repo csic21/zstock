@@ -240,14 +240,20 @@ fn validate_value(
         );
     }
     for period in indicator.periods() {
-        if period < limits.min_period || period > limits.max_period {
+        // 单日涨幅（Return period 1）语义明确且只需 2 根 K，是连板回测的基础；
+        // 仅对 Return 放行 period 1，其它指标仍至少 min_period。
+        let min = match indicator {
+            IndicatorRef::Return { .. } => 1,
+            _ => limits.min_period,
+        };
+        if period < min || period > limits.max_period {
             push(
                 errors,
                 "period_out_of_range",
                 path,
                 format!(
-                    "indicator period {period} is outside {}–{}",
-                    limits.min_period, limits.max_period
+                    "indicator period {period} is outside {min}–{}",
+                    limits.max_period
                 ),
             );
         }

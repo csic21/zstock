@@ -49,6 +49,7 @@ use crate::data::groups::{FindMode, WatchTag};
 use crate::data::indicators::{BollSeries, MaSeries, MacdSeries};
 use crate::data::journal::Journal;
 use crate::data::levels;
+use crate::data::limitup::{LimitUpHit, LimitVerdict};
 use crate::data::market as market_data;
 use crate::data::market_analysis as market_analysis_data;
 use crate::data::portfolio::{Portfolio, TradeSide};
@@ -312,6 +313,18 @@ pub struct AppState {
     radar_gen: u64,
     /// 策略过滤；`None` = 全部策略。
     radar_filter: Option<RadarStrategy>,
+    /// 连板梯队结果（按结论排序：二连 > 首板 > 观察）。
+    limitup_hits: Vec<LimitUpHit>,
+    /// 连板扫描时间戳（当日盘面，跨日即视为过期，不做磁盘缓存）。
+    limitup_updated_at: String,
+    limitup_scanning: bool,
+    limitup_done: usize,
+    limitup_total: usize,
+    limitup_status: SharedString,
+    limitup_summary: SharedString,
+    limitup_gen: u64,
+    /// 结论过滤；`None` = 全部结论。
+    limitup_filter: Option<LimitVerdict>,
     /// 自选分组 code → tag。
     watch_tags: HashMap<String, WatchTag>,
     /// 自选列表筛选（None = 全部）。
@@ -767,6 +780,15 @@ impl StockApp {
                 radar_summary: shared(""),
                 radar_gen: 0,
                 radar_filter: None,
+                limitup_hits: Vec::new(),
+                limitup_updated_at: String::new(),
+                limitup_scanning: false,
+                limitup_done: 0,
+                limitup_total: 0,
+                limitup_status: shared(""),
+                limitup_summary: shared(""),
+                limitup_gen: 0,
+                limitup_filter: None,
                 watch_tags,
                 watch_filter: WatchTag::from_id(&cfg.watch_filter),
                 sector_drill_code: None,

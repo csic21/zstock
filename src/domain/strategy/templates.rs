@@ -147,15 +147,19 @@ pub enum ScanPlaybook {
     RadarBreakout,
     RadarOversold,
     TreasureLow,
+    LimitUpFirstBoard,
+    LimitUpSecondBoard,
 }
 
 impl ScanPlaybook {
-    pub const fn all() -> [Self; 4] {
+    pub const fn all() -> [Self; 6] {
         [
             Self::RadarPullback,
             Self::RadarBreakout,
             Self::RadarOversold,
             Self::TreasureLow,
+            Self::LimitUpFirstBoard,
+            Self::LimitUpSecondBoard,
         ]
     }
 
@@ -254,6 +258,62 @@ impl ScanPlaybook {
                 20,
                 8.0,
                 16.0,
+            ),
+            // 连板是 DSL 表达能力的边界：白名单没有“涨停板幅度”算子，
+            // 这里用近似条件（单日涨幅 ≥9% + 放量 + 未过热）做可回测代理；
+            // 精确的板数/炸板/一字板识别由 `data::limitup` 离线计算。
+            // 20% 板的大涨同样会触发本模板，hypothesis 已如实说明。
+            Self::LimitUpFirstBoard => (
+                "连板·首板次日",
+                "首板次日开盘溢价博弈的近似回测：昨日大涨近板且放量，持有3日短打",
+                Expression::All {
+                    all: vec![
+                        compare(
+                            indicator(IndicatorRef::Return { period: 1, lag: 0 }),
+                            CompareOperator::AtLeast,
+                            constant(9.0),
+                        ),
+                        compare(
+                            indicator(IndicatorRef::Volume { lag: 0 }),
+                            CompareOperator::Above,
+                            indicator(IndicatorRef::Volume { lag: 1 }),
+                        ),
+                        compare(
+                            indicator(IndicatorRef::Rsi { period: 14, lag: 0 }),
+                            CompareOperator::AtMost,
+                            constant(82.0),
+                        ),
+                    ],
+                },
+                3,
+                6.0,
+                8.0,
+            ),
+            Self::LimitUpSecondBoard => (
+                "连板·二进一",
+                "连续两日大涨（二连板近似）的接力回测：只做情绪连续确认，持有3日",
+                Expression::All {
+                    all: vec![
+                        compare(
+                            indicator(IndicatorRef::Return { period: 1, lag: 0 }),
+                            CompareOperator::AtLeast,
+                            constant(9.0),
+                        ),
+                        compare(
+                            indicator(IndicatorRef::Return { period: 1, lag: 1 }),
+                            CompareOperator::AtLeast,
+                            constant(9.0),
+                        ),
+                        compare(
+                            indicator(IndicatorRef::Volume { lag: 0 }),
+                            CompareOperator::Above,
+                            indicator(IndicatorRef::Volume { lag: 1 }),
+                        ),
+                    ],
+                },
+                3,
+                7.0,
+                10.0,
             ),
         };
         StrategySpec {

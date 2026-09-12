@@ -1465,8 +1465,9 @@ mod tests {
         let mut feature = feature();
         feature.state.form.template_family =
             crate::features::strategy_lab::state::TemplateFamily::ScanPlaybooks;
+        feature.state.form.strategy_count = 6;
         feature.create_local_experiment(series()).unwrap();
-        assert_eq!(feature.state.drafts.len(), 4);
+        assert_eq!(feature.state.drafts.len(), 6);
         assert!(
             feature
                 .state

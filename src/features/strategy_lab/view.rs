@@ -225,7 +225,7 @@ impl StockApp {
         let form = &state.form;
         let (current_code, current_market, watchlist_count, candle_count) =
             self.strategy_lab_data_context();
-        let count_selector = h_flex().gap_2().flex_wrap().children((3..=5).map(|count| {
+        let count_selector = h_flex().gap_2().flex_wrap().children((3..=6).map(|count| {
             Button::new(("strategy-count", count))
                 .xsmall()
                 .when(form.strategy_count == count, |button| button.primary())

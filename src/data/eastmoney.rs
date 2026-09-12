@@ -1359,6 +1359,190 @@ pub fn fetch_klines(code: &str, limit: usize) -> Result<(String, String, Vec<Can
     Ok((resp_code, name, candles))
 }
 
+/// 不复权一日（连板识别专用，不受前复权失真影响）。
+#[derive(Debug, Clone)]
+pub struct UnadjustedDay {
+    pub open: f64,
+    pub close: f64,
+    pub high: f64,
+    pub low: f64,
+    /// 当日涨跌幅（%），接口字段第 9 列。
+    pub chg_pct: Option<f64>,
+}
+
+/// Daily K-line **不复权**（`fqt=0`），连板/炸板识别专用。
+///
+/// 前复权会改变历史价格导致涨停价算不准，这里必须用实际成交价。
+/// 返回的 `chg_pct` 可直接用于连板计数，不依赖价格比较。
+pub fn fetch_klines_unadjusted(
+    code: &str,
+    limit: usize,
+) -> Result<(String, String, Vec<UnadjustedDay>)> {
+    let secid = secid_for_code(code);
+    let limit = limit.clamp(5, 1000);
+    let url = format!(
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get?\
+         secid={secid}\
+         &fields1=f1,f2,f3,f4,f5,f6\
+         &fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61\
+         &klt=101&fqt=0&end=20500101&lmt={limit}"
+    );
+    let v =
+        get_json(&url).map_err(|e| anyhow!("K线请求失败: {}", short_http_err(&e.to_string())))?;
+    let name = v
+        .pointer("/data/name")
+        .and_then(|x| x.as_str())
+        .unwrap_or(code)
+        .to_string();
+    let resp_code = v
+        .pointer("/data/code")
+        .and_then(|x| x.as_str())
+        .unwrap_or(code)
+        .to_string();
+    let klines = v
+        .pointer("/data/klines")
+        .and_then(|x| x.as_array())
+        .ok_or_else(|| anyhow!("无 K 线数据 ({code})"))?;
+
+    let mut days = Vec::with_capacity(klines.len());
+    for row in klines {
+        let s = row.as_str().unwrap_or_default();
+        // date,open,close,high,low,volume,amount,amp,chg_pct,chg,turnover
+        let parts: Vec<&str> = s.split(',').collect();
+        if parts.len() < 6 {
+            continue;
+        }
+        let chg_pct = parts
+            .get(8)
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite());
+        days.push(UnadjustedDay {
+            open: parts[1].parse().unwrap_or(0.0),
+            close: parts[2].parse().unwrap_or(0.0),
+            high: parts[3].parse().unwrap_or(0.0),
+            low: parts[4].parse().unwrap_or(0.0),
+            chg_pct,
+        });
+    }
+    if days.is_empty() {
+        return Err(anyhow!("K线为空 ({code})"));
+    }
+    Ok((resp_code, name, days))
+}
+
+/// 今日涨幅榜一行（含昨收与高低开，可精确判断是否封板）。
+#[derive(Debug, Clone)]
+pub struct RisingRow {
+    pub code: String,
+    pub name: String,
+    pub last: f64,
+    pub change_pct: f64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub prev_close: f64,
+    pub amount: f64,
+}
+
+/// 按涨跌幅降序拉取沪深 A 股涨幅榜（连板梯队候选池）。
+///
+/// 与市值池不同，这里**保留 ST/N 字**（调用方按纪律 Skip 并给出原因），
+/// 只过滤代码异常与退市整理（名称含“退”）。
+pub fn fetch_rising_a_shares(limit: usize) -> Result<Vec<RisingRow>> {
+    let limit = limit.clamp(20, 400);
+    let page_size = 100usize;
+    let mut out: Vec<RisingRow> = Vec::with_capacity(limit);
+    let mut page = 1u32;
+    let fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23";
+    let fields = "f12,f14,f2,f3,f6,f15,f16,f17,f18";
+
+    while out.len() < limit && page <= 10 {
+        let path = format!(
+            "/api/qt/clist/get?pn={page}&pz={page_size}&po=1&np=1\
+             &ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2\
+             &fid=f3&fs={fs}&fields={fields}"
+        );
+        let mut page_rows: Option<Vec<RisingRow>> = None;
+        let mut last_err = anyhow!("no host");
+        for host in PUSH2_HOSTS
+            .iter()
+            .chain(std::iter::once(&"push2delay.eastmoney.com"))
+        {
+            let url = format!("https://{host}{path}");
+            match get_json(&url) {
+                Ok(v) => {
+                    page_rows = Some(parse_clist_rising(&v)?);
+                    break;
+                }
+                Err(e) => last_err = e,
+            }
+        }
+        let rows = page_rows.ok_or_else(|| anyhow!("涨幅榜失败: {last_err}"))?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            if out.len() >= limit {
+                break;
+            }
+            if out.iter().any(|x| x.code == row.code) {
+                continue;
+            }
+            out.push(row);
+        }
+        // 涨幅榜按涨跌幅降序：当页末尾已跌破 3% 时，后面不可能是连板候选。
+        if out.len() >= limit || out.last().is_some_and(|r| r.change_pct < 3.0) {
+            break;
+        }
+        page += 1;
+    }
+
+    if out.is_empty() {
+        return Err(anyhow!("涨幅榜为空"));
+    }
+    Ok(out)
+}
+
+fn parse_clist_rising(v: &Value) -> Result<Vec<RisingRow>> {
+    let diff = v
+        .pointer("/data/diff")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| anyhow!("clist 无 diff"))?;
+    let mut out = Vec::with_capacity(diff.len());
+    for item in diff {
+        let code = item
+            .get("f12")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let name = item
+            .get("f14")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if name.is_empty() || name.contains('退') {
+            continue;
+        }
+        out.push(RisingRow {
+            code,
+            name,
+            last: num_f64(item.get("f2")),
+            change_pct: num_f64(item.get("f3")),
+            amount: num_f64(item.get("f6")),
+            high: num_f64(item.get("f15")),
+            low: num_f64(item.get("f16")),
+            open: num_f64(item.get("f17")),
+            prev_close: num_f64(item.get("f18")),
+        });
+    }
+    Ok(out)
+}
+
 /// Lightweight symbol search (name / pinyin / code).
 pub fn search_symbols(query: &str, limit: usize) -> Result<Vec<Symbol>> {
     let q = query.trim();

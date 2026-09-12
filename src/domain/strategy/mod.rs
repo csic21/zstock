@@ -302,7 +302,7 @@ mod tests {
     #[test]
     fn scan_playbooks_compile_and_match_scanner_names() {
         let playbooks = scan_playbooks("fixture");
-        assert_eq!(playbooks.len(), 4);
+        assert_eq!(playbooks.len(), 6);
         for spec in &playbooks {
             CompiledStrategy::compile(spec.clone()).unwrap();
             assert_eq!(spec.metadata.generator, "scan-playbook");
@@ -315,7 +315,9 @@ mod tests {
                 "雷达·强势回踩",
                 "雷达·放量突破",
                 "雷达·超跌反弹",
-                "寻宝·低位观察"
+                "寻宝·低位观察",
+                "连板·首板次日",
+                "连板·二进一"
             ]
         );
     }

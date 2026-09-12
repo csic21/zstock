@@ -72,6 +72,8 @@ pub enum FindMode {
     Long,
     /// 短线：策略雷达（回踩 / 突破 / 超跌）。
     Short,
+    /// 连板：涨停梯队（首板 / 二连 / 二进一观察）。
+    LimitUp,
 }
 
 impl FindMode {
@@ -79,12 +81,14 @@ impl FindMode {
         match self {
             Self::Long => "long",
             Self::Short => "short",
+            Self::LimitUp => "limitup",
         }
     }
 
     pub fn from_id(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "short" | "短线" => Self::Short,
+            "limitup" | "连板" | "涨停" | "打板" => Self::LimitUp,
             _ => Self::Long,
         }
     }
@@ -95,6 +99,8 @@ impl FindMode {
             (Self::Long, false) => "长线",
             (Self::Short, true) => "Short",
             (Self::Short, false) => "短线",
+            (Self::LimitUp, true) => "Boards",
+            (Self::LimitUp, false) => "连板",
         }
     }
 
@@ -104,6 +110,8 @@ impl FindMode {
             (Self::Long, false) => "历史低位 · 估值观察 · 建仓带",
             (Self::Short, true) => "Momentum radar · pullback / breakout",
             (Self::Short, false) => "强势回踩 · 放量突破 · 超跌反弹",
+            (Self::LimitUp, true) => "Limit-up ladder · first / second board",
+            (Self::LimitUp, false) => "首板 · 二连 · 二进一观察 · 炸板不追",
         }
     }
 }

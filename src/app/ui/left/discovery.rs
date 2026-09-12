@@ -13,6 +13,7 @@ use crate::app::helpers::*;
 use crate::app::labels::L;
 use crate::data::freshness::{self, Freshness};
 use crate::data::groups::{FindMode, WatchTag};
+use crate::data::limitup::LimitVerdict;
 use crate::data::radar::RadarStrategy;
 use crate::data::scout::ScoutVerdict;
 use crate::data::treasure::{self, fmt_dd, fmt_pos};
@@ -24,8 +25,9 @@ impl StockApp {
         let work = self.work_mode;
         let long_active = self.find_mode == FindMode::Long;
         let short_active = self.find_mode == FindMode::Short;
+        let limitup_active = self.find_mode == FindMode::LimitUp;
 
-        // 顶部统一入口：长线 / 短线
+        // 顶部统一入口：长线 / 短线 / 连板
         let header = v_flex()
             .px_2()
             .py_2()
@@ -65,6 +67,17 @@ impl StockApp {
                             .on_click(cx.listener(|this, _, _w, cx| {
                                 this.set_find_mode(FindMode::Short, cx);
                             })),
+                    )
+                    .child(
+                        Button::new("find-mode-limitup")
+                            .xsmall()
+                            .when(limitup_active, |b| b.primary())
+                            .when(!limitup_active, |b| b.ghost())
+                            .label(L::find_limitup(work))
+                            .tooltip(FindMode::LimitUp.headline(work))
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                this.set_find_mode(FindMode::LimitUp, cx);
+                            })),
                     ),
             )
             .child(
@@ -75,13 +88,16 @@ impl StockApp {
             )
             .child(self.render_find_freshness_banner(cx));
 
-        v_flex().flex_1().min_h_0().w_full().child(header).child(
-            if self.find_mode == FindMode::Short {
-                self.render_radar_body(cx).into_any_element()
-            } else {
-                self.render_long_find_body(cx).into_any_element()
-            },
-        )
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(header)
+            .child(match self.find_mode {
+                FindMode::Short => self.render_radar_body(cx).into_any_element(),
+                FindMode::LimitUp => self.render_limitup_body(cx).into_any_element(),
+                FindMode::Long => self.render_long_find_body(cx).into_any_element(),
+            })
     }
 
     fn render_find_freshness_banner(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -92,6 +108,8 @@ impl StockApp {
                 self.treasure_scanning || self.scout_running,
             ),
             FindMode::Short => (self.radar_updated_at.as_str(), self.radar_scanning),
+            // 连板是当日盘面：无时间戳即视为未知，提示重扫，不复用旧榜。
+            FindMode::LimitUp => (self.limitup_updated_at.as_str(), self.limitup_scanning),
         };
         let fresh = if scanning {
             Freshness::Fresh
@@ -407,6 +425,281 @@ impl StockApp {
                         "Local rules · not advice"
                     } else {
                         "本地规则排序 · 仅供学习研究，不构成投资建议"
+                    }),
+            )
+    }
+
+    fn render_limitup_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let work = self.work_mode;
+        let selected = self.selected.clone();
+        let busy = self.limitup_scanning;
+        let has_hits = !self.limitup_hits.is_empty();
+        let visible = self.visible_limitup_hits();
+
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(
+                v_flex()
+                    .px_2()
+                    .py_2()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .flex_wrap()
+                            .child(
+                                Button::new("limitup-scan")
+                                    .xsmall()
+                                    .when(!busy && !has_hits, |b| b.primary())
+                                    .when(busy || has_hits, |b| b.ghost())
+                                    .label(if busy {
+                                        if work {
+                                            "Scanning…"
+                                        } else {
+                                            "扫描中…"
+                                        }
+                                    } else if has_hits {
+                                        if work {
+                                            "Rescan"
+                                        } else {
+                                            "重新扫描"
+                                        }
+                                    } else if work {
+                                        "Run boards"
+                                    } else {
+                                        "开始连板扫描"
+                                    })
+                                    .disabled(busy)
+                                    .tooltip(if work {
+                                        "First / second boards from today's gainers"
+                                    } else {
+                                        "从今日涨幅榜识别首板、二连与二进一观察"
+                                    })
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.start_limitup_scan(cx);
+                                    })),
+                            )
+                            .when(busy, |row| {
+                                row.child(
+                                    Button::new("limitup-cancel")
+                                        .xsmall()
+                                        .ghost()
+                                        .label(if work { "Cancel" } else { "取消" })
+                                        .on_click(cx.listener(|this, _, _w, cx| {
+                                            this.cancel_limitup_scan(cx);
+                                        })),
+                                )
+                            })
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if busy {
+                                        format!("{}/{}", self.limitup_done, self.limitup_total)
+                                    } else {
+                                        format!("{} 只", visible.len())
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(self.limitup_status.clone()),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .flex_wrap()
+                            .child(
+                                Button::new("limitup-f-all")
+                                    .xsmall()
+                                    .when(self.limitup_filter.is_none(), |b| b.primary())
+                                    .when(self.limitup_filter.is_some(), |b| b.ghost())
+                                    .label(if work { "All" } else { "全部" })
+                                    .on_click(cx.listener(|this, _, _w, cx| {
+                                        this.set_limitup_filter(None, cx);
+                                    })),
+                            )
+                            .children(
+                                [
+                                    LimitVerdict::FirstBoard,
+                                    LimitVerdict::SecondBoard,
+                                    LimitVerdict::WatchSecondEntry,
+                                ]
+                                .into_iter()
+                                .enumerate()
+                                .map(|(ix, v)| {
+                                    let active = self.limitup_filter == Some(v);
+                                    Button::new(("limitup-f", ix as u32))
+                                        .xsmall()
+                                        .when(active, |b| b.primary())
+                                        .when(!active, |b| b.ghost())
+                                        .label(if work { v.label_work() } else { v.label() })
+                                        .on_click(cx.listener(move |this, _, _w, cx| {
+                                            this.set_limitup_filter(Some(v), cx);
+                                        }))
+                                }),
+                            ),
+                    ),
+            )
+            .when(
+                !self.limitup_summary.as_ref().is_empty() && !busy,
+                |col| {
+                    col.child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(cx.theme().border)
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(self.limitup_summary.clone()),
+                    )
+                },
+            )
+            .child(
+                v_flex()
+                    .id("limitup-scroll")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .when(visible.is_empty() && !busy, |col| {
+                        col.child(
+                            div()
+                                .px_3()
+                                .py_4()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if work {
+                                    "No board hits yet · run scan"
+                                } else {
+                                    "还没有连板命中 · 点上方「开始连板扫描」\n盘后扫描只反映收盘梯队，次日务必先看是否高开兑现"
+                                }),
+                        )
+                    })
+                    .children(visible.into_iter().enumerate().map(|(ix, hit)| {
+                        let is_sel = hit.code == selected.as_ref();
+                        let hit_c = hit.clone();
+                        let code_s = hit.code.clone();
+                        let name_s = hit.name.clone();
+                        let last_s = hit.close;
+                        let chg_color = self.chg_color(hit.change_pct >= 0.0, cx);
+                        let verdict_color = match hit.verdict {
+                            LimitVerdict::SecondBoard => cx.theme().success,
+                            LimitVerdict::FirstBoard => cx.theme().accent,
+                            LimitVerdict::WatchSecondEntry => cx.theme().warning,
+                            LimitVerdict::HigherBoard | LimitVerdict::BrokenBoard => {
+                                cx.theme().danger
+                            }
+                            LimitVerdict::Skip => cx.theme().muted_foreground,
+                        };
+                        v_flex()
+                            .id(("limitup-row", ix))
+                            .px_3()
+                            .py_2()
+                            .gap_1()
+                            .border_b_1()
+                            .border_color(cx.theme().border.opacity(0.35))
+                            .cursor_pointer()
+                            .when(is_sel, |r| r.bg(cx.theme().accent.opacity(0.16)))
+                            .hover(|r| r.bg(cx.theme().accent.opacity(0.08)))
+                            .on_click(cx.listener(move |this, _, _w, cx| {
+                                this.select_limitup_hit(&hit_c, cx);
+                            }))
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_semibold()
+                                            .text_color(cx.theme().foreground)
+                                            .child(if work {
+                                                hit.code.clone()
+                                            } else {
+                                                format!("{}  {}", hit.code, hit.name)
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .px_1()
+                                            .rounded(cx.theme().radius)
+                                            .bg(cx.theme().muted)
+                                            .text_color(verdict_color)
+                                            .child(if work {
+                                                hit.verdict.label_work().to_string()
+                                            } else {
+                                                hit.verdict.label().to_string()
+                                            }),
+                                    )
+                                    .child(div().flex_1())
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_semibold()
+                                            .text_color(cx.theme().accent)
+                                            .child(format!("{:.0}", hit.score)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(chg_color)
+                                            .child(format!("{:+.1}%", hit.change_pct)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if work {
+                                        hit.headline.clone()
+                                    } else {
+                                        format!("{} · {}", hit.headline, hit.price_band_text())
+                                    }),
+                            )
+                            .when(!work && !hit.risks.is_empty(), |row| {
+                                row.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().warning)
+                                        .child(hit.risks.first().cloned().unwrap_or_default()),
+                                )
+                            })
+                            .child(
+                                h_flex().gap_1().child(
+                                    Button::new(("limitup-short", ix as u32))
+                                        .xsmall()
+                                        .ghost()
+                                        .label(if work { "+Short" } else { "+短线池" })
+                                        .on_click(cx.listener(move |this, _, _w, cx| {
+                                            this.add_pick_to_group(
+                                                &code_s, &name_s, last_s, WatchTag::Short, cx,
+                                            );
+                                        })),
+                                ),
+                            )
+                    })),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground.opacity(0.8))
+                    .child(if work {
+                        "Local rules · not advice"
+                    } else {
+                        "炸板/高板只看不做 · 打板先设失效价 · 仅供学习研究，不构成投资建议"
                     }),
             )
     }

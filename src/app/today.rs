@@ -2,6 +2,7 @@
 
 use gpui::Context;
 
+use crate::data::limitup::LimitVerdict;
 use crate::data::radar::RadarStrategy;
 use crate::data::scout::ScoutVerdict;
 use crate::domain::climate::{
@@ -188,6 +189,33 @@ impl StockApp {
                 },
             }
         }));
+        // 连板梯队：封板质量分决定初始 readiness，气候门再按连板规则二次拦截。
+        // 炸板/高板在这里直接判为不行动（只看不做），不进入 ready 队列。
+        opportunities.extend(self.limitup_hits.iter().map(|hit| {
+            let (ready, gate_reason) = match hit.verdict {
+                LimitVerdict::FirstBoard | LimitVerdict::SecondBoard => {
+                    if hit.score >= 60.0 {
+                        (true, None)
+                    } else {
+                        (false, Some("封板质量不足，先观察不行动".into()))
+                    }
+                }
+                LimitVerdict::WatchSecondEntry => (true, None),
+                LimitVerdict::HigherBoard => (false, Some("高位连板只看不做".into())),
+                LimitVerdict::BrokenBoard => (false, Some("炸板当日不追".into())),
+                LimitVerdict::Skip => (false, Some("不符合连板纪律".into())),
+            };
+            TodayOpportunity {
+                code: hit.code.clone(),
+                name: hit.name.clone(),
+                strategy: hit.verdict.label().into(),
+                playbook: PlaybookKind::LimitUp,
+                score: hit.score,
+                observation: hit.price_band_text(),
+                ready,
+                gate_reason,
+            }
+        }));
 
         build_today_dashboard(TodayDashboardInput {
             alerts,
@@ -351,6 +379,13 @@ impl StockApp {
                     self.radar_hits.iter().find(|hit| hit.code == code).cloned()
                 {
                     self.select_radar_hit(&hit, cx);
+                } else if let Some(hit) = self
+                    .limitup_hits
+                    .iter()
+                    .find(|hit| hit.code == code)
+                    .cloned()
+                {
+                    self.select_limitup_hit(&hit, cx);
                 } else {
                     self.ensure_today_symbol(&code);
                     self.select_symbol(shared(code), cx);

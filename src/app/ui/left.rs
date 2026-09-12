@@ -75,6 +75,13 @@ impl StockApp {
                         format!("{}", self.radar_hits.len())
                     }
                 }
+                FindMode::LimitUp => {
+                    if self.limitup_scanning {
+                        format!("{}/{}", self.limitup_done, self.limitup_total)
+                    } else {
+                        format!("{}", self.limitup_hits.len())
+                    }
+                }
             },
         };
         v_flex()

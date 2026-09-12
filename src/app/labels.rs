@@ -15,6 +15,10 @@ impl L {
         if work { "Short" } else { "短线" }
     }
 
+    pub(crate) fn find_limitup(work: bool) -> &'static str {
+        if work { "Boards" } else { "连板" }
+    }
+
     // —— Detail (analysis dock) tabs ——
     pub(crate) fn detail_overview(work: bool) -> &'static str {
         if work { "Overview" } else { "决策" }
