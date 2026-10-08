@@ -9,10 +9,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{
-    LazyLock,
+    LazyLock, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
@@ -142,6 +142,96 @@ fn get_json(url: &str) -> Result<Value> {
         .into_string()
         .context("read body")?;
     serde_json::from_str(&body).context("parse json")
+}
+
+/// Eastmoney's push2 edges serve `clist` from backends that throttle
+/// datacenter networks: after only a handful of requests the edge redirects
+/// flagged traffic to the delay nodes and answers 502 / drops the TLS
+/// connection across every host for minutes. Requests are therefore spaced
+/// lightly to soften bursts, and one extra host-rotation round absorbs
+/// ordinary transient 5xx blips instead of failing the whole refresh.
+const PUSH2_MIN_REQUEST_GAP: Duration = Duration::from_millis(100);
+const PUSH2_FAILOVER_ROUNDS: usize = 2;
+const PUSH2_RETRY_BACKOFF: [Duration; PUSH2_FAILOVER_ROUNDS - 1] = [Duration::from_millis(500)];
+
+static PUSH2_PACER: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn pace_push2_request() {
+    let mut last = PUSH2_PACER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(at) = *last {
+        let elapsed = at.elapsed();
+        if elapsed < PUSH2_MIN_REQUEST_GAP {
+            std::thread::sleep(PUSH2_MIN_REQUEST_GAP - elapsed);
+        }
+    }
+    *last = Some(Instant::now());
+}
+
+struct Push2Error {
+    message: String,
+    retryable: bool,
+}
+
+/// One push2 attempt. Transport errors and 5xx/408/429 are retryable; other
+/// statuses (e.g. 400 from a malformed query) fail fast.
+fn push2_request(url: &str) -> Result<Value, Push2Error> {
+    pace_push2_request();
+    match agent()
+        .get(url)
+        .set("User-Agent", UA)
+        .set("Referer", "https://quote.eastmoney.com/")
+        .call()
+    {
+        Ok(response) => {
+            let body = response.into_string().map_err(|error| Push2Error {
+                message: short_http_err(&error.to_string()),
+                retryable: true,
+            })?;
+            serde_json::from_str(&body).map_err(|error| Push2Error {
+                message: format!("响应解析失败: {error}"),
+                retryable: true,
+            })
+        }
+        Err(error) => {
+            let retryable = match &error {
+                ureq::Error::Status(status, _) => *status >= 500 || matches!(*status, 408 | 429),
+                ureq::Error::Transport(_) => true,
+            };
+            Err(Push2Error {
+                message: short_http_err(&error.to_string()),
+                retryable,
+            })
+        }
+    }
+}
+
+/// Fetch a push2 path with global pacing, host rotation and bounded retry
+/// rounds.
+fn fetch_push2_json(path: &str, hosts: &[&str]) -> Result<Value> {
+    let mut last_error = Push2Error {
+        message: "接口未返回数据".into(),
+        retryable: true,
+    };
+    for round in 0..PUSH2_FAILOVER_ROUNDS {
+        for host in hosts {
+            let url = format!("https://{host}{path}");
+            match push2_request(&url) {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    if !error.retryable {
+                        bail!(error.message);
+                    }
+                    last_error = error;
+                }
+            }
+        }
+        if let Some(backoff) = PUSH2_RETRY_BACKOFF.get(round) {
+            std::thread::sleep(*backoff);
+        }
+    }
+    bail!(last_error.message)
 }
 
 /// Point-in-time financial quality reports for A shares.
@@ -782,19 +872,9 @@ fn fetch_quotes_by_secids_with_hosts(secids: &[String], hosts: &[&str]) -> Resul
          &fields=f12,f13,f14,f2,f3,f4,f5,f6,f15,f16,f17,f18"
     );
 
-    let mut last_err = anyhow!("no host tried");
-    for host in hosts {
-        let url = format!("https://{host}{path}");
-        match get_json(&url) {
-            Ok(v) => {
-                return parse_quote_diff(v);
-            }
-            Err(e) => {
-                last_err = e;
-            }
-        }
-    }
-    Err(anyhow!("行情接口不可用: {last_err}"))
+    let value =
+        fetch_push2_json(&path, hosts).map_err(|error| anyhow!("行情接口不可用: {error}"))?;
+    parse_quote_diff(value)
 }
 
 /// 上证综指 / 沪深300 / 创业板指.
@@ -827,19 +907,8 @@ fn fetch_complete_industry_sectors(filter: &str, level_label: &str) -> Result<Ve
              &fltt=2&invt=2&fid=f6&fs={filter}\
              &fields=f12,f14,f2,f3,f4,f5,f6,f104,f105,f106"
         );
-        let mut last_err = anyhow!("{level_label}行业接口未返回数据");
-        let mut response = None;
-        for host in PUSH2_HOSTS {
-            let url = format!("https://{host}{path}");
-            match get_json(&url) {
-                Ok(value) => {
-                    response = Some(value);
-                    break;
-                }
-                Err(error) => last_err = error,
-            }
-        }
-        let value = response.ok_or_else(|| anyhow!("{level_label}行业不可用: {last_err}"))?;
+        let value = fetch_push2_json(&path, PUSH2_HOSTS)
+            .map_err(|error| anyhow!("{level_label}行业不可用: {error}"))?;
         let total = clist_total(&value).ok_or_else(|| anyhow!("{level_label}行业缺少总数"))?;
         if let Some(expected) = expected_total {
             if total != expected {
@@ -880,18 +949,13 @@ fn fetch_a_share_stock_total() -> Result<usize> {
          pn=1&pz=1&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281\
          &fltt=2&invt=2&fid=f6&fs={EASTMONEY_A_SHARE_UNIVERSE}&fields=f12"
     );
-    let mut last_err = anyhow!("全 A 股接口未返回数据");
-    for host in PUSH2_HOSTS {
-        let url = format!("https://{host}{path}");
-        match get_json(&url)
-            .and_then(|value| clist_total(&value).ok_or_else(|| anyhow!("全 A 股接口缺少总数")))
-        {
-            Ok(total) if total > 0 => return Ok(total),
-            Ok(_) => last_err = anyhow!("全 A 股总数为 0"),
-            Err(error) => last_err = error,
-        }
+    let value = fetch_push2_json(&path, PUSH2_HOSTS)
+        .map_err(|error| anyhow!("全 A 股总数不可用: {error}"))?;
+    let total = clist_total(&value).ok_or_else(|| anyhow!("全 A 股接口缺少总数"))?;
+    if total == 0 {
+        bail!("全 A 股总数为 0");
     }
-    Err(anyhow!("全 A 股总数不可用: {last_err}"))
+    Ok(total)
 }
 
 /// Complete A-share heatmap hierarchy using Shenwan's mutually-exclusive
@@ -1043,19 +1107,8 @@ fn fetch_complete_sector_heatmap(sector: SectorTick) -> Result<IndustryHeatmapSe
              &ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2\
              &fid=f6&fs=b:{code}&fields=f12,f14,f2,f3,f5,f6,f15,f16,f17,f18,f100"
         );
-        let mut last_err = anyhow!("板块成分接口未返回");
-        let mut response = None;
-        for host in PUSH2_HOSTS {
-            let url = format!("https://{host}{path}");
-            match get_json(&url) {
-                Ok(value) => {
-                    response = Some(value);
-                    break;
-                }
-                Err(error) => last_err = error,
-            }
-        }
-        let value = response.ok_or_else(|| anyhow!("{} 成分不可用: {last_err}", sector.name))?;
+        let value = fetch_push2_json(&path, PUSH2_HOSTS)
+            .map_err(|error| anyhow!("{} 成分不可用: {error}", sector.name))?;
         let total = clist_total(&value).ok_or_else(|| anyhow!("{} 缺少成分总数", sector.name))?;
         if let Some(expected) = expected_total {
             if total != expected {
@@ -1141,19 +1194,8 @@ pub fn fetch_sector_constituents(sector_code: &str, limit: usize) -> Result<Vec<
              &ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2\
              &fid=f6&fs=b:{code}&fields=f12,f14,f2,f3,f5,f6,f15,f16,f17,f18"
         );
-        let mut last_err = anyhow!("板块成分接口未返回");
-        let mut response = None;
-        for host in PUSH2_HOSTS {
-            let url = format!("https://{host}{path}");
-            match get_json(&url) {
-                Ok(value) => {
-                    response = Some(value);
-                    break;
-                }
-                Err(error) => last_err = error,
-            }
-        }
-        let value = response.ok_or_else(|| anyhow!("板块成分不可用: {last_err}"))?;
+        let value = fetch_push2_json(&path, PUSH2_HOSTS)
+            .map_err(|error| anyhow!("板块成分不可用: {error}"))?;
         let total = clist_total(&value);
         let received_count = clist_row_count(&value);
         let rows = parse_quote_diff(value)?;
@@ -1462,22 +1504,9 @@ pub fn fetch_rising_a_shares(limit: usize) -> Result<Vec<RisingRow>> {
              &ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2\
              &fid=f3&fs={fs}&fields={fields}"
         );
-        let mut page_rows: Option<Vec<RisingRow>> = None;
-        let mut last_err = anyhow!("no host");
-        for host in PUSH2_HOSTS
-            .iter()
-            .chain(std::iter::once(&"push2delay.eastmoney.com"))
-        {
-            let url = format!("https://{host}{path}");
-            match get_json(&url) {
-                Ok(v) => {
-                    page_rows = Some(parse_clist_rising(&v)?);
-                    break;
-                }
-                Err(e) => last_err = e,
-            }
-        }
-        let rows = page_rows.ok_or_else(|| anyhow!("涨幅榜失败: {last_err}"))?;
+        let value =
+            fetch_push2_json(&path, PUSH2_HOSTS).map_err(|error| anyhow!("涨幅榜失败: {error}"))?;
+        let rows = parse_clist_rising(&value)?;
         if rows.is_empty() {
             break;
         }
@@ -1721,22 +1750,9 @@ pub fn fetch_liquid_a_shares(limit: usize) -> Result<Vec<UniverseRow>> {
              &ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2\
              &fid=f20&fs={fs}&fields={fields}"
         );
-        let mut page_rows: Option<Vec<UniverseRow>> = None;
-        let mut last_err = anyhow!("no host");
-        for host in PUSH2_HOSTS
-            .iter()
-            .chain(std::iter::once(&"push2delay.eastmoney.com"))
-        {
-            let url = format!("https://{host}{path}");
-            match get_json(&url) {
-                Ok(v) => {
-                    page_rows = Some(parse_clist_universe(&v)?);
-                    break;
-                }
-                Err(e) => last_err = e,
-            }
-        }
-        let rows = page_rows.ok_or_else(|| anyhow!("A股列表失败: {last_err}"))?;
+        let value = fetch_push2_json(&path, PUSH2_HOSTS)
+            .map_err(|error| anyhow!("A股列表失败: {error}"))?;
+        let rows = parse_clist_universe(&value)?;
         if rows.is_empty() {
             break;
         }
