@@ -1,6 +1,6 @@
 use crate::data;
 use crate::domain::market::{
-    Adjustment, Availability, Freshness, KlineSeries, Market, QuoteRecord, SearchHit,
+    Adjustment, Availability, KlineSeries, Market, QuoteRecord, SearchHit,
 };
 use crate::services::market_data::{
     KlineProvider, ProviderError, ProviderErrorKind, QuoteProvider, SearchProvider,
@@ -17,7 +17,6 @@ impl QuoteProvider for TencentProvider {
     }
 
     fn fetch_quotes(&self, codes: &[String]) -> Result<Vec<QuoteRecord>, ProviderError> {
-        let fetched_at = chrono::Utc::now().timestamp_millis();
         data::tencent::fetch_quotes(codes)
             .map(|values| {
                 values
@@ -29,20 +28,20 @@ impl QuoteProvider for TencentProvider {
                         Some(QuoteRecord {
                             code: value.code,
                             market,
-                            currency: market.currency(),
+                            currency: value.currency,
                             name: value.name,
                             price,
                             change_pct: value.change_pct.is_finite().then_some(value.change_pct),
                             volume: Some(value.volume),
                             source: PROVIDER.into(),
-                            fetched_at,
-                            market_time: None,
+                            fetched_at: value.fetched_at,
+                            market_time: value.market_time,
                             availability: if price.is_some() {
-                                Availability::Available
+                                value.availability
                             } else {
                                 Availability::Invalid
                             },
-                            freshness: Freshness::Live,
+                            freshness: value.freshness,
                         })
                     })
                     .collect()

@@ -51,9 +51,9 @@ impl L {
 
     pub(crate) fn palette_section_remote(work: bool) -> &'static str {
         if work {
-            "Results · Enter to add"
+            "Results · Enter to preview"
         } else {
-            "搜索结果 · Enter 添加"
+            "搜索结果 · Enter 查看"
         }
     }
 

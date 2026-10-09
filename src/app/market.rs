@@ -23,6 +23,249 @@ use super::{
 };
 
 impl StockApp {
+    pub(crate) fn quote_for_code(&self, code: &str) -> Option<&crate::domain::market::QuoteRecord> {
+        self.services.market.quote_for(code)
+    }
+
+    pub(crate) fn quote_status_text(&self) -> String {
+        let quote = self
+            .quote_for_code(self.selected.as_ref())
+            .map(|quote| {
+                format!(
+                    "{} · {} · {}",
+                    quote.source,
+                    quote.as_of_label(),
+                    quote.freshness_label()
+                )
+            })
+            .unwrap_or_else(|| "行情缺失 · 时间未知".into());
+        let errors = &self.services.market.errors;
+        format!(
+            "{quote}{} · {}",
+            if errors.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", errors.join("；"))
+            },
+            session::SESSION_CALENDAR_NOTE
+        )
+    }
+
+    fn quote_request_codes(&self) -> Vec<String> {
+        let mut codes: Vec<_> = self
+            .symbols
+            .iter()
+            .map(|symbol| symbol.code.clone())
+            .collect();
+        codes.extend(self.portfolio.open_codes());
+        codes.extend(
+            self.buy_alerts
+                .iter()
+                .filter(|(_, alert)| alert.any_armed())
+                .map(|(code, _)| code.clone()),
+        );
+        codes.push(self.selected.to_string());
+        let mut seen = std::collections::HashSet::new();
+        codes.retain(|code| seen.insert(code.clone()));
+        codes
+    }
+
+    fn apply_quote_batch(
+        &mut self,
+        ticket: &crate::controller::state::RequestTicket,
+        batch: crate::infrastructure::market::service::QuoteBatch,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let errors: Vec<_> = batch.errors.iter().map(ToString::to_string).collect();
+        let source = market::quote_source(&batch.records);
+        let now = chrono::Utc::now().timestamp_millis();
+        let stale_count = batch
+            .records
+            .iter()
+            .filter(|record| {
+                !record.usable()
+                    || record.effective_freshness(now) == crate::domain::market::Freshness::Stale
+            })
+            .count();
+        let usable_count = batch
+            .records
+            .iter()
+            .filter(|record| record.usable())
+            .count();
+        let previous: std::collections::HashMap<_, _> = batch
+            .records
+            .iter()
+            .map(|record| {
+                (
+                    record.code.clone(),
+                    self.quote_for_code(&record.code)
+                        .and_then(|quote| quote.price)
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        if !self.services.market.apply_refresh_with_errors(
+            ticket,
+            batch.records.clone(),
+            errors.clone(),
+        ) {
+            return false;
+        }
+        self.market_state.last_applied_at = Some(now);
+        self.analysis_state.decision_card =
+            (!self.current_daily_candles().is_empty()).then(|| self.decision_card_view_model());
+        self.quote_fail_streak =
+            if usable_count == 0 || (stale_count == batch.records.len() && !errors.is_empty()) {
+                self.quote_fail_streak.saturating_add(1)
+            } else {
+                0
+            };
+        let mut transitions = Vec::new();
+        for record in &batch.records {
+            if record.usable()
+                && record.effective_freshness(now) == crate::domain::market::Freshness::Live
+                && let Some(price) = record.price
+            {
+                transitions.push((record.code.clone(), previous[&record.code], price));
+            }
+            if let Some(symbol) = self
+                .symbols
+                .iter_mut()
+                .find(|symbol| symbol.code == record.code)
+            {
+                hydrate_symbol_from_quote(symbol, record);
+            }
+            if let Some(preview) = self.preview_symbol.as_mut() {
+                hydrate_symbol_from_quote(preview, record);
+            }
+            if is_real_name(&record.name, &record.code)
+                && let Some(hit) = self
+                    .treasure_hits
+                    .iter_mut()
+                    .find(|hit| hit.code == record.code)
+            {
+                hit.name = record.name.clone();
+            }
+        }
+        let alert_hits = self.evaluate_buy_alerts(&transitions, cx);
+        if !alert_hits.is_empty() {
+            self.status = shared(self.format_buy_alert_status(&alert_hits));
+        } else {
+            let unknown = batch
+                .records
+                .iter()
+                .filter(|record| {
+                    record.effective_freshness(now) == crate::domain::market::Freshness::Unknown
+                })
+                .count();
+            self.status = shared(format!(
+                "行情 {source} · 过期/缺失 {stale_count} · 时效未知 {unknown}{}",
+                if errors.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", errors.join("；"))
+                }
+            ));
+        }
+        if self.status_bar_enabled {
+            self.sync_status_bar();
+        }
+        self.notify_buy_alert_hits(&alert_hits);
+        // Notify even when all prices are flat: metadata and errors are visible data.
+        cx.notify();
+        true
+    }
+
+    pub(crate) fn visible_series_matches_selection(&self) -> bool {
+        let expected = self.chart_kind.series_identity(self.selected.as_ref());
+        expected.as_ref().is_some_and(|identity| {
+            self.chart_state.visible_identity.as_ref() == Some(identity)
+                && (matches!(self.chart_kind, ChartKind::Intraday)
+                    || self.chart_state.controller.matches_visible(identity))
+        }) && self.candles_code.as_deref() == Some(self.selected.as_ref())
+    }
+
+    pub(crate) fn current_daily_candles(&self) -> &[Candle] {
+        self.chart_state.daily.candles_for(self.selected.as_ref())
+    }
+
+    pub(crate) fn daily_analysis_source(&self) -> &str {
+        if self.current_daily_candles().is_empty() {
+            "日线证据未知"
+        } else {
+            &self.chart_state.daily.source
+        }
+    }
+
+    /// Always request the same daily window; chart period/range does not change evidence.
+    pub(crate) fn reload_daily_analysis(&mut self, force: bool, cx: &mut Context<Self>) {
+        let code = self.selected.to_string();
+        if !force {
+            if self.chart_state.daily.requested_code.as_deref() == Some(code.as_str())
+                && matches!(
+                    self.chart_state.daily.request.state,
+                    crate::controller::state::RequestState::Loading
+                )
+            {
+                // A chart-period change must not restart or cancel daily evidence loading.
+                return;
+            }
+            if self.chart_state.daily.code.as_deref() == Some(code.as_str())
+                && !self.chart_state.daily.candles.is_empty()
+            {
+                if self.chart_state.daily.requested_code.as_deref() != Some(code.as_str()) {
+                    self.chart_state.daily.request.cancel();
+                    self.chart_state.daily.requested_code = None;
+                }
+                self.refresh_analysis_cache();
+                return;
+            }
+        }
+        let ticket = self.chart_state.daily.request.begin(code.clone());
+        self.chart_state.daily.requested_code = Some(code.clone());
+        self.signal_cache = None;
+        self.levels_cache = None;
+        self.backtest_report = None;
+        self.analysis_state.decision_card = None;
+        cx.spawn(async move |this, cx| {
+            let req_code = code.clone();
+            let result = smol::unblock(move || market::fetch_klines(&code, 1_000)).await;
+            let _ = this.update(cx, |app, cx| {
+                if app.selected.as_ref() != req_code
+                    || !app.chart_state.daily.request.is_current(&ticket)
+                {
+                    return;
+                }
+                match result {
+                    Ok(sourced) => {
+                        let (_, _, candles) = sourced.data;
+                        app.chart_state.daily.code = Some(req_code.clone());
+                        app.chart_state.daily.candles = candles;
+                        app.chart_state.daily.source = sourced.source.into();
+                        app.chart_state.daily.error = None;
+                        app.chart_state.daily.request.apply(&ticket, ());
+                        let candles = app.current_daily_candles().to_vec();
+                        if app.journal.update_outcomes_for_series(&req_code, &candles) > 0 {
+                            app.persist_journal();
+                        }
+                        app.refresh_analysis_cache();
+                    }
+                    Err(error) => {
+                        app.chart_state.daily.error = Some((req_code.clone(), error.to_string()));
+                        app.chart_state
+                            .daily
+                            .request
+                            .fail(&ticket, error.to_string());
+                        app.status = shared(format!("日线分析加载失败：{error}"));
+                        app.refresh_analysis_cache();
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn window_title(&self) -> &'static str {
         if self.work_mode {
             TITLE_WORK
@@ -196,16 +439,24 @@ impl StockApp {
             let mut delay = Duration::from_secs(1);
             loop {
                 Timer::after(delay).await;
-                let codes = match this.read_with(cx, |app, _| {
-                    let mut codes: Vec<String> =
-                        app.symbols.iter().map(|s| s.code.clone()).collect();
-                    for c in app.portfolio.open_codes() {
-                        if !codes.iter().any(|x| x == &c) {
-                            codes.push(c);
+                if this
+                    .update(cx, |app, cx| {
+                        if app
+                            .services
+                            .market
+                            .age_quotes(chrono::Utc::now().timestamp_millis())
+                        {
+                            app.analysis_state.decision_card =
+                                (!app.current_daily_candles().is_empty())
+                                    .then(|| app.decision_card_view_model());
+                            cx.notify();
                         }
-                    }
-                    codes
-                }) {
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                let codes = match this.read_with(cx, |app, _| app.quote_request_codes()) {
                     Ok(c) => c,
                     Err(_) => break,
                 };
@@ -232,162 +483,41 @@ impl StockApp {
                         Ok(ticket) => ticket,
                         Err(_) => break,
                     };
-                let result = smol::unblock(move || market::fetch_quotes(&active)).await;
+                let batch = smol::unblock(move || market::fetch_quote_records(&active)).await;
                 let idx_result = if need_idx {
                     Some(smol::unblock(market::fetch_major_indices).await)
                 } else {
                     None
                 };
                 let ok = this.update(cx, |app, cx| {
-                    match result {
-                        Ok(sourced) => {
-                            app.quote_fail_streak = 0;
-                            let contracts = sourced
-                                .data
-                                .iter()
-                                .filter_map(|tick| {
-                                    let market =
-                                        crate::domain::market::Market::for_code(&tick.code)?;
-                                    Some(crate::domain::market::QuoteRecord {
-                                        code: tick.code.clone(),
-                                        market,
-                                        currency: tick.currency,
-                                        name: tick.name.clone(),
-                                        price: (tick.last > 0.0).then_some(tick.last),
-                                        change_pct: Some(tick.change_pct),
-                                        volume: Some(tick.volume),
-                                        source: tick.source.clone(),
-                                        fetched_at: tick.fetched_at,
-                                        market_time: tick.market_time.clone(),
-                                        availability: tick.availability,
-                                        freshness: tick.freshness,
-                                    })
-                                })
-                                .collect();
-                            if app.services.market.apply_refresh(&quote_ticket, contracts) {
-                                app.market_state.last_applied_at =
-                                    Some(chrono::Utc::now().timestamp_millis());
-                            }
-                            let symbol_ix: std::collections::HashMap<String, usize> = app
-                                .symbols
-                                .iter()
-                                .enumerate()
-                                .map(|(ix, s)| (s.code.clone(), ix))
-                                .collect();
-                            let treasure_ix: std::collections::HashMap<String, usize> = app
-                                .treasure_hits
-                                .iter()
-                                .enumerate()
-                                .map(|(ix, h)| (h.code.clone(), ix))
-                                .collect();
-                            let mut quotes_changed = false;
-                            let mut status_bar_dirty = false;
-                            // Only codes that need alert evaluation (price moved, or
-                            // already-triggered alert that may rearm at a stable price).
-                            let mut transitions = Vec::new();
-                            let status_bar_codes = app.status_bar_codes.clone();
-                            for t in sourced.data {
-                                if let Some(&ix) = symbol_ix.get(&t.code) {
-                                    let sym = &mut app.symbols[ix];
-                                    if is_real_name(&t.name, &t.code)
-                                        && sym.name.as_ref() != t.name.as_str()
-                                    {
-                                        sym.name = shared(t.name.clone());
-                                        quotes_changed = true;
-                                        if status_bar_codes.iter().any(|c| c == &t.code) {
-                                            status_bar_dirty = true;
-                                        }
-                                    }
-                                    if t.last > 0.0 {
-                                        let previous = sym.last;
-                                        let price_dirty = (sym.last - t.last).abs() > 1e-9
-                                            || (sym.change_pct - t.change_pct).abs() > 1e-6
-                                            || sym.volume != t.volume;
-                                        if price_dirty {
-                                            transitions.push((t.code.clone(), previous, t.last));
-                                            sym.last = t.last;
-                                            sym.change_pct = t.change_pct;
-                                            sym.volume = t.volume;
-                                            quotes_changed = true;
-                                            if app.status_bar_codes.iter().any(|c| c == &t.code) {
-                                                status_bar_dirty = true;
-                                            }
-                                        } else if app
-                                            .buy_alerts
-                                            .get(&t.code)
-                                            .is_some_and(|a| a.triggered)
-                                        {
-                                            // Price flat but may still rearm above target.
-                                            transitions.push((t.code.clone(), previous, t.last));
-                                        }
-                                    }
-                                }
-                                // 顺带补寻宝列表中文名
-                                if is_real_name(&t.name, &t.code)
-                                    && let Some(&ix) = treasure_ix.get(&t.code)
-                                {
-                                    let hit = &mut app.treasure_hits[ix];
-                                    if hit.name != t.name {
-                                        hit.name = t.name.clone();
-                                        quotes_changed = true;
-                                    }
-                                }
-                            }
-                            let alert_hits = app.evaluate_buy_alerts(&transitions, cx);
-                            let mut index_changed = false;
-                            if let Some(Ok(idx)) = &idx_result {
-                                let rows: Vec<_> = idx
-                                    .data
-                                    .iter()
-                                    .map(|t| (t.code.clone(), t.name.clone(), t.last, t.change_pct))
-                                    .collect();
-                                index_changed = app.apply_index_ticks(&rows);
-                            }
-                            // Skip full UI rebuild when nothing visible changed.
-                            if quotes_changed || index_changed || !alert_hits.is_empty() {
-                                // Don't clobber an in-flight kline status unless idle.
-                                // Omit wall-clock seconds so identical ticks don't thrash status.
-                                if !alert_hits.is_empty() {
-                                    app.status = shared(app.format_buy_alert_status(&alert_hits));
-                                } else if !app.loading {
-                                    let mkt = match (open.a, open.hk) {
-                                        (true, true) => "A+港",
-                                        (true, false) => "A股",
-                                        (false, true) => "港股",
-                                        _ => "—",
-                                    };
-                                    app.status =
-                                        shared(format!("行情已更新 · {mkt} · {}", sourced.source));
-                                }
-                                if app.status_bar_enabled && status_bar_dirty {
-                                    app.sync_status_bar();
-                                }
-                                app.notify_buy_alert_hits(&alert_hits);
-                                cx.notify();
-                            }
-                            Duration::from_secs(app.quote_interval_secs)
-                        }
-                        Err(e) => {
-                            app.services
-                                .market
-                                .fail_refresh(&quote_ticket, e.to_string());
-                            app.quote_fail_streak = app.quote_fail_streak.saturating_add(1);
-                            let base = app.quote_interval_secs.max(1);
-                            let backoff_secs = (base * 2u64.pow(app.quote_fail_streak.min(5)))
-                                .min(QUOTE_INTERVAL_ERR_MAX.as_secs());
-                            app.status =
-                                shared(format!("行情刷新失败: {e} · {}s 后重试", backoff_secs));
-                            if let Some(Ok(idx)) = &idx_result {
-                                let rows: Vec<_> = idx
-                                    .data
-                                    .iter()
-                                    .map(|t| (t.code.clone(), t.name.clone(), t.last, t.change_pct))
-                                    .collect();
-                                let _ = app.apply_index_ticks(&rows);
-                            }
-                            cx.notify();
-                            Duration::from_secs(backoff_secs)
-                        }
+                    if !app.apply_quote_batch(&quote_ticket, batch, cx) {
+                        return Duration::from_secs(app.quote_interval_secs);
+                    }
+                    if let Some(Ok(idx)) = &idx_result {
+                        let rows: Vec<_> = idx
+                            .data
+                            .iter()
+                            .map(|tick| {
+                                (
+                                    tick.code.clone(),
+                                    tick.name.clone(),
+                                    tick.last,
+                                    tick.change_pct,
+                                )
+                            })
+                            .collect();
+                        app.apply_index_ticks(&rows);
+                    }
+                    // Price-flat updates still change source, provider timestamp and error state.
+                    cx.notify();
+                    if app.quote_fail_streak == 0 {
+                        Duration::from_secs(app.quote_interval_secs)
+                    } else {
+                        Duration::from_secs(
+                            (app.quote_interval_secs.max(1)
+                                * 2u64.pow(app.quote_fail_streak.min(5)))
+                            .min(QUOTE_INTERVAL_ERR_MAX.as_secs()),
+                        )
                     }
                 });
                 match ok {
@@ -410,7 +540,11 @@ impl StockApp {
             loop {
                 Timer::after(delay).await;
                 let is_intraday = this
-                    .read_with(cx, |app, _| matches!(app.chart_kind, ChartKind::Intraday))
+                    .read_with(cx, |app, _| {
+                        matches!(app.chart_kind, ChartKind::Intraday)
+                            && !app.loading
+                            && !app.refreshing
+                    })
                     .unwrap_or(false);
                 if !is_intraday {
                     delay = Duration::from_secs(5);
@@ -429,11 +563,19 @@ impl StockApp {
                     delay = Duration::from_secs(idle_delay_secs(present, 60));
                     continue;
                 }
+                let generation = match this.update(cx, |app, _| {
+                    app.minute_gen = app.minute_gen.wrapping_add(1);
+                    (app.minute_gen, app.kline_gen)
+                }) {
+                    Ok(generation) => generation,
+                    Err(_) => break,
+                };
                 let fetch_code = selected.clone();
                 let result = smol::unblock(move || market::fetch_minute_series(&fetch_code)).await;
                 let ok = this.update(cx, |app, cx| {
                     if !matches!(app.chart_kind, ChartKind::Intraday)
                         || app.selected.as_ref() != selected
+                        || generation != (app.minute_gen, app.kline_gen)
                     {
                         return;
                     }
@@ -455,9 +597,13 @@ impl StockApp {
     }
 
     pub(crate) fn refresh_all(&mut self, cx: &mut Context<Self>) {
+        self.drawing_anchor = None;
+        self.draft_line = None;
         self.reload_fundamentals(cx);
+        self.reload_daily_analysis(true, cx);
         self.ensure_market_climate_data(cx);
-        let codes: Vec<String> = self.symbols.iter().map(|s| s.code.clone()).collect();
+        let codes = self.quote_request_codes();
+        let quote_ticket = self.services.market.begin_refresh(&codes);
         let selected = self.selected.to_string();
         let bars = self.current_bars();
         let is_intraday = matches!(self.chart_kind, ChartKind::Intraday);
@@ -466,10 +612,11 @@ impl StockApp {
             ChartKind::DayK | ChartKind::Intraday => None,
         };
         let req_kind = self.chart_kind;
+        self.minute_gen = self.minute_gen.wrapping_add(1);
         self.kline_gen = self.kline_gen.wrapping_add(1);
         let req_gen = self.kline_gen;
         let from_cache = self.try_restore_series_cache();
-        // Keep previous candles painted until the new series arrives (no blank flash).
+        // Only an exact cached identity is paintable while this request is pending.
         self.hover_ix = None;
         self.loading = !from_cache;
         self.refreshing = from_cache;
@@ -489,7 +636,16 @@ impl StockApp {
         cx.spawn(async move |this, cx| {
             let codes2 = codes.clone();
             let req_code = selected.clone();
-            let quotes = smol::unblock(move || market::hydrate_symbols(&codes2)).await;
+            let quotes = smol::unblock(move || market::fetch_quote_records(&codes2)).await;
+            let quote_src = Some(market::quote_source(&quotes.records));
+            if this
+                .update(cx, |app, cx| {
+                    app.apply_quote_batch(&quote_ticket, quotes, cx);
+                })
+                .is_err()
+            {
+                return;
+            }
             let minute = if is_intraday {
                 let c = selected.clone();
                 Some(smol::unblock(move || market::fetch_minute_series(&c)).await)
@@ -514,39 +670,6 @@ impl StockApp {
             };
 
             this.update(cx, |app, cx| {
-                let mut quote_src = None;
-                let mut hydrate_transitions = Vec::new();
-                match quotes {
-                    Ok(sourced) => {
-                        quote_src = Some(sourced.source);
-                        let quotes: std::collections::HashMap<&str, &Symbol> = sourced
-                            .data
-                            .iter()
-                            .map(|symbol| (symbol.code.as_str(), symbol))
-                            .collect();
-                        for s in &mut app.symbols {
-                            if let Some(n) = quotes.get(s.code.as_str()) {
-                                // Keep existing last if hydrate returned zeros
-                                let keep_last = s.last;
-                                let keep_chg = s.change_pct;
-                                let keep_vol = s.volume;
-                                *s = (*n).clone();
-                                if s.last <= 0.0 && keep_last > 0.0 {
-                                    s.last = keep_last;
-                                    s.change_pct = keep_chg;
-                                    s.volume = keep_vol;
-                                }
-                                if s.last > 0.0 {
-                                    hydrate_transitions.push((s.code.clone(), keep_last, s.last));
-                                }
-                            }
-                        }
-                        app.quote_fail_streak = 0;
-                    }
-                    Err(e) => {
-                        app.status = shared(format!("自选列表加载失败: {e}"));
-                    }
-                }
                 // Drop stale kline if user switched while we were loading
                 if req_gen != app.kline_gen
                     || app.selected.as_ref() != req_code
@@ -574,7 +697,7 @@ impl StockApp {
                         }
                         #[allow(clippy::collapsible_match)]
                         Some(Err(e)) => {
-                            if app.candles_code.as_deref() != Some(req_code.as_str()) {
+                            if !app.visible_series_matches_selection() {
                                 app.status = shared(format!("分时加载失败: {e}"));
                             }
                         }
@@ -598,17 +721,12 @@ impl StockApp {
                         }
                         #[allow(clippy::collapsible_match)]
                         Some(Err(e)) => {
-                            if app.candles_code.as_deref() != Some(req_code.as_str()) {
+                            if !app.visible_series_matches_selection() {
                                 app.status = shared(format!("K线加载失败: {e}"));
                             }
                         }
                         None => {}
                     }
-                }
-                let alert_hits = app.evaluate_buy_alerts(&hydrate_transitions, cx);
-                if !alert_hits.is_empty() {
-                    app.status = shared(app.format_buy_alert_status(&alert_hits));
-                    app.notify_buy_alert_hits(&alert_hits);
                 }
                 app.loading = false;
                 app.refreshing = false;
@@ -638,9 +756,10 @@ impl StockApp {
         code: &str,
         name: String,
         candles: Vec<Candle>,
-        _from_cache: bool,
+        from_cache: bool,
         source: &str,
     ) {
+        let previous_drawing_scope = self.drawing_scope_key();
         if let Some(sym) = self.symbols.iter_mut().find(|s| s.code == code) {
             // 仅写入真实中文名；空名 / 代码占位不覆盖已有名称
             if is_real_name(&name, code) {
@@ -664,7 +783,9 @@ impl StockApp {
             }
         }
         // Same symbol refresh keeps zoom/pan; switching symbols resets the window.
-        let same_series = self.candles_code.as_deref() == Some(code) && !self.candles.is_empty();
+        let identity = self.chart_kind.series_identity(code);
+        let same_series = self.chart_state.visible_identity == identity && !self.candles.is_empty();
+        self.chart_state.visible_identity = identity;
         self.candles = candles;
         self.candles_code = Some(code.to_string());
         self.data_source = shared(if source.is_empty() {
@@ -678,7 +799,11 @@ impl StockApp {
                 market,
                 currency: market.currency(),
                 source: self.data_source.to_string(),
-                as_of: chrono::Utc::now().timestamp_millis(),
+                as_of: if from_cache {
+                    0
+                } else {
+                    chrono::Utc::now().timestamp_millis()
+                },
                 market_time: self.candles.last().map(|candle| candle.date.to_string()),
                 adjustment: if matches!(self.chart_kind, ChartKind::DayK) {
                     Adjustment::Forward
@@ -698,20 +823,15 @@ impl StockApp {
                     })
                     .collect(),
             };
-            let ticket = self.chart_state.controller.select(code);
+            let Some(identity) = self.chart_kind.series_identity(code) else {
+                return;
+            };
+            let ticket = self.chart_state.controller.select(identity);
             if self.chart_state.controller.apply(&ticket, series.clone()) {
                 self.chart_state.visible = Some(series);
             }
         } else {
             self.chart_state.visible = None;
-        }
-        let outcome_candles = self.candles.clone();
-        if self
-            .journal
-            .update_outcomes_for_series(code, &outcome_candles)
-            > 0
-        {
-            self.persist_journal();
         }
         // Day/minute K replaces intraday overlay.
         if !matches!(self.chart_kind, ChartKind::Intraday) {
@@ -721,8 +841,11 @@ impl StockApp {
         self.ma = MaSeries::from_candles(&self.candles);
         self.macd = MacdSeries::from_candles(&self.candles);
         self.boll = BollSeries::from_candles(&self.candles);
+        if previous_drawing_scope != self.drawing_scope_key() {
+            self.drawing_anchor = None;
+            self.draft_line = None;
+        }
         self.hover_ix = None;
-        self.refresh_analysis_cache();
         if same_series {
             let n = self.candles.len();
             if self.chart_view_count > 0 {
@@ -742,7 +865,7 @@ impl StockApp {
 
     /// True when the fetched minute series matches what we already paint (skip apply/notify).
     pub(crate) fn minute_unchanged(&self, code: &str, series: &MinuteSeries) -> bool {
-        if self.minute_code.as_deref() != Some(code) {
+        if self.minute_code.as_deref() != Some(code) || !self.visible_series_matches_selection() {
             return false;
         }
         let Some(old) = self.minute.as_ref() else {
@@ -768,8 +891,13 @@ impl StockApp {
     }
 
     fn apply_minute_inner(&mut self, code: &str, series: MinuteSeries, _from_cache: bool) {
+        let previous_drawing_scope = self.drawing_scope_key();
         // Periodic refresh of the same code keeps the user's zoom/pan window.
-        let same_series = self.minute_code.as_deref() == Some(code) && self.minute.is_some();
+        let identity = ChartKind::Intraday.series_identity(code);
+        let same_series = self.chart_state.visible_identity == identity && self.minute.is_some();
+        self.chart_state.visible_identity = identity;
+        self.chart_state.visible = None;
+        self.data_source = shared(market::SRC_TENCENT);
         if let Some(sym) = self.symbols.iter_mut().find(|s| s.code == code) {
             if is_real_name(&series.name, code) {
                 sym.name = shared(series.name.clone());
@@ -789,8 +917,11 @@ impl StockApp {
         self.ma = MaSeries::default();
         self.macd = MacdSeries::default();
         self.boll = BollSeries::default();
+        if previous_drawing_scope != self.drawing_scope_key() {
+            self.drawing_anchor = None;
+            self.draft_line = None;
+        }
         self.hover_ix = None;
-        self.refresh_analysis_cache();
         if !same_series {
             self.reset_chart_view();
         }
@@ -822,13 +953,13 @@ impl StockApp {
     /// Half-open `[start, end)` index range currently painted.
     pub(crate) fn chart_visible_range(&self) -> (usize, usize) {
         let n = self.candles.len();
-        if n == 0 {
+        if n == 0 || !self.visible_series_matches_selection() {
             return (0, 0);
         }
         let count = if self.chart_view_count == 0 {
             n
         } else {
-            self.chart_view_count.clamp(CHART_MIN_VISIBLE, n)
+            self.chart_view_count.clamp(CHART_MIN_VISIBLE.min(n), n)
         };
         let start = self.chart_view_start.min(n.saturating_sub(count));
         (start, start + count)
@@ -837,7 +968,7 @@ impl StockApp {
     /// Continuous zoom: `factor < 1` shows fewer bars (zoom in).
     pub(crate) fn chart_zoom_factor(&mut self, factor: f32, anchor: Option<usize>) {
         let n = self.candles.len();
-        if n <= CHART_MIN_VISIBLE {
+        if n <= CHART_MIN_VISIBLE || !self.visible_series_matches_selection() {
             return;
         }
         let factor = factor.clamp(0.55, 1.8);
@@ -888,7 +1019,7 @@ impl StockApp {
             return;
         }
         let n = self.candles.len();
-        if n == 0 {
+        if n == 0 || !self.visible_series_matches_selection() {
             return;
         }
         let (start, end) = self.chart_visible_range();
@@ -916,7 +1047,7 @@ impl StockApp {
 
     pub(crate) fn on_chart_scroll(&mut self, ev: &ScrollWheelEvent, cx: &mut Context<Self>) {
         let n = self.candles.len();
-        if n == 0 {
+        if n == 0 || !self.visible_series_matches_selection() {
             return;
         }
         let precise = matches!(ev.delta, ScrollDelta::Pixels(_));
@@ -964,6 +1095,8 @@ impl StockApp {
     }
 
     pub(crate) fn reload_klines(&mut self, cx: &mut Context<Self>) {
+        self.drawing_anchor = None;
+        self.draft_line = None;
         let selected = self.selected.to_string();
         let bars = self.current_bars();
         let minute_period = match self.chart_kind {
@@ -971,10 +1104,11 @@ impl StockApp {
             ChartKind::DayK | ChartKind::Intraday => None,
         };
         let req_kind = self.chart_kind;
+        self.minute_gen = self.minute_gen.wrapping_add(1);
         self.kline_gen = self.kline_gen.wrapping_add(1);
         let req_gen = self.kline_gen;
         let from_cache = self.try_restore_series_cache();
-        // Keep last series visible while loading (header uses live quote + loading flag).
+        // Incompatible previous data remains cached but cannot be rendered.
         self.hover_ix = None;
         self.loading = !from_cache;
         self.refreshing = from_cache;
@@ -1022,7 +1156,7 @@ impl StockApp {
                         ));
                     }
                     Err(e) => {
-                        if app.candles_code.as_deref() != Some(req_code.as_str()) {
+                        if !app.visible_series_matches_selection() {
                             app.status = shared(format!("{}加载失败: {e}", app.chart_label()));
                         } else {
                             app.status = shared(format!(
@@ -1045,6 +1179,9 @@ impl StockApp {
     }
 
     pub(crate) fn reload_minute(&mut self, cx: &mut Context<Self>) {
+        self.drawing_anchor = None;
+        self.draft_line = None;
+        self.kline_gen = self.kline_gen.wrapping_add(1);
         let selected = self.selected.to_string();
         self.minute_gen = self.minute_gen.wrapping_add(1);
         let req_gen = self.minute_gen;
@@ -1084,9 +1221,7 @@ impl StockApp {
                         ));
                     }
                     Err(e) => {
-                        if app.minute_code.as_deref() != Some(req_code.as_str()) {
-                            app.status = shared(format!("分时失败: {e}"));
-                        }
+                        app.status = shared(format!("分时刷新失败: {e}"));
                     }
                 }
                 app.loading = false;
@@ -1100,6 +1235,22 @@ impl StockApp {
     }
 
     pub(crate) fn reload_chart(&mut self, cx: &mut Context<Self>) {
+        // A gesture belongs to the old instrument and interval, even if a new cache restores instantly.
+        self.drawing_anchor = None;
+        self.draft_line = None;
+        self.hover_ix = None;
+        self.reload_daily_analysis(false, cx);
+        if self.quote_for_code(self.selected.as_ref()).is_none() {
+            let codes = self.quote_request_codes();
+            let ticket = self.services.market.begin_refresh(&codes);
+            cx.spawn(async move |this, cx| {
+                let batch = smol::unblock(move || market::fetch_quote_records(&codes)).await;
+                let _ = this.update(cx, |app, cx| {
+                    app.apply_quote_batch(&ticket, batch, cx);
+                });
+            })
+            .detach();
+        }
         match self.chart_kind {
             ChartKind::Intraday => self.reload_minute(cx),
             ChartKind::DayK | ChartKind::MinuteK(_) => self.reload_klines(cx),
@@ -1125,8 +1276,8 @@ impl StockApp {
                 if !accepted || app.selected.as_ref() != request_code {
                     return;
                 }
-                app.analysis_state.decision_card =
-                    (!app.candles.is_empty()).then(|| app.decision_card_view_model());
+                app.analysis_state.decision_card = (!app.current_daily_candles().is_empty())
+                    .then(|| app.decision_card_view_model());
                 cx.notify();
             });
         })
@@ -1140,5 +1291,62 @@ impl StockApp {
         self.chart_kind = kind;
         self.schedule_persist(cx);
         self.reload_chart(cx);
+    }
+}
+
+/// Keep temporary research metadata useful without treating it as valuation evidence.
+fn hydrate_symbol_from_quote(symbol: &mut Symbol, quote: &crate::domain::market::QuoteRecord) {
+    if symbol.code != quote.code {
+        return;
+    }
+    if is_real_name(&quote.name, &quote.code) {
+        symbol.name = shared(quote.name.clone());
+    }
+    if quote.usable()
+        && let Some(price) = quote.price
+    {
+        symbol.last = price;
+        symbol.change_pct = quote.change_pct.unwrap_or_default();
+        symbol.volume = quote.volume.unwrap_or_default();
+    }
+}
+
+#[cfg(test)]
+mod preview_hydration_tests {
+    use super::*;
+    use crate::domain::market::{Availability, Freshness, QuoteRecord};
+    use crate::domain::money::Currency;
+
+    #[test]
+    fn typed_preview_is_hydrated_from_its_canonical_quote_only() {
+        let mut preview = Symbol {
+            code: "600519".into(),
+            name: shared("600519"),
+            last: 0.0,
+            change_pct: 0.0,
+            volume: 0,
+            board: shared("fixture"),
+        };
+        let mut quote = QuoteRecord {
+            code: "000001".into(),
+            market: Market::AShare,
+            currency: Currency::Cny,
+            name: "*ST离线样本".into(),
+            price: Some(12.0),
+            change_pct: Some(-3.0),
+            volume: Some(100),
+            source: "offline fixture".into(),
+            fetched_at: 0,
+            market_time: None,
+            availability: Availability::Available,
+            freshness: Freshness::Unknown,
+        };
+        hydrate_symbol_from_quote(&mut preview, &quote);
+        assert_eq!(preview.name.as_ref(), "600519");
+        quote.code = preview.code.clone();
+        hydrate_symbol_from_quote(&mut preview, &quote);
+        assert_eq!(preview.name.as_ref(), "*ST离线样本");
+        assert_eq!(preview.last, 12.0);
+        assert_eq!(preview.change_pct, -3.0);
     }
 }

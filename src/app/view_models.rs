@@ -20,16 +20,9 @@ impl StockApp {
         use crate::controller::state::RequestState;
 
         let card = self.decision_card_view_model();
-        let candles_current = self
-            .candles_code
-            .as_ref()
-            .is_some_and(|code| code == self.selected.as_ref());
-        let candle_count = if candles_current {
-            self.candles.len()
-        } else {
-            0
-        };
-        let data_step = if (self.loading || self.refreshing) && candle_count == 0 {
+        let candle_count = self.current_daily_candles().len();
+        let daily_loading = matches!(self.chart_state.daily.request.state, RequestState::Loading);
+        let data_step = if daily_loading && candle_count == 0 {
             DecisionStep {
                 title: "行情数据".into(),
                 state: DecisionStepState::Running,
@@ -47,7 +40,8 @@ impl StockApp {
                 state: DecisionStepState::Passed,
                 summary: format!(
                     "{candle_count} 根日 K · {} · 截至 {}",
-                    self.data_source, card.data_as_of
+                    self.daily_analysis_source(),
+                    card.data_as_of
                 ),
             }
         };
@@ -55,7 +49,7 @@ impl StockApp {
         let technical_step = if self.current_signal().is_none() {
             DecisionStep {
                 title: "技术规则".into(),
-                state: if self.loading {
+                state: if daily_loading {
                     DecisionStepState::Running
                 } else {
                     DecisionStepState::Blocked
@@ -154,7 +148,7 @@ impl StockApp {
             },
             None => DecisionStep {
                 title: "价位计划".into(),
-                state: if self.loading {
+                state: if daily_loading {
                     DecisionStepState::Running
                 } else {
                     DecisionStepState::Blocked
@@ -271,8 +265,7 @@ impl StockApp {
             .unwrap_or_default()
             * climate.risk_scale;
         let levels = self
-            .levels_cache
-            .as_ref()
+            .current_levels()
             .ok_or(PositionSizingError::InvalidEntry)?;
         let currency = Currency::for_code(self.selected.as_ref()).unwrap_or(Currency::Cny);
         let existing_shares = self
@@ -308,14 +301,17 @@ impl StockApp {
 
     pub(crate) fn decision_card_view_model(&self) -> DecisionCard {
         let signal = self.current_signal();
-        let levels = self.levels_cache.as_ref();
-        let symbol = self.current_symbol();
-        let name = symbol.map(|value| value.name.as_ref()).unwrap_or_default();
+        let current_levels = self.current_levels();
+        let levels = current_levels.as_ref();
+        let quote_evidence = CanonicalQuoteEvidence::from_quote(
+            self.selected.as_ref(),
+            self.quote_for_code(self.selected.as_ref()),
+        );
         let data_as_of = self
-            .candles
+            .current_daily_candles()
             .last()
             .map(|candle| candle.date.to_string())
-            .unwrap_or_else(|| chrono::Local::now().date_naive().to_string());
+            .unwrap_or_else(|| "日线时间未知".into());
         let (fundamental_gate, fundamental_source, latest_evidence_date, quality_evidence) =
             match &self.analysis_state.fundamentals.state {
                 crate::controller::state::RequestState::Ready(snapshot)
@@ -396,11 +392,32 @@ impl StockApp {
                     Vec::new(),
                 ),
             };
+        let mut unknown = fundamental_gate.unknown.clone();
+        if quote_evidence.name.is_none() {
+            unknown.push("标的名称未由行情核验，无法确认 ST 风险门槛".into());
+        }
+        if let Some((code, error)) = &self.chart_state.daily.error
+            && code == self.selected.as_ref()
+        {
+            unknown.push(format!("日线刷新失败：{error}"));
+        }
+        match self.quote_for_code(self.selected.as_ref()) {
+            Some(quote)
+                if quote.usable()
+                    && quote.effective_freshness(chrono::Utc::now().timestamp_millis())
+                        == crate::domain::market::Freshness::Live => {}
+            Some(quote) => unknown.push(format!(
+                "当前行情{}（{}）",
+                quote.freshness_label(),
+                quote.as_of_label()
+            )),
+            None => unknown.push("当前行情缺失".into()),
+        }
         let mut blockers = Vec::new();
-        if name.to_ascii_uppercase().contains("ST") {
+        if quote_evidence.st_risk {
             blockers.push("ST 风险门槛".into());
         }
-        if self.candles.len() < 30 {
+        if self.current_daily_candles().len() < 30 {
             blockers.push("历史样本不足 30 根".into());
         }
         let completeness = signal.as_ref().map(|value| value.confidence).unwrap_or(0.0);
@@ -488,7 +505,7 @@ impl StockApp {
             .as_ref()
             .map(|report| report.verdict().label(false).to_string())
             .unwrap_or_else(|| {
-                if self.candles.len() >= 120 {
+                if self.current_daily_candles().len() >= 120 {
                     "待运行样本外验证".into()
                 } else {
                     "样本不足".into()
@@ -501,7 +518,7 @@ impl StockApp {
                     .into_iter()
                     .chain(fundamental_gate.blockers)
                     .collect(),
-                unknown: fundamental_gate.unknown,
+                unknown,
             },
             factors,
             completeness_pct: completeness,
@@ -513,9 +530,12 @@ impl StockApp {
             target,
             risk_reward,
             data_as_of,
-            source: format!("行情 {}；基本面 {fundamental_source}", self.data_source),
+            source: format!(
+                "日线 {}；基本面 {fundamental_source}",
+                self.daily_analysis_source()
+            ),
             adjustment: "前复权".into(),
-            sample_size: self.candles.len(),
+            sample_size: self.current_daily_candles().len(),
             strategy_version: "technical-quality-gate-v4".into(),
             evidence_grade,
         })
@@ -524,16 +544,26 @@ impl StockApp {
     pub(crate) fn record_decision_plan_from_card(&mut self, cx: &mut gpui::Context<Self>) {
         use crate::data::journal::{self, JournalEntry, JournalKind};
 
-        let card = self
-            .analysis_state
-            .decision_card
-            .clone()
-            .unwrap_or_else(|| self.decision_card_view_model());
+        // Re-evaluate safety evidence at the save boundary, independently of preview metadata.
+        let card = self.decision_card_view_model();
         let code = self.selected.to_string();
-        let name = self
-            .current_symbol()
-            .map(|symbol| symbol.name.to_string())
-            .unwrap_or_else(|| code.clone());
+        let quote_evidence = CanonicalQuoteEvidence::from_quote(&code, self.quote_for_code(&code));
+        let name = quote_evidence
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("{code}（名称未知）"));
+        let price = quote_evidence.price;
+        let quote_note = self
+            .quote_for_code(&code)
+            .map(|quote| {
+                format!(
+                    "{} · {} · {}",
+                    quote.source,
+                    quote.as_of_label(),
+                    quote.freshness_label()
+                )
+            })
+            .unwrap_or_else(|| "行情缺失，参考价格未知".into());
         let entry_id = journal::new_id();
         let created_on = chrono::Local::now().date_naive();
         let review_on = created_on + chrono::Duration::days(28);
@@ -582,11 +612,10 @@ impl StockApp {
             followed_plan: None,
         };
         let note = format!(
-            "计划 · {trigger} · 失效：{invalidation} · 复盘：{review_on} · {}",
+            "计划 · {trigger} · 失效：{invalidation} · 复盘：{review_on} · {} · {quote_note}",
             card.strategy_version
         );
-        let price = self.current_symbol().map(|symbol| symbol.last);
-        let target = self.levels_cache.as_ref().map(|levels| levels.sell_low);
+        let target = self.current_levels().map(|levels| levels.sell_low);
         self.journal.push(JournalEntry {
             id: entry_id,
             code,
@@ -610,37 +639,19 @@ impl StockApp {
     pub(crate) fn position_review_view_model(&self) -> Option<PositionReview> {
         let code = self.selected.to_string();
         let position = self.portfolio.position_of(&code)?;
-        let candles_match = self
-            .candles_code
-            .as_ref()
-            .is_some_and(|value| value == code.as_str());
-        let symbol = self.symbols.iter().find(|item| item.code == code);
-        let last = symbol
-            .map(|item| item.last)
-            .filter(|price| price.is_finite() && *price > 0.0)
-            .or_else(|| {
-                candles_match
-                    .then(|| self.candles.last().map(|candle| candle.close))
-                    .flatten()
-                    .filter(|price| price.is_finite() && *price > 0.0)
-            })
-            .unwrap_or(0.0);
+        let quote = self.quote_for_code(&code)?;
+        let last = quote
+            .price
+            .filter(|price| price.is_finite() && *price > 0.0)?;
         let mark = crate::data::portfolio::PositionMark::from_position(position, last, 0.0);
-        let signal = candles_match.then(|| self.current_signal()).flatten();
-        let levels = candles_match.then(|| self.levels_cache.as_ref()).flatten();
+        let signal = self.current_signal();
+        let current_levels = self.current_levels();
+        let levels = current_levels.as_ref();
         let alert = self.buy_alerts.get(&code);
         let climate = self.market_climate_report();
-        let quote_stale = match &self.services.market.quotes.state {
-            crate::controller::state::RequestState::Ready(records) => records
-                .iter()
-                .find(|record| record.code == code)
-                .is_none_or(|record| {
-                    !record.usable() || record.freshness == crate::domain::market::Freshness::Stale
-                }),
-            crate::controller::state::RequestState::Idle
-            | crate::controller::state::RequestState::Loading => last <= 0.0,
-            crate::controller::state::RequestState::Failed(_) => true,
-        };
+        let quote_stale = !quote.usable()
+            || quote.effective_freshness(chrono::Utc::now().timestamp_millis())
+                != crate::domain::market::Freshness::Live;
         let weight = self
             .portfolio_risk_view(&self.portfolio_summary())
             .items
@@ -655,14 +666,10 @@ impl StockApp {
                 )
             })
         });
-        let as_of = if candles_match {
-            self.candles
-                .last()
-                .map(|candle| candle.date.to_string())
-                .unwrap_or_else(|| chrono::Local::now().date_naive().to_string())
-        } else {
-            chrono::Local::now().date_naive().to_string()
-        };
+        let as_of = chrono::Utc::now()
+            .with_timezone(&crate::domain::market::exchange_offset())
+            .date_naive()
+            .to_string();
         let range_position_60_pct = levels.and_then(|item| {
             let low = item.low_60?;
             let high = item.high_60?;
@@ -673,8 +680,8 @@ impl StockApp {
             shares: mark.position.shares,
             avg_cost: mark.position.avg_cost,
             last,
-            unrealized_pnl: mark.unrealized_pnl,
-            unrealized_pnl_pct: mark.unrealized_pnl_pct,
+            unrealized_pnl: mark.unrealized_pnl?,
+            unrealized_pnl_pct: mark.unrealized_pnl_pct?,
             realized_pnl: mark.position.realized_pnl,
             held_calendar_days: held_calendar_days(
                 self.portfolio
@@ -718,5 +725,84 @@ fn held_calendar_days(opened_on: Option<&str>, as_of: &str) -> Option<u32> {
         Some(0)
     } else {
         u32::try_from(days).ok()
+    }
+}
+
+/// Canonical evidence at safety and plan-save boundaries; preview values are display hints only.
+#[derive(Debug, PartialEq)]
+struct CanonicalQuoteEvidence {
+    name: Option<String>,
+    price: Option<f64>,
+    st_risk: bool,
+}
+
+impl CanonicalQuoteEvidence {
+    fn from_quote(code: &str, quote: Option<&crate::domain::market::QuoteRecord>) -> Self {
+        let quote = quote.filter(|quote| quote.code == code);
+        let name = quote
+            .map(|quote| quote.name.trim())
+            .filter(|name| super::helpers::is_real_name(name, code))
+            .map(str::to_string);
+        let st_risk = name
+            .as_ref()
+            .is_some_and(|name| name.to_ascii_uppercase().contains("ST"));
+        let price = quote
+            .filter(|quote| quote.usable())
+            .and_then(|quote| quote.price);
+        Self {
+            name,
+            price,
+            st_risk,
+        }
+    }
+}
+
+#[cfg(test)]
+mod canonical_quote_evidence_tests {
+    use super::CanonicalQuoteEvidence;
+    use crate::domain::market::{Availability, Freshness, Market, QuoteRecord};
+    use crate::domain::money::Currency;
+
+    fn fixture(name: &str, price: Option<f64>) -> QuoteRecord {
+        QuoteRecord {
+            code: "600519".into(),
+            market: Market::AShare,
+            currency: Currency::Cny,
+            name: name.into(),
+            price,
+            change_pct: None,
+            volume: None,
+            source: "offline fixture".into(),
+            fetched_at: 0,
+            market_time: None,
+            availability: Availability::Available,
+            freshness: Freshness::Unknown,
+        }
+    }
+
+    #[test]
+    fn canonical_st_name_controls_safety_even_without_watchlist_or_preview_name() {
+        let quote = fixture("*ST离线样本", Some(12.0));
+        let evidence = CanonicalQuoteEvidence::from_quote("600519", Some(&quote));
+        assert_eq!(evidence.name.as_deref(), Some("*ST离线样本"));
+        assert!(evidence.st_risk);
+        assert_eq!(evidence.price, Some(12.0));
+    }
+
+    #[test]
+    fn missing_invalid_or_other_instrument_quote_never_saves_zero_as_plan_price() {
+        let missing = CanonicalQuoteEvidence::from_quote("600519", None);
+        assert_eq!(missing.name, None);
+        assert_eq!(missing.price, None);
+        for price in [None, Some(0.0), Some(-1.0), Some(f64::NAN)] {
+            let quote = fixture("600519", price);
+            let evidence = CanonicalQuoteEvidence::from_quote("600519", Some(&quote));
+            assert_eq!(evidence.name, None);
+            assert_eq!(evidence.price, None);
+        }
+        let other =
+            CanonicalQuoteEvidence::from_quote("000001", Some(&fixture("样本", Some(12.0))));
+        assert_eq!(other.name, None);
+        assert_eq!(other.price, None);
     }
 }

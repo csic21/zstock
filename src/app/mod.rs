@@ -52,7 +52,7 @@ use crate::data::levels;
 use crate::data::limitup::{LimitUpHit, LimitVerdict};
 use crate::data::market as market_data;
 use crate::data::market_analysis as market_analysis_data;
-use crate::data::portfolio::{Portfolio, TradeSide};
+use crate::data::portfolio::Portfolio;
 use crate::data::radar::{RadarHit, RadarStrategy};
 use crate::data::scout::ScoutPick;
 use crate::data::signals;
@@ -229,6 +229,11 @@ pub struct AppState {
     palette_focus: FocusHandle,
     /// Search results for palette (remote + local).
     palette_hits: Vec<Symbol>,
+    palette_search: symbols::PaletteSearchState,
+    palette_scroll: gpui::ScrollHandle,
+    watchlist_scroll: gpui::ScrollHandle,
+    watchlist_undo: Option<symbols::RemovedWatchlistEntry>,
+    preview_symbol: Option<Symbol>,
     filtered_local: Vec<usize>,
     left_width: f32,
     bottom_height: f32,
@@ -380,7 +385,8 @@ pub struct AppState {
     /// 本地持仓（交易流水 + 可选现金）。
     portfolio: Portfolio,
     /// 打开中的买卖表单方向；`None` = 关闭。
-    trade_form_side: Option<TradeSide>,
+    trade_form: Option<crate::data::portfolio::LocalTradeForm>,
+    trade_feedback: Option<SharedString>,
     trade_shares_input: Entity<InputState>,
     trade_price_input: Entity<InputState>,
     trade_fee_input: Entity<InputState>,
@@ -442,18 +448,24 @@ impl StockApp {
             })
             .collect();
 
-        let selected_norm = normalize_code(&cfg.selected).unwrap_or_else(|| cfg.selected.clone());
-        let selected = if symbols.iter().any(|s| s.code == selected_norm) {
-            shared(selected_norm)
-        } else {
-            symbols
-                .first()
-                .map(|s| shared(s.code.clone()))
-                .unwrap_or_else(|| shared("600519"))
-        };
+        let selected = normalize_code(&cfg.selected)
+            .map(shared)
+            .or_else(|| symbols.first().map(|symbol| shared(symbol.code.clone())))
+            .unwrap_or_else(|| shared("600519"));
+        let preview_symbol = (!symbols
+            .iter()
+            .any(|symbol| symbol.code == selected.as_ref()))
+        .then(|| Symbol {
+            code: selected.to_string(),
+            name: selected.clone(),
+            last: 0.0,
+            change_pct: 0.0,
+            volume: 0,
+            board: board_for_code(selected.as_ref()),
+        });
 
         let palette_query =
-            cx.new(|cx| InputState::new(window, cx).placeholder("搜索代码 / 名称，回车添加自选…"));
+            cx.new(|cx| InputState::new(window, cx).placeholder("搜索代码 / 名称，回车查看…"));
         let palette_focus = cx.focus_handle();
         let filtered_local: Vec<usize> = (0..symbols.len()).collect();
 
@@ -728,6 +740,11 @@ impl StockApp {
                 palette_query,
                 palette_focus,
                 palette_hits: Vec::new(),
+                palette_search: Default::default(),
+                palette_scroll: Default::default(),
+                watchlist_scroll: Default::default(),
+                watchlist_undo: None,
+                preview_symbol,
                 filtered_local,
                 left_width: cfg.left_width,
                 bottom_height: cfg.bottom_height,
@@ -821,7 +838,8 @@ impl StockApp {
                 position_risk_pct_input,
                 buy_alerts: cfg.buy_alerts.clone(),
                 portfolio,
-                trade_form_side: None,
+                trade_form: None,
+                trade_feedback: None,
                 trade_shares_input,
                 trade_price_input,
                 trade_fee_input,
@@ -851,21 +869,6 @@ impl StockApp {
         } else {
             state::PrimaryTask::Today
         };
-
-        // 历史持仓代码自动并入自选，便于行情轮询。
-        let before = app.symbols.len();
-        let open_codes: Vec<(String, String)> = app
-            .portfolio
-            .positions()
-            .into_iter()
-            .map(|p| (p.code, p.name))
-            .collect();
-        for (code, name) in open_codes {
-            app.ensure_in_watchlist(&code, &name, 0.0);
-        }
-        if app.symbols.len() != before {
-            app.persist();
-        }
 
         if let Some(error) = storage::take_storage_error() {
             app.status = shared(error);
@@ -960,22 +963,16 @@ impl Render for StockApp {
                 this.dismiss_overlay(cx);
             }))
             .on_action(cx.listener(|this, _: &SelectPrevSymbol, _w, cx| {
-                if this.settings_open {
-                    return;
-                }
                 if this.palette_open {
                     this.palette_move(-1, cx);
-                } else {
+                } else if !this.settings_open {
                     this.select_adjacent_symbol(-1, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &SelectNextSymbol, _w, cx| {
-                if this.settings_open {
-                    return;
-                }
                 if this.palette_open {
                     this.palette_move(1, cx);
-                } else {
+                } else if !this.settings_open {
                     this.select_adjacent_symbol(1, cx);
                 }
             }))
@@ -1102,10 +1099,9 @@ impl Render for StockApp {
                     )
                     .into_any_element()
             })
-            .when(
-                self.palette_open && !self.settings_open && !self.market_analysis_open,
-                |this| this.child(self.render_palette(cx)),
-            )
+            .when(self.palette_open, |this| {
+                this.child(self.render_palette(cx))
+            })
             .children(Root::render_dialog_layer(window, cx));
         self.runtime_state
             .performance
@@ -1454,7 +1450,7 @@ mod layout_regression_tests {
     /// Shared window/App setup for layout regression tests: isolated HOME and a
     /// deterministic default config (work mode off, fixed dock) so results do
     /// not depend on the developer's real `config.json`.
-    fn test_window(cx: &mut TestAppContext, w: f32, h: f32) -> VisualTestContext {
+    pub(super) fn test_window(cx: &mut TestAppContext, w: f32, h: f32) -> VisualTestContext {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -1467,9 +1463,10 @@ mod layout_regression_tests {
         std::fs::create_dir_all(&tmp).expect("create temp home");
         unsafe {
             std::env::set_var("HOME", &tmp);
+            std::env::set_var("ZSTOCK_DATA_DIR", &tmp);
         }
         // Resolve config dir after HOME is set (macOS/Linux paths differ).
-        let cfg_dir = dirs::data_dir().expect("data_dir").join("stock-analysis");
+        let cfg_dir = tmp.clone();
         std::fs::create_dir_all(&cfg_dir).expect("create temp config dir");
         let cfg = crate::storage::AppConfig::default();
         let json = serde_json::to_string_pretty(&cfg).expect("serialize test config");
@@ -1971,3 +1968,6 @@ mod layout_regression_tests {
         assert!(update_result.is_ok(), "industry drill should succeed");
     }
 }
+
+#[cfg(test)]
+mod ux_regression_tests;

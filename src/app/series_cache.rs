@@ -35,11 +35,11 @@ impl SeriesCache {
 
     /// Cache key for day / minute-K series (not intraday points).
     pub(crate) fn kline_key(kind: ChartKind, code: &str) -> Option<String> {
-        match kind {
-            ChartKind::DayK => Some(format!("d:{code}")),
-            ChartKind::MinuteK(p) => Some(format!("{}:{code}", p.param())),
-            ChartKind::Intraday => None,
+        if matches!(kind, ChartKind::Intraday) {
+            return None;
         }
+        kind.series_identity(code)
+            .map(|identity| identity.storage_key())
     }
 
     pub(crate) fn put_klines(&mut self, key: String, entry: CachedKlines) {
@@ -98,6 +98,15 @@ impl SeriesCache {
             // and the series end date still matches (same session snapshot).
             if old_last == new_last {
                 let mut merged = old.clone();
+                for candle in &entry.candles {
+                    if let Some(old_candle) = merged
+                        .candles
+                        .iter_mut()
+                        .find(|old| old.date == candle.date)
+                    {
+                        *old_candle = candle.clone();
+                    }
+                }
                 if !entry.name.is_empty() {
                     merged.name = entry.name;
                 }
@@ -112,7 +121,12 @@ impl SeriesCache {
     }
 
     pub(crate) fn put_minute(&mut self, code: &str, series: MinuteSeries) {
-        let key = code.to_string();
+        let Some(key) = ChartKind::Intraday
+            .series_identity(code)
+            .map(|identity| identity.storage_key())
+        else {
+            return;
+        };
         if self.minutes.contains_key(&key) {
             self.minute_order.retain(|k| k != &key);
         }
@@ -126,7 +140,8 @@ impl SeriesCache {
     }
 
     pub(crate) fn get_minute(&self, code: &str) -> Option<&MinuteSeries> {
-        self.minutes.get(code)
+        let key = ChartKind::Intraday.series_identity(code)?.storage_key();
+        self.minutes.get(&key)
     }
 }
 
@@ -180,10 +195,16 @@ mod tests {
                 },
             );
         }
-        assert!(c.get_klines("d:000000").is_none());
         assert!(
-            c.get_klines(&format!("d:{:06}", MAX_KLINE_ENTRIES + 4))
-                .is_some()
+            c.get_klines(&SeriesCache::kline_key(ChartKind::DayK, "000000").unwrap())
+                .is_none()
+        );
+        assert!(
+            c.get_klines(
+                &SeriesCache::kline_key(ChartKind::DayK, &format!("{:06}", MAX_KLINE_ENTRIES + 4))
+                    .unwrap()
+            )
+            .is_some()
         );
     }
 
@@ -207,5 +228,50 @@ mod tests {
             c.lookup_klines(ChartKind::MinuteK(MinutePeriod::M5), "600519", 30)
                 .is_some()
         );
+    }
+    #[test]
+    fn cache_identity_cannot_cross_asset_type_adjustment_or_bar_kind() {
+        use crate::domain::market::{Adjustment, AssetType};
+        let daily = ChartKind::DayK.series_identity("000001").unwrap();
+        let mut index = daily.clone();
+        index.instrument.asset_type = AssetType::Index;
+        assert_ne!(daily.storage_key(), index.storage_key());
+        let mut unadjusted = daily.clone();
+        unadjusted.adjustment = Adjustment::None;
+        assert_ne!(daily.storage_key(), unadjusted.storage_key());
+        assert_ne!(
+            daily.storage_key(),
+            ChartKind::MinuteK(MinutePeriod::M5)
+                .series_identity("000001")
+                .unwrap()
+                .storage_key()
+        );
+    }
+
+    #[test]
+    fn shorter_same_day_refresh_updates_overlap_without_discarding_history() {
+        let mut cache = SeriesCache::new();
+        cache.put_klines_smart(
+            ChartKind::DayK,
+            "600519",
+            CachedKlines {
+                name: "fixture".into(),
+                source: "old".into(),
+                candles: vec![candle("2026-10-08", 10.0), candle("2026-10-09", 11.0)],
+            },
+        );
+        cache.put_klines_smart(
+            ChartKind::DayK,
+            "600519",
+            CachedKlines {
+                name: "fixture".into(),
+                source: "new".into(),
+                candles: vec![candle("2026-10-09", 12.0)],
+            },
+        );
+        let restored = cache.lookup_klines(ChartKind::DayK, "600519", 0).unwrap();
+        assert_eq!(restored.candles.len(), 2);
+        assert_eq!(restored.candles[1].close, 12.0);
+        assert_eq!(restored.source, "new");
     }
 }

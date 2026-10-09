@@ -14,10 +14,7 @@ impl StockApp {
     /// Indicator and strategy-evidence views for the active point-in-time series.
     pub(crate) fn render_indicators_detail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let work = self.work_mode;
-        let candles_match = self
-            .candles_code
-            .as_ref()
-            .is_some_and(|c| c == self.selected.as_ref());
+        let candles_match = self.visible_series_matches_selection();
         let kline_ok = candles_match && !matches!(self.chart_kind, ChartKind::Intraday);
 
         h_flex()
@@ -30,6 +27,16 @@ impl StockApp {
                     .min_w(px(140.))
                     .flex_1()
                     .child(section_title(if work { "Moving avg" } else { "均线" }, cx))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if work {
+                                self.chart_label()
+                            } else {
+                                format!("当前图表周期：{}", self.chart_label())
+                            }),
+                    )
                     .child(detail_row(
                         if work { "L1" } else { "MA5" },
                         &if kline_ok {
@@ -117,10 +124,7 @@ impl StockApp {
     }
 
     pub(crate) fn render_macd_detail_col(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let candles_match = self
-            .candles_code
-            .as_ref()
-            .is_some_and(|c| c == self.selected.as_ref())
+        let candles_match = self.visible_series_matches_selection()
             && !matches!(self.chart_kind, ChartKind::Intraday);
         let (dif, dea, hist) = self.macd.value_at(self.macd.dif.len().saturating_sub(1));
         let fmt = |v: Option<f64>| v.map(|n| format!("{n:.3}")).unwrap_or_else(|| "--".into());
@@ -165,10 +169,7 @@ impl StockApp {
     }
 
     pub(crate) fn render_boll_detail_col(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let candles_match = self
-            .candles_code
-            .as_ref()
-            .is_some_and(|c| c == self.selected.as_ref())
+        let candles_match = self.visible_series_matches_selection()
             && !matches!(self.chart_kind, ChartKind::Intraday);
         let (up, mid, low) = self.boll.value_at(self.boll.mid.len().saturating_sub(1));
         let fmt = |v: Option<f64>| {
@@ -217,16 +218,18 @@ impl StockApp {
         let card = self.decision_card_view_model();
         let levels = self.current_levels();
         let last_price = self
-            .current_symbol()
-            .map(|symbol| symbol.last)
-            .filter(|price| price.is_finite() && *price > 0.0)
-            .or_else(|| levels.as_ref().map(|levels| levels.close))
-            .unwrap_or_default();
+            .quote_for_code(self.selected.as_ref())
+            .filter(|quote| {
+                quote.usable()
+                    && quote.effective_freshness(chrono::Utc::now().timestamp_millis())
+                        == crate::domain::market::Freshness::Live
+            })
+            .and_then(|quote| quote.price);
         let playbook = StrategyPlaybook::build(
             &card,
             signal.as_ref(),
-            levels.as_ref(),
-            last_price,
+            last_price.and(levels.as_ref()),
+            last_price.unwrap_or_default(),
             self.backtest_report.as_ref(),
             work,
         );
@@ -236,7 +239,7 @@ impl StockApp {
             PlaybookOutcome::NoAction => cx.theme().danger,
             PlaybookOutcome::NeedEvidence => cx.theme().muted_foreground,
         };
-        let can_backtest = matches!(self.chart_kind, ChartKind::DayK) && self.candles.len() >= 60;
+        let can_backtest = self.current_daily_candles().len() >= 60;
         let active_rule = self.backtest_active_rule;
 
         v_flex()
@@ -633,9 +636,9 @@ impl StockApp {
                                     .child(if can_backtest {
                                         if work { "Choose a rule or compare all three." } else { "选择规则或一次比较三条；当前标的结果不能替代跨股票验证。" }
                                     } else if work {
-                                        "Switch to daily K and load at least 60 bars."
+                                        "Daily evidence needs at least 60 bars; chart period is independent."
                                     } else {
-                                        "请切换到日 K 并加载至少 60 根；分钟 K 不用于这组日线规则。"
+                                        "日线分析至少需要 60 根；图表周期不会改变这组日线规则的输入。"
                                     })
                                     .into_any_element()
                             }),

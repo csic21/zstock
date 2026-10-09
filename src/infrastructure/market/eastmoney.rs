@@ -1,7 +1,7 @@
 use crate::data;
 use crate::domain::fundamentals::{FundamentalSnapshot, ReportedMetric};
 use crate::domain::market::{
-    Adjustment, Availability, CandleRecord, Freshness, KlineSeries, Market, QuoteRecord, SearchHit,
+    Adjustment, Availability, CandleRecord, KlineSeries, Market, QuoteRecord, SearchHit,
 };
 use crate::services::fundamentals::FundamentalsProvider;
 use crate::services::market_data::{
@@ -23,7 +23,6 @@ impl QuoteProvider for EastmoneyProvider {
     }
 
     fn fetch_quotes(&self, codes: &[String]) -> Result<Vec<QuoteRecord>, ProviderError> {
-        let fetched_at = now_millis();
         data::eastmoney::fetch_quotes(codes)
             .map(|values| {
                 values
@@ -35,20 +34,20 @@ impl QuoteProvider for EastmoneyProvider {
                         Some(QuoteRecord {
                             code: value.code,
                             market,
-                            currency: market.currency(),
+                            currency: value.currency,
                             name: value.name,
                             price,
                             change_pct: value.change_pct.is_finite().then_some(value.change_pct),
                             volume: Some(value.volume),
                             source: PROVIDER.into(),
-                            fetched_at,
-                            market_time: None,
+                            fetched_at: value.fetched_at,
+                            market_time: value.market_time,
                             availability: if price.is_some() {
-                                Availability::Available
+                                value.availability
                             } else {
                                 Availability::Invalid
                             },
-                            freshness: Freshness::Live,
+                            freshness: value.freshness,
                         })
                     })
                     .collect()

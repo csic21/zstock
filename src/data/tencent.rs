@@ -154,6 +154,12 @@ fn parse_quote_body(body: &str) -> Result<Vec<QuoteTick>> {
         };
         let parse_f = |i: usize| -> f64 { f.get(i).and_then(|s| s.parse().ok()).unwrap_or(0.0) };
         let last = parse_f(3);
+        let fetched_at = chrono::Utc::now().timestamp_millis();
+        let market_time = f
+            .get(30)
+            .filter(|value| crate::domain::market::parse_market_timestamp(value).is_some())
+            .map(|value| (*value).to_string());
+        let freshness = Freshness::from_market_time(market_time.as_deref(), fetched_at);
         out.push(QuoteTick {
             code,
             name: f[1].trim().to_string(),
@@ -163,14 +169,14 @@ fn parse_quote_body(body: &str) -> Result<Vec<QuoteTick>> {
             change_pct: parse_f(32),
             currency,
             source: "腾讯财经".into(),
-            fetched_at: chrono::Utc::now().timestamp_millis(),
-            market_time: None,
+            fetched_at,
+            market_time,
             availability: if last > 0.0 {
                 Availability::Available
             } else {
                 Availability::Invalid
             },
-            freshness: Freshness::Live,
+            freshness,
         });
     }
     Ok(out)
@@ -570,6 +576,33 @@ fn urlencoding_minimal(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quote_timestamp_is_preserved_and_absence_is_unknown() {
+        let mut fields = vec![""; 35];
+        fields[1] = "fixture";
+        fields[2] = "600519";
+        fields[3] = "10.5";
+        fields[30] = "20261009100000";
+        let body = format!("v_sh600519=\"{}\";", fields.join("~"));
+        let ticks = parse_quote_body(&body).unwrap();
+        assert_eq!(ticks[0].market_time.as_deref(), Some("20261009100000"));
+        fields[30] = "";
+        let body = format!("v_sh600519=\"{}\";", fields.join("~"));
+        let ticks = parse_quote_body(&body).unwrap();
+        assert_eq!(ticks[0].freshness, Freshness::Unknown);
+        assert!(ticks[0].market_time.is_none());
+        fields[2] = "00700";
+        fields[30] = "2026/10/09 10:00:00";
+        let body = format!("v_hk00700=\"{}\";", fields.join("~"));
+        let ticks = parse_quote_body(&body).unwrap();
+        assert_eq!(ticks[0].currency, Currency::Hkd);
+        assert_eq!(ticks[0].market_time.as_deref(), Some("2026/10/09 10:00:00"));
+        assert_eq!(
+            crate::domain::market::parse_market_timestamp(ticks[0].market_time.as_deref().unwrap()),
+            crate::domain::market::parse_market_timestamp("2026-10-09T02:00:00Z")
+        );
+    }
 
     #[test]
     #[ignore = "requires public market-data network"]

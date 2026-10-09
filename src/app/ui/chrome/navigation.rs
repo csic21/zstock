@@ -120,6 +120,7 @@ impl StockApp {
                     bar.child(
                         h_flex()
                             .p_0p5()
+                            .flex_shrink_0()
                             .gap_0p5()
                             .rounded(cx.theme().radius)
                             .border_1()
@@ -176,7 +177,7 @@ impl StockApp {
                                 .when(work, |b| b.primary())
                                 .when(!work, |b| b.ghost())
                                 .when(work, |b| b.label("Focus"))
-                                .when(!work, |b| b.label("专注"))
+
                                 .tooltip(if work {
                                     "Exit focus layout · ⌘⇧W"
                                 } else {
@@ -192,7 +193,7 @@ impl StockApp {
                                 .ghost()
                                 .xsmall()
                                 .when(work, |b| b.label("Sync"))
-                                .when(!work, |b| b.label("刷新"))
+
                                 .tooltip(if work { "Sync" } else { "刷新全部行情" })
                                 .on_click(cx.listener(|this, _, _w, cx| {
                                     this.refresh_all(cx);
@@ -218,7 +219,7 @@ impl StockApp {
                                 .icon(IconName::Search)
                                 .ghost()
                                 .xsmall()
-                                .label(if work { "Find" } else { "搜索" })
+                                .when(work, |button| button.label("Find"))
                                 .tooltip(if work { "Find" } else { "搜索股票或跳转功能 · ⌘K" })
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.toggle_palette(window, cx);
@@ -237,9 +238,7 @@ impl StockApp {
                                 .when(self.settings_open, |b| {
                                     b.label(if work { "Back" } else { "返回" })
                                 })
-                                .when(!self.settings_open, |b| {
-                                    b.label(if work { "Prefs" } else { "设置" })
-                                })
+                                .when(!self.settings_open && work, |b| b.label("Prefs"))
                                 .tooltip(if work {
                                     "Preferences · ⌘,"
                                 } else {

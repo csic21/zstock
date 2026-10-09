@@ -5,11 +5,14 @@ use gpui::{
 use gpui_component::{
     ActiveTheme, IconName, Sizable, StyledExt,
     button::{Button, ButtonVariants},
-    h_flex, v_flex,
+    h_flex,
+    tooltip::Tooltip,
+    v_flex,
 };
 
 use crate::app::{LeftTab, StockApp};
 use crate::data::groups::WatchTag;
+use crate::domain::market::Freshness;
 use crate::model::{format_price, shared};
 use crate::storage::WatchlistSort;
 
@@ -19,6 +22,7 @@ impl StockApp {
         let work = self.work_mode;
         let sort = self.watchlist_sort;
         let display_order = self.watchlist_display_order();
+        let now_millis = chrono::Utc::now().timestamp_millis();
         v_flex()
             .flex_1()
             .min_h_0()
@@ -102,6 +106,7 @@ impl StockApp {
             .child(
                 v_flex()
                     .id("watchlist-scroll")
+                    .track_scroll(&self.watchlist_scroll)
                     .flex_1()
                     .overflow_y_scroll()
                     .when(display_order.is_empty(), |col| {
@@ -125,18 +130,67 @@ impl StockApp {
                         let is_selected = sym.code == selected.as_ref();
                         let code = shared(sym.code.clone());
                         let code_show = self.display_code(&sym.code);
+                        let quote = self.quote_for_code(&sym.code);
+                        let usable_quote = quote.filter(|quote| quote.usable());
+                        let freshness = quote.map(|quote| quote.effective_freshness(now_millis));
                         let name_show = if work {
                             shared("series")
                         } else {
-                            sym.name.clone()
+                            quote
+                                .map(|quote| quote.name.as_str())
+                                .filter(|name| !name.is_empty())
+                                .map(|name| shared(name.to_string()))
+                                .unwrap_or_else(|| sym.name.clone())
                         };
                         let code_for_tag = code.clone();
                         let code_rm = code.clone();
                         let name_rm = name_show.clone();
                         let code_tip = code_show.clone();
-                        let last = format_price(sym.last);
-                        let chg = self.format_change(sym.change_pct);
-                        let chg_color = self.chg_color(sym.is_up(), cx);
+                        let last = usable_quote
+                            .and_then(|quote| quote.price)
+                            .map(format_price)
+                            .unwrap_or_else(|| "—".into());
+                        let change = usable_quote
+                            .and_then(|quote| quote.change_pct)
+                            .filter(|change| change.is_finite());
+                        let chg = change
+                            .map(|change| self.format_change(change))
+                            .unwrap_or_else(|| "—".into());
+                        let chg_color = if freshness == Some(Freshness::Live) {
+                            change
+                                .map(|change| self.chg_color(change >= 0.0, cx))
+                                .unwrap_or(cx.theme().muted_foreground)
+                        } else {
+                            cx.theme().muted_foreground
+                        };
+                        let freshness_label = match (usable_quote.is_some(), freshness, work) {
+                            (false, _, false) => "缺失",
+                            (false, _, true) => "N/A",
+                            (_, Some(Freshness::Live), false) => "实时",
+                            (_, Some(Freshness::Live), true) => "Live",
+                            (_, Some(Freshness::Delayed), false) => "延迟",
+                            (_, Some(Freshness::Delayed), true) => "Late",
+                            (_, Some(Freshness::Stale), false) => "过期",
+                            (_, Some(Freshness::Stale), true) => "Stale",
+                            (_, _, false) => "时效未知",
+                            (_, _, true) => "Unknown",
+                        };
+                        let quote_tooltip = quote
+                            .map(|quote| {
+                                format!(
+                                    "{} · {} · {}",
+                                    if work { "Feed" } else { quote.source.as_str() },
+                                    quote.as_of_label(),
+                                    freshness_label
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                if work {
+                                    "No quote received".into()
+                                } else {
+                                    "尚未取得有效行情 · 价格与涨跌幅未知".into()
+                                }
+                            });
                         let board = if work {
                             shared("svc")
                         } else {
@@ -149,11 +203,15 @@ impl StockApp {
                         div()
                             .id(("watch-row", ix))
                             .h(px(52.))
+                            .flex_shrink_0()
                             .px_3()
                             .flex()
                             .items_center()
                             .gap_2()
                             .cursor_pointer()
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(quote_tooltip.clone()).build(window, cx)
+                            })
                             .border_b_1()
                             .border_color(cx.theme().border.opacity(0.30))
                             .when(is_selected, |this| {
@@ -199,11 +257,33 @@ impl StockApp {
                                             ),
                                     )
                                     .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .truncate()
-                                            .child(name_show),
+                                        h_flex()
+                                            .gap_1()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .truncate()
+                                                    .child(name_show),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .flex_shrink_0()
+                                                    .text_color(
+                                                        if freshness == Some(Freshness::Live)
+                                                            && usable_quote.is_some()
+                                                        {
+                                                            cx.theme().muted_foreground
+                                                        } else {
+                                                            cx.theme().warning
+                                                        },
+                                                    )
+                                                    .child(freshness_label),
+                                            ),
                                     ),
                             )
                             .child(
@@ -241,6 +321,7 @@ impl StockApp {
                                         "循环标记：长线 → 短线 → 观察 → 清除"
                                     })
                                     .on_click(cx.listener(move |this, _, _w, cx| {
+                                        cx.stop_propagation();
                                         this.select_symbol(code_for_tag.clone(), cx);
                                         this.cycle_selected_watch_tag(cx);
                                     })),
@@ -253,14 +334,49 @@ impl StockApp {
                                     .tooltip(if work {
                                         format!("Remove {code_tip}")
                                     } else {
-                                        format!("删除 {name_rm}")
+                                        format!("移出自选 {name_rm} · 保留研究数据")
                                     })
                                     .on_click(cx.listener(move |this, _, _w, cx| {
+                                        cx.stop_propagation();
                                         this.remove_symbol(&code_rm, cx);
                                     })),
                             )
                     })),
             )
+            .when_some(self.watchlist_undo.as_ref(), |column, removed| {
+                column.child(
+                    h_flex()
+                        .px_2()
+                        .py_1()
+                        .gap_1()
+                        .items_center()
+                        .flex_shrink_0()
+                        .border_t_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .truncate()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if work {
+                                    "Removed · data kept".to_string()
+                                } else {
+                                    format!("已移出 {} · 数据保留", removed.symbol.code)
+                                }),
+                        )
+                        .child(
+                            Button::new("watchlist-undo")
+                                .ghost()
+                                .xsmall()
+                                .label(if work { "Undo" } else { "撤销" })
+                                .on_click(
+                                    cx.listener(|this, _, _window, cx| this.undo_remove_symbol(cx)),
+                                ),
+                        ),
+                )
+            })
             .child(
                 h_flex()
                     .h(px(38.))

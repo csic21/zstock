@@ -32,12 +32,13 @@ impl StockApp {
         if order.is_empty() {
             return;
         }
-        let cur = order
+        let current = order
             .iter()
-            .position(|&ix| self.symbols[ix].code == self.selected.as_ref())
-            .unwrap_or(0);
-        let n = order.len() as i32;
-        let next = ((cur as i32 + delta).rem_euclid(n)) as usize;
+            .position(|&ix| self.symbols[ix].code == self.selected.as_ref());
+        let Some(next) = adjacent_selection_index(current, order.len(), delta) else {
+            return;
+        };
+        self.watchlist_scroll.scroll_to_item(next);
         let code = shared(self.symbols[order[next]].code.clone());
         self.select_symbol(code, cx);
     }
@@ -145,7 +146,7 @@ impl StockApp {
                 if on {
                     "Find service or id…"
                 } else {
-                    "搜索代码 / 名称，回车添加自选…"
+                    "搜索代码 / 名称，回车预览…"
                 },
                 window,
                 cx,
@@ -703,40 +704,23 @@ impl StockApp {
     /// 当前展示的 AI 点评对应的缓存键（`code@最后一根 K 日期`）。
     /// 与 `ai_key` 不一致时，详情栏按「未生成」展示，避免串股。
     pub(crate) fn ai_current_key(&self) -> Option<String> {
-        let matched = self
-            .candles_code
-            .as_ref()
-            .is_some_and(|c| c == self.selected.as_ref());
-        if !matched {
-            return None;
-        }
-        let date = self.candles.last()?.date.to_string();
+        let date = self.current_daily_candles().last()?.date.to_string();
         Some(format!("{}@{date}", self.selected))
     }
 
     pub(crate) fn request_ai_commentary(&mut self, cx: &mut Context<Self>) {
-        let Some(last) = self.candles.last() else {
+        let candles = self.current_daily_candles();
+        let Some(last) = candles.last() else {
             self.ai_panel = AiPanelState::Idle;
             cx.notify();
             return;
         };
-        let matched = self
-            .candles_code
-            .as_ref()
-            .is_some_and(|c| c == self.selected.as_ref());
-        if !matched {
-            self.ai_panel = AiPanelState::Idle;
-            cx.notify();
-            return;
-        }
         let code = self.selected.to_string();
         let name = self
-            .symbols
-            .iter()
-            .find(|s| s.code == code)
-            .map(|s| s.name.to_string())
+            .current_symbol()
+            .map(|symbol| symbol.name.to_string())
             .unwrap_or_default();
-        let Some(snap) = ai::build_snapshot(&self.candles, &code, &name) else {
+        let Some(snap) = ai::build_snapshot(candles, &code, &name) else {
             self.ai_panel = AiPanelState::Ready {
                 text: shared("数据不足：策略雷达需要至少 20 根有效日 K。"),
                 source: AiSource::Local,
@@ -875,7 +859,7 @@ impl StockApp {
     pub(crate) fn toggle_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_open = !self.settings_open;
         if self.settings_open {
-            self.palette_open = false;
+            self.close_palette(cx);
             self.market_analysis_open = false;
             // Re-enter on General so the page feels fresh each open.
             self.settings_section = SettingsSection::General;
@@ -1048,4 +1032,38 @@ fn is_work_peek_keystroke(ks: &gpui::Keystroke) -> bool {
         return false;
     }
     matches!(ks.key.as_str(), "`" | "space")
+}
+
+/// When filtering hides the current selection, Down starts at the first row
+/// and Up starts at the last row instead of skipping the first matching item.
+fn adjacent_selection_index(current: Option<usize>, count: usize, delta: i32) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    Some(match current.filter(|&index| index < count) {
+        Some(index) => ((index as i64 + i64::from(delta)).rem_euclid(count as i64)) as usize,
+        None if delta < 0 => count - 1,
+        None => 0,
+    })
+}
+
+#[cfg(test)]
+mod keyboard_navigation_tests {
+    use super::adjacent_selection_index;
+
+    #[test]
+    fn filtered_selection_starts_at_nearest_edge() {
+        assert_eq!(adjacent_selection_index(None, 4, 1), Some(0));
+        assert_eq!(adjacent_selection_index(None, 4, -1), Some(3));
+        assert_eq!(adjacent_selection_index(Some(99), 4, 1), Some(0));
+        assert_eq!(adjacent_selection_index(None, 0, 1), None);
+        assert_eq!(adjacent_selection_index(Some(0), 1, -1), Some(0));
+    }
+
+    #[test]
+    fn existing_selection_wraps_in_display_order() {
+        assert_eq!(adjacent_selection_index(Some(0), 4, -1), Some(3));
+        assert_eq!(adjacent_selection_index(Some(3), 4, 1), Some(0));
+        assert_eq!(adjacent_selection_index(Some(1), 4, 1), Some(2));
+    }
 }

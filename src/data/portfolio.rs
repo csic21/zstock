@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::domain::market::{Freshness, QuoteRecord};
 use crate::domain::money::{Currency, Money};
 
 pub const PORTFOLIO_SCHEMA_VERSION: u32 =
@@ -134,32 +135,34 @@ impl Position {
     }
 }
 
-/// 持仓 + 最新价标记。
+/// 持仓 + 最新价标记。没有行情时，价格与浮盈亏保持未知，不能用成本冒充。
 #[derive(Debug, Clone)]
 pub struct PositionMark {
     pub position: Position,
-    pub last: f64,
+    pub last: Option<f64>,
     /// 当日涨跌幅（来自行情，非持仓盈亏）。
     pub day_change_pct: f64,
-    pub market_value: f64,
-    pub unrealized_pnl: f64,
-    pub unrealized_pnl_pct: f64,
+    pub market_value: Option<f64>,
+    pub unrealized_pnl: Option<f64>,
+    pub unrealized_pnl_pct: Option<f64>,
+    pub quote_freshness: Option<Freshness>,
+    pub quote_as_of: Option<String>,
 }
 
 impl PositionMark {
     pub fn from_position(pos: Position, last: f64, day_change_pct: f64) -> Self {
-        let last = if last.is_finite() && last > 0.0 {
-            last
-        } else {
-            pos.avg_cost
-        };
-        let market_value = pos.shares * last;
-        let unrealized_pnl = market_value - pos.total_cost;
-        let unrealized_pnl_pct = if pos.total_cost > 1e-9 {
-            unrealized_pnl / pos.total_cost * 100.0
-        } else {
-            0.0
-        };
+        let last = (last.is_finite() && last > 0.0).then_some(last);
+        let market_value = last
+            .map(|price| pos.shares * price)
+            .filter(|value| value.is_finite());
+        let unrealized_pnl = market_value.map(|value| value - pos.total_cost);
+        let unrealized_pnl_pct = unrealized_pnl.map(|pnl| {
+            if pos.total_cost > 1e-9 {
+                pnl / pos.total_cost * 100.0
+            } else {
+                0.0
+            }
+        });
         Self {
             position: pos,
             last,
@@ -167,6 +170,72 @@ impl PositionMark {
             market_value,
             unrealized_pnl,
             unrealized_pnl_pct,
+            quote_freshness: None,
+            quote_as_of: None,
+        }
+    }
+
+    pub fn from_quote(pos: Position, quote: Option<&QuoteRecord>) -> Self {
+        let quote = quote.filter(|quote| {
+            quote.code == pos.code && quote.currency == pos.currency && quote.usable()
+        });
+        let mut mark = Self::from_position(
+            pos,
+            quote.and_then(|quote| quote.price).unwrap_or(0.0),
+            quote.and_then(|quote| quote.change_pct).unwrap_or(0.0),
+        );
+        mark.quote_freshness =
+            quote.map(|quote| quote.effective_freshness(chrono::Utc::now().timestamp_millis()));
+        mark.quote_as_of = quote.map(|quote| quote.as_of_label().to_string());
+        mark
+    }
+
+    pub fn quote_is_uncertain(&self) -> bool {
+        self.last.is_none()
+            || !matches!(
+                self.quote_freshness,
+                Some(Freshness::Live | Freshness::Delayed)
+            )
+    }
+
+    pub fn valuation_label(&self, work: bool) -> &'static str {
+        if self.market_value.is_none() {
+            if work {
+                "Quote unavailable"
+            } else {
+                "行情缺失 · 估值未知"
+            }
+        } else {
+            match self.quote_freshness {
+                Some(Freshness::Live) => {
+                    if work {
+                        "Live quote"
+                    } else {
+                        "实时行情"
+                    }
+                }
+                Some(Freshness::Delayed) => {
+                    if work {
+                        "Delayed quote"
+                    } else {
+                        "延迟行情"
+                    }
+                }
+                Some(Freshness::Stale) => {
+                    if work {
+                        "Stale valuation"
+                    } else {
+                        "过期行情估值"
+                    }
+                }
+                _ => {
+                    if work {
+                        "Quote time unknown"
+                    } else {
+                        "行情时间未知"
+                    }
+                }
+            }
         }
     }
 }
@@ -186,11 +255,36 @@ pub struct PortfolioSummary {
 pub struct CurrencyTotals {
     pub currency: Currency,
     pub total_cost: f64,
+    /// Subtotal of positions with usable prices; see missing_quote_count.
     pub total_market_value: f64,
+    pub valued_count: usize,
+    pub missing_quote_count: usize,
+    pub stale_quote_count: usize,
+    pub uncertain_quote_count: usize,
+    pub valued_cost: f64,
     pub total_unrealized_pnl: f64,
     pub total_unrealized_pnl_pct: f64,
     pub total_realized_pnl: f64,
     pub cash: Money,
+}
+
+impl CurrencyTotals {
+    fn empty(currency: Currency, cash: Money) -> Self {
+        Self {
+            currency,
+            total_cost: 0.0,
+            total_market_value: 0.0,
+            valued_count: 0,
+            missing_quote_count: 0,
+            stale_quote_count: 0,
+            uncertain_quote_count: 0,
+            valued_cost: 0.0,
+            total_unrealized_pnl: 0.0,
+            total_unrealized_pnl_pct: 0.0,
+            total_realized_pnl: 0.0,
+            cash,
+        }
+    }
 }
 
 /// 录单错误。
@@ -234,6 +328,89 @@ pub struct TradeDraft<'a> {
     pub fee: f64,
     pub note: &'a str,
     pub time: Option<String>,
+}
+
+/// Session-only local record form. Its identity is captured on open, never from
+/// whichever chart happens to be selected when the user later confirms.
+#[derive(Debug, Clone)]
+pub struct LocalTradeForm {
+    pub code: String,
+    pub name: String,
+    pub currency: Currency,
+    pub side: TradeSide,
+    pub reference_hint: String,
+    pub confirmation: Option<TradeConfirmation>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TradeConfirmation {
+    pub shares: f64,
+    pub price: f64,
+    pub fee: f64,
+    pub note: String,
+}
+
+impl TradeConfirmation {
+    pub fn new(shares: f64, price: f64, fee: f64, note: String) -> Result<Self, TradeError> {
+        if !shares.is_finite() || shares <= 0.0 {
+            return Err(TradeError::InvalidShares);
+        }
+        if !price.is_finite() || price <= 0.0 || !(shares * price).is_finite() {
+            return Err(TradeError::InvalidPrice);
+        }
+        if !fee.is_finite() || fee < 0.0 || !(shares * price + fee).is_finite() {
+            return Err(TradeError::InvalidFee);
+        }
+        Ok(Self {
+            shares,
+            price,
+            fee,
+            note,
+        })
+    }
+
+    pub fn notional(&self) -> f64 {
+        self.shares * self.price
+    }
+
+    pub fn total(&self, side: TradeSide) -> f64 {
+        match side {
+            TradeSide::Buy => self.notional() + self.fee,
+            TradeSide::Sell => self.notional() - self.fee,
+        }
+    }
+}
+
+impl LocalTradeForm {
+    pub fn new(code: &str, name: &str, side: TradeSide) -> Result<Self, TradeError> {
+        let code = code.trim();
+        if code.is_empty() {
+            return Err(TradeError::EmptyCode);
+        }
+        let currency = Currency::for_code(code).ok_or(TradeError::UnknownCurrency)?;
+        Ok(Self {
+            code: code.into(),
+            name: name.into(),
+            currency,
+            side,
+            reference_hint: String::new(),
+            confirmation: None,
+        })
+    }
+
+    pub fn confirmed_draft(&self) -> Option<TradeDraft<'_>> {
+        let confirmed = self.confirmation.as_ref()?;
+        (Currency::for_code(&self.code) == Some(self.currency)).then_some(TradeDraft {
+            code: &self.code,
+            name: &self.name,
+            side: self.side,
+            shares: confirmed.shares,
+            price: confirmed.price,
+            fee: confirmed.fee,
+            note: &confirmed.note,
+            time: None,
+        })
+    }
 }
 
 /// 新建交易 id。
@@ -401,36 +578,44 @@ impl Portfolio {
         opened.filter(|_| shares > 1e-9)
     }
 
-    /// 用最新价标记组合。
-    ///
-    /// `quote_fn(code) -> (last, day_change_pct, name_hint)`
+    /// Mark positions from the canonical per-instrument quote store, independently
+    /// of watchlist membership. Unpriced holdings remain in the summary as unknown.
     pub fn summarize_with<F>(&self, mut quote_fn: F) -> PortfolioSummary
     where
-        F: FnMut(&str) -> (f64, f64, String),
+        F: FnMut(&str) -> Option<QuoteRecord>,
     {
         let positions = self.positions();
         let mut marks = Vec::with_capacity(positions.len());
         let mut by_currency: BTreeMap<Currency, CurrencyTotals> = BTreeMap::new();
 
         for mut pos in positions {
-            let (last, day_chg, name_hint) = quote_fn(&pos.code);
-            if (pos.name.is_empty() || pos.name == pos.code) && !name_hint.is_empty() {
-                pos.name = name_hint;
+            let quote = quote_fn(&pos.code);
+            if let Some(quote) = quote.as_ref().filter(|quote| quote.code == pos.code)
+                && (pos.name.is_empty() || pos.name == pos.code)
+                && !quote.name.is_empty()
+            {
+                pos.name = quote.name.clone();
             }
-            let mark = PositionMark::from_position(pos, last, day_chg);
+            let mark = PositionMark::from_quote(pos, quote.as_ref());
             let totals = by_currency
                 .entry(mark.position.currency)
-                .or_insert_with(|| CurrencyTotals {
-                    currency: mark.position.currency,
-                    total_cost: 0.0,
-                    total_market_value: 0.0,
-                    total_unrealized_pnl: 0.0,
-                    total_unrealized_pnl_pct: 0.0,
-                    total_realized_pnl: 0.0,
-                    cash: self.cash(mark.position.currency),
+                .or_insert_with(|| {
+                    CurrencyTotals::empty(mark.position.currency, self.cash(mark.position.currency))
                 });
             totals.total_cost += mark.position.total_cost;
-            totals.total_market_value += mark.market_value;
+            if let (Some(value), Some(pnl)) = (mark.market_value, mark.unrealized_pnl) {
+                totals.total_market_value += value;
+                totals.total_unrealized_pnl += pnl;
+                totals.valued_cost += mark.position.total_cost;
+                totals.valued_count += 1;
+                if mark.quote_freshness == Some(Freshness::Stale) {
+                    totals.stale_quote_count += 1;
+                } else if mark.quote_is_uncertain() {
+                    totals.uncertain_quote_count += 1;
+                }
+            } else {
+                totals.missing_quote_count += 1;
+            }
             totals.total_realized_pnl += mark.position.realized_pnl;
             marks.push(mark);
         }
@@ -438,18 +623,10 @@ impl Portfolio {
         for (currency, cash) in &self.cash_balances {
             by_currency
                 .entry(*currency)
-                .or_insert_with(|| CurrencyTotals {
-                    currency: *currency,
-                    total_cost: 0.0,
-                    total_market_value: 0.0,
-                    total_unrealized_pnl: 0.0,
-                    total_unrealized_pnl_pct: 0.0,
-                    total_realized_pnl: 0.0,
-                    cash: *cash,
-                });
+                .or_insert_with(|| CurrencyTotals::empty(*currency, *cash));
         }
 
-        // 按浮动盈亏比例降序，便于扫一眼风险。
+        // Known P&L sorts first; unavailable quotes never become false zero returns.
         marks.sort_by(|a, b| {
             b.unrealized_pnl_pct
                 .partial_cmp(&a.unrealized_pnl_pct)
@@ -457,9 +634,8 @@ impl Portfolio {
         });
 
         for totals in by_currency.values_mut() {
-            totals.total_unrealized_pnl = totals.total_market_value - totals.total_cost;
-            totals.total_unrealized_pnl_pct = if totals.total_cost > 1e-9 {
-                totals.total_unrealized_pnl / totals.total_cost * 100.0
+            totals.total_unrealized_pnl_pct = if totals.valued_cost > 1e-9 {
+                totals.total_unrealized_pnl / totals.valued_cost * 100.0
             } else {
                 0.0
             };
@@ -703,6 +879,28 @@ pub fn format_money(v: f64) -> String {
 mod tests {
     use super::*;
 
+    fn quote(code: &str, price: f64) -> QuoteRecord {
+        QuoteRecord {
+            code: code.into(),
+            name: "测试".into(),
+            market: crate::domain::market::Market::for_code(code).unwrap(),
+            currency: Currency::for_code(code).unwrap(),
+            price: Some(price),
+            change_pct: Some(0.0),
+            volume: Some(100),
+            source: "fixture".into(),
+            fetched_at: chrono::Utc::now().timestamp_millis(),
+            market_time: Some(
+                chrono::Utc::now()
+                    .with_timezone(&chrono::FixedOffset::east_opt(8 * 60 * 60).unwrap())
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string(),
+            ),
+            availability: crate::domain::market::Availability::Available,
+            freshness: Freshness::Live,
+        }
+    }
+
     fn buy(p: &mut Portfolio, code: &str, shares: f64, price: f64, fee: f64) {
         p.record_trade(TradeDraft {
             code,
@@ -840,9 +1038,9 @@ mod tests {
         buy(&mut p, "600519", 100.0, 10.0, 0.0);
         buy(&mut p, "000001", 200.0, 5.0, 0.0);
         let sum = p.summarize_with(|code| match code {
-            "600519" => (12.0, 1.0, "茅台".into()),
-            "000001" => (4.0, -1.0, "平安".into()),
-            _ => (0.0, 0.0, String::new()),
+            "600519" => Some(quote(code, 12.0)),
+            "000001" => Some(quote(code, 4.0)),
+            _ => None,
         });
         assert_eq!(sum.open_count, 2);
         let cny = &sum.by_currency[&Currency::Cny];
@@ -959,8 +1157,8 @@ mod tests {
         buy(&mut p, "600519", 100.0, 10.0, 0.0);
         buy(&mut p, "00700", 100.0, 20.0, 0.0);
         let summary = p.summarize_with(|code| match code {
-            "600519" => (11.0, 1.0, String::new()),
-            "00700" => (19.0, -1.0, String::new()),
+            "600519" => Some(quote(code, 11.0)),
+            "00700" => Some(quote(code, 19.0)),
             _ => unreachable!(),
         });
         assert_eq!(summary.by_currency.len(), 2);
@@ -972,5 +1170,184 @@ mod tests {
             summary.by_currency[&Currency::Hkd].total_market_value,
             1900.0
         );
+    }
+
+    #[test]
+    fn canonical_quotes_keep_held_stock_valued_after_watchlist_removal() {
+        let mut portfolio = Portfolio::default();
+        buy(&mut portfolio, "600519", 100.0, 10.0, 0.0);
+        let quotes = BTreeMap::from([("600519".to_string(), quote("600519", 12.0))]);
+        let mut watchlist = vec!["600519".to_string()];
+        let before = portfolio.summarize_with(|code| quotes.get(code).cloned());
+        watchlist.retain(|code| code != "600519");
+        let after = portfolio.summarize_with(|code| quotes.get(code).cloned());
+        assert!(watchlist.is_empty());
+        assert_eq!(before.positions[0].unrealized_pnl, Some(200.0));
+        assert_eq!(after.positions[0].last, Some(12.0));
+        assert_eq!(after.positions[0].unrealized_pnl, Some(200.0));
+        assert_eq!(after.by_currency[&Currency::Cny].total_market_value, 1200.0);
+    }
+
+    #[test]
+    fn missing_or_invalid_quotes_never_substitute_cost() {
+        let mut portfolio = Portfolio::default();
+        buy(&mut portfolio, "600519", 100.0, 10.0, 0.0);
+        for price in [
+            None,
+            Some(0.0),
+            Some(-1.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+        ] {
+            let summary = portfolio.summarize_with(|code| price.map(|price| quote(code, price)));
+            let mark = &summary.positions[0];
+            assert_eq!(mark.last, None);
+            assert_eq!(mark.market_value, None);
+            assert_eq!(mark.unrealized_pnl, None);
+            assert_eq!(mark.position.total_cost, 1000.0);
+            assert_eq!(summary.by_currency[&Currency::Cny].missing_quote_count, 1);
+            assert_eq!(summary.by_currency[&Currency::Cny].valued_count, 0);
+        }
+    }
+
+    #[test]
+    fn partial_totals_only_include_costs_of_valued_positions() {
+        let mut portfolio = Portfolio::default();
+        buy(&mut portfolio, "600519", 100.0, 10.0, 0.0);
+        buy(&mut portfolio, "000001", 100.0, 20.0, 0.0);
+        let summary =
+            portfolio.summarize_with(|code| (code == "600519").then(|| quote(code, 12.0)));
+        let totals = &summary.by_currency[&Currency::Cny];
+        assert_eq!(totals.total_cost, 3000.0);
+        assert_eq!(totals.valued_cost, 1000.0);
+        assert_eq!(totals.total_market_value, 1200.0);
+        assert_eq!(totals.total_unrealized_pnl, 200.0);
+        assert_eq!(totals.total_unrealized_pnl_pct, 20.0);
+        assert_eq!(totals.valued_count, 1);
+        assert_eq!(totals.missing_quote_count, 1);
+    }
+
+    #[test]
+    fn stale_quote_keeps_last_known_value_with_explicit_warning() {
+        let mut portfolio = Portfolio::default();
+        buy(&mut portfolio, "600519", 100.0, 10.0, 0.0);
+        let summary = portfolio.summarize_with(|code| Some(quote(code, 12.0).stale()));
+        assert_eq!(summary.positions[0].unrealized_pnl, Some(200.0));
+        assert_eq!(summary.positions[0].quote_freshness, Some(Freshness::Stale));
+        assert!(summary.positions[0].quote_is_uncertain());
+        assert_eq!(summary.by_currency[&Currency::Cny].stale_quote_count, 1);
+    }
+
+    #[test]
+    fn mismatched_instrument_or_currency_quote_is_unavailable() {
+        let mut portfolio = Portfolio::default();
+        buy(&mut portfolio, "600519", 100.0, 10.0, 0.0);
+        let wrong_code = portfolio.summarize_with(|_| Some(quote("000001", 12.0)));
+        assert_eq!(wrong_code.positions[0].last, None);
+        let wrong_currency = portfolio.summarize_with(|code| {
+            let mut quote = quote(code, 12.0);
+            quote.currency = Currency::Hkd;
+            Some(quote)
+        });
+        assert_eq!(wrong_currency.positions[0].last, None);
+    }
+
+    #[test]
+    fn local_form_stays_bound_to_original_instrument_and_currency() {
+        let mut portfolio = Portfolio::default();
+        let mut selected = "00700";
+        let mut form = LocalTradeForm::new(selected, "腾讯控股", TradeSide::Buy).unwrap();
+        assert!(form.confirmed_draft().is_none());
+        form.confirmation =
+            Some(TradeConfirmation::new(100.0, 12.0, 5.0, "实际成交".into()).unwrap());
+        selected = "600519";
+        portfolio
+            .record_trade(form.confirmed_draft().unwrap())
+            .unwrap();
+        assert_eq!(selected, "600519");
+        let saved = &portfolio.trades[0];
+        assert_eq!(saved.code, "00700");
+        assert_eq!(saved.name, "腾讯控股");
+        assert_eq!(saved.currency, Currency::Hkd);
+        assert_eq!(saved.shares, 100.0);
+        assert_eq!(saved.price, 12.0);
+        assert_eq!(saved.fee, 5.0);
+        assert_eq!(
+            form.confirmation.as_ref().unwrap().total(TradeSide::Buy),
+            1205.0
+        );
+    }
+
+    #[test]
+    fn full_sell_form_requires_confirmation_and_uses_actual_price_and_fee() {
+        let mut portfolio = Portfolio::default();
+        buy(&mut portfolio, "600519", 100.0, 10.0, 0.0);
+        let position = portfolio.position_of("600519").unwrap();
+        let mut form =
+            LocalTradeForm::new(&position.code, &position.name, TradeSide::Sell).unwrap();
+        assert!(form.confirmed_draft().is_none());
+        assert_eq!(portfolio.trades.len(), 1);
+        assert_eq!(portfolio.position_of("600519").unwrap().shares, 100.0);
+        form.confirmation =
+            Some(TradeConfirmation::new(position.shares, 11.5, 3.0, "清仓记录".into()).unwrap());
+        assert_eq!(
+            form.confirmation.as_ref().unwrap().total(TradeSide::Sell),
+            1147.0
+        );
+        let id = portfolio
+            .record_trade(form.confirmed_draft().unwrap())
+            .unwrap();
+        assert!(portfolio.position_of("600519").is_none());
+        assert_eq!(
+            portfolio.position_state_of("600519").unwrap().realized_pnl,
+            147.0
+        );
+        assert!(portfolio.remove_trade(&id));
+        assert_eq!(portfolio.position_of("600519").unwrap().shares, 100.0);
+    }
+
+    #[test]
+    fn local_confirmation_rejects_invalid_fees_and_overflow() {
+        for fee in [-1.0, f64::NAN, f64::INFINITY] {
+            assert!(matches!(
+                TradeConfirmation::new(100.0, 10.0, fee, String::new()),
+                Err(TradeError::InvalidFee)
+            ));
+        }
+        assert!(matches!(
+            TradeConfirmation::new(f64::MAX, 10.0, 0.0, String::new()),
+            Err(TradeError::InvalidPrice)
+        ));
+    }
+
+    #[test]
+    fn unknown_quote_time_is_visible_even_with_a_valid_price() {
+        let mut portfolio = Portfolio::default();
+        buy(&mut portfolio, "600519", 100.0, 10.0, 0.0);
+        let summary = portfolio.summarize_with(|code| {
+            let mut quote = quote(code, 12.0);
+            quote.market_time = None;
+            Some(quote)
+        });
+        assert_eq!(summary.positions[0].unrealized_pnl, Some(200.0));
+        assert!(summary.positions[0].quote_is_uncertain());
+        assert_eq!(summary.by_currency[&Currency::Cny].uncertain_quote_count, 1);
+    }
+
+    #[test]
+    fn canceling_or_editing_a_review_has_no_portfolio_effect() {
+        let mut portfolio = Portfolio {
+            track_cash: true,
+            ..Default::default()
+        };
+        portfolio.set_cash(Currency::Hkd, 2000.0).unwrap();
+        let original = serde_json::to_string(&portfolio).unwrap();
+        let mut form = LocalTradeForm::new("00700", "腾讯控股", TradeSide::Buy).unwrap();
+        form.confirmation = Some(TradeConfirmation::new(100.0, 12.0, 5.0, String::new()).unwrap());
+        // Back to edit invalidates the reviewed snapshot; Cancel drops the form.
+        form.confirmation = None;
+        assert!(form.confirmed_draft().is_none());
+        drop(form);
+        assert_eq!(serde_json::to_string(&portfolio).unwrap(), original);
     }
 }

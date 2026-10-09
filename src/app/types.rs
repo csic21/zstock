@@ -69,6 +69,28 @@ pub(crate) enum ChartKind {
 }
 
 impl ChartKind {
+    pub(crate) fn series_identity(
+        self,
+        code: &str,
+    ) -> Option<crate::domain::market::SeriesIdentity> {
+        use crate::domain::market::{Adjustment, BarKind, SeriesIdentity};
+        let (bars, adjustment) = match self {
+            Self::DayK => (BarKind::Daily, Adjustment::Forward),
+            Self::Intraday => (BarKind::Intraday, Adjustment::None),
+            Self::MinuteK(period) => (
+                BarKind::Minute(match period {
+                    MinutePeriod::M1 => 1,
+                    MinutePeriod::M5 => 5,
+                    MinutePeriod::M15 => 15,
+                    MinutePeriod::M30 => 30,
+                    MinutePeriod::M60 => 60,
+                }),
+                Adjustment::None,
+            ),
+        };
+        SeriesIdentity::stock(code, bars, adjustment)
+    }
+
     pub(crate) fn from_label(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "intraday" | "分时" => Self::Intraday,

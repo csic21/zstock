@@ -96,6 +96,23 @@ impl MarketDataService {
             }
         }
 
+        if self.last_good.len() > 512 {
+            let requested: HashSet<_> = normalized.iter().map(String::as_str).collect();
+            let mut oldest: Vec<_> = self
+                .last_good
+                .values()
+                .filter(|record| !requested.contains(record.code.as_str()))
+                .map(|record| (record.fetched_at, record.code.clone()))
+                .collect();
+            oldest.sort();
+            for (_, code) in oldest
+                .into_iter()
+                .take(self.last_good.len().saturating_sub(512))
+            {
+                self.last_good.remove(&code);
+            }
+        }
+
         let records = normalized
             .into_iter()
             .filter_map(|code| {

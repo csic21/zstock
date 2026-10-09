@@ -12,7 +12,8 @@ use gpui_component::{
 
 use crate::chart::{ChartPaintData, chart_layout, index_from_x, paint_chart, price_from_y};
 use crate::model::{
-    MinutePeriod, QuoteSnapshot, TrendLine, format_pct, format_price, format_volume, shared,
+    MinutePeriod, QuoteSnapshot, TrendLine, board_for_code, format_pct, format_price,
+    format_volume, shared,
 };
 
 use super::super::helpers::*;
@@ -20,17 +21,38 @@ use super::super::labels::L;
 use super::super::{ChartKind, ChartRange, DetailTab, StockApp};
 use gpui_component::skeleton::Skeleton;
 
+/// The quote header never derives valuation from the selected chart's candles.
+#[derive(Debug, PartialEq)]
+struct QuoteHeaderValues {
+    last: Option<f64>,
+    change_pct: Option<f64>,
+}
+
+impl QuoteHeaderValues {
+    fn from_quote(quote: Option<&crate::domain::market::QuoteRecord>) -> Self {
+        let quote = quote.filter(|quote| quote.usable());
+        Self {
+            last: quote.and_then(|quote| quote.price),
+            change_pct: quote
+                .and_then(|quote| quote.change_pct)
+                .filter(|change| change.is_finite()),
+        }
+    }
+
+    fn cost_return_pct(&self, cost: f64) -> Option<f64> {
+        self.last
+            .filter(|_| cost.is_finite() && cost > 0.0)
+            .map(|price| (price - cost) / cost * 100.0)
+    }
+}
+
 impl StockApp {
     pub(crate) fn render_chart_area(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let sym = self.current_symbol();
-        // Only use candle snapshot when it belongs to the selected symbol
-        let candles_match = self
-            .candles_code
-            .as_ref()
-            .is_some_and(|c| c == self.selected.as_ref());
+        let candles_match = self.visible_series_matches_selection();
         let snap = if candles_match {
             match self.chart_kind {
-                ChartKind::Intraday => self.minute.as_ref().and_then(|m| m.snapshot()),
+                ChartKind::Intraday => self.minute.as_ref().and_then(|minute| minute.snapshot()),
                 ChartKind::DayK | ChartKind::MinuteK(_) => {
                     QuoteSnapshot::from_candles(&self.candles)
                 }
@@ -38,18 +60,39 @@ impl StockApp {
         } else {
             None
         };
-        let up = snap
-            .as_ref()
-            .map(|s| s.change_pct >= 0.0)
-            .or_else(|| sym.map(|s| s.is_up()))
-            .unwrap_or(true);
-        let chg_color = self.chg_color(up, cx);
+        // Header price and change must share one canonical quote, independent of view kind.
+        let quote = self.quote_for_code(self.selected.as_ref());
+        let quote_values = QuoteHeaderValues::from_quote(quote);
+        let close = quote_values.last;
+        let chg = quote_values.change_pct;
+        let chg_color = match chg {
+            Some(change) if change > 0.0 => self.chg_color(true, cx),
+            Some(change) if change < 0.0 => self.chg_color(false, cx),
+            _ => cx.theme().muted_foreground,
+        };
         let paint = self.chart_paint_data(cx);
         let work = self.work_mode;
         let decision_trace = (!work).then(|| self.decision_trace_view_model(cx));
+        let data_status = if work {
+            self.work_status_line()
+        } else {
+            let mut status = self.quote_status_text();
+            if self
+                .chart_lines
+                .get(self.selected.as_ref())
+                .is_some_and(|lines| !lines.is_empty())
+            {
+                status.push_str(" · 旧画线缺少周期信息，已保留并隐藏");
+            }
+            status
+        };
 
         let code_show = self.display_code(self.selected.as_ref());
-        let name_raw = sym.map(|s| s.name.as_ref().to_string()).unwrap_or_default();
+        let name_raw = quote
+            .map(|quote| quote.name.clone())
+            .filter(|name| is_real_name(name, self.selected.as_ref()))
+            .or_else(|| sym.map(|symbol| symbol.name.to_string()))
+            .unwrap_or_default();
         let name_show = if work {
             None
         } else if is_real_name(&name_raw, self.selected.as_ref()) {
@@ -60,20 +103,15 @@ impl StockApp {
         let board = if work {
             shared("metric")
         } else {
-            sym.map(|s| s.board.clone()).unwrap_or_else(|| shared(""))
+            sym.map(|s| s.board.clone())
+                .unwrap_or_else(|| board_for_code(self.selected.as_ref()))
         };
-        // Prefer live quote on the watchlist; fall back to last candle only if matched
-        let close = sym
-            .map(|s| s.last)
-            .filter(|v| *v > 0.0)
-            .or_else(|| snap.as_ref().map(|s| s.close))
-            .unwrap_or(0.0);
-        let chg = sym
-            .map(|s| s.change_pct)
-            .or_else(|| snap.as_ref().map(|s| s.change_pct))
-            .unwrap_or(0.0);
-        let close_disp = self.format_value(close);
-        let chg_disp = self.format_change(chg);
+        let close_disp = close
+            .map(|price| self.format_value(price))
+            .unwrap_or_else(|| "—".into());
+        let chg_disp = chg
+            .map(|change| self.format_change(change))
+            .unwrap_or_else(|| "—".into());
         // Open position cost for header chip + dashed cost line on chart.
         let cost_mark = if work {
             None
@@ -83,24 +121,18 @@ impl StockApp {
                 .filter(|p| p.is_open() && p.avg_cost.is_finite() && p.avg_cost > 0.0)
                 .map(|p| {
                     let cost = p.avg_cost;
-                    let pnl_pct = if close > 0.0 && cost > 0.0 {
-                        (close - cost) / cost * 100.0
-                    } else {
-                        0.0
-                    };
+                    let pnl_pct = quote_values.cost_return_pct(cost);
                     (cost, pnl_pct)
                 })
         };
 
         // OHLC strip (merged into quote header to free chart vertical space)
-        let ohlc_el = if candles_match {
-            let o = snap.as_ref().map(|s| s.open).unwrap_or(0.0);
-            let hi = snap.as_ref().map(|s| s.high).unwrap_or(0.0);
-            let lo = snap.as_ref().map(|s| s.low).unwrap_or(0.0);
-            let v = snap.as_ref().map(|s| s.volume).unwrap_or(0);
+        let ohlc_el = if let Some(snapshot) = snap.as_ref() {
+            let (o, hi, lo, v) = (snapshot.open, snapshot.high, snapshot.low, snapshot.volume);
             if work {
                 h_flex()
                     .gap_2()
+                    .flex_wrap()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(format!("min {}", self.format_value(lo)))
@@ -110,8 +142,10 @@ impl StockApp {
             } else {
                 h_flex()
                     .gap_2()
+                    .flex_wrap()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
+                    .child(format!("{} 最新柱", self.chart_label()))
                     .child(format!("开 {}", format_price(o)))
                     .child(format!("高 {}", format_price(hi)))
                     .child(format!("低 {}", format_price(lo)))
@@ -121,6 +155,7 @@ impl StockApp {
         } else {
             h_flex()
                 .gap_2()
+                .flex_wrap()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
                 .child(if self.loading {
@@ -149,20 +184,20 @@ impl StockApp {
             .child(
                 h_flex()
                     .id("chart-quote-header")
-                    .h(px(48.))
+                    .min_h(px(48.)).py_2().flex_wrap()
                     .flex_shrink_0()
                     .px_4()
                     .items_center()
-                    .justify_between()
+                    .justify_between().min_w_0().w_full()
                     .gap_3()
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .debug_selector(|| "chart-quote-header".into())
                     .child(
                         h_flex()
-                            .gap_2()
+                            .gap_2().flex_wrap()
                             .items_baseline()
-                            .min_w_0()
+                            .min_w_0().flex_1()
                             .child(
                                 div()
                                     .text_lg()
@@ -188,14 +223,14 @@ impl StockApp {
                     )
                     .child(
                         h_flex()
-                            .gap_2()
+                            .gap_2().flex_wrap()
                             .items_baseline()
-                            .flex_shrink_0()
+                            .min_w_0().max_w_full()
                             .child(
                                 div()
                                     .text_2xl()
                                     .font_semibold()
-                                    .text_color(cx.theme().foreground)
+                                    .text_color(chg_color)
                                     .child(close_disp),
                             )
                             .child(
@@ -206,7 +241,8 @@ impl StockApp {
                                     .child(chg_disp),
                             )
                             .when_some(cost_mark, |row, (cost, pnl_pct)| {
-                                let pnl_color = self.chg_color(pnl_pct >= 0.0, cx);
+                                let pnl_color = pnl_pct.map(|pnl| self.chg_color(pnl >= 0.0, cx))
+                                    .unwrap_or(cx.theme().muted_foreground);
                                 row.child(div().w(px(6.))).child(
                                     crate::app::helpers::status_pill(
                                         format!("成本 {}", format_price(cost)),
@@ -219,7 +255,7 @@ impl StockApp {
                                             .text_xs()
                                             .font_medium()
                                             .text_color(pnl_color)
-                                            .child(format!("{:+.2}%", pnl_pct)),
+                                            .child(pnl_pct.map(|pnl| format!("{pnl:+.2}%")).unwrap_or_else(|| "盈亏 —".into())),
                                     )
                             })
                             .when(self.refreshing, |row| {
@@ -242,6 +278,12 @@ impl StockApp {
                             }),
                     ),
             )
+            .child(
+                div().id("chart-data-status").w_full().flex_shrink_0().px_4().py_1()
+                    .text_xs().text_color(cx.theme().muted_foreground)
+                    .border_b_1().border_color(cx.theme().border)
+                    .child(data_status),
+            )
             .when_some(decision_trace, |panel, trace| {
                 let color = match trace.outcome {
                     crate::domain::decision::DecisionOutcome::Calculating => cx.theme().accent,
@@ -255,10 +297,10 @@ impl StockApp {
                 panel.child(
                     h_flex()
                         .id("decision-status-strip")
-                        .h(px(38.0))
+                        .min_h(px(38.0)).py_1().flex_wrap()
                         .flex_shrink_0()
                         .px_4()
-                        .gap_2()
+                        .gap_2().flex_wrap()
                         .items_center()
                         .border_b_1()
                         .border_color(cx.theme().border)
@@ -279,7 +321,6 @@ impl StockApp {
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                .overflow_hidden()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(trace.current_activity()),
@@ -314,16 +355,16 @@ impl StockApp {
             // Toolbar：周期 / 指标 / 画线（操作与行情分离）
             .child(
                 h_flex()
-                    .h(px(34.))
+                    .min_h(px(34.)).py_1().gap_2().flex_wrap().flex_wrap()
                     .flex_shrink_0()
                     .px_3()
                     .items_center()
-                    .justify_between()
+                    .justify_between().min_w_0().w_full()
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(
                         h_flex()
-                            .gap_1()
+                            .gap_1().flex_wrap().min_w_0().max_w_full()
                             .items_center()
                             .child(self.kind_button(
                                 if work { "Intraday" } else { "分时" },
@@ -371,7 +412,7 @@ impl StockApp {
                     )
                     .child(
                         h_flex()
-                            .gap_1()
+                            .gap_1().flex_wrap().min_w_0().max_w_full()
                             .items_center()
                             .when(!matches!(self.chart_kind, ChartKind::Intraday), |row| {
                                 row.child(self.ma_toggle(
@@ -440,7 +481,7 @@ impl StockApp {
                                                 .xsmall()
                                                 .ghost()
                                                 .label("清除")
-                                                .tooltip("清除当前标的的全部画线")
+                                                .tooltip("清除当前周期和历史窗口的画线；其他周期与旧画线保留")
                                                 .on_click(cx.listener(|this, _, _w, cx| {
                                                     this.clear_chart_lines(cx);
                                                 })),
@@ -452,7 +493,7 @@ impl StockApp {
             // hover strip
             .child(
                 h_flex()
-                    .h(px(26.))
+                    .min_h(px(26.)).py_1().flex_wrap()
                     .flex_shrink_0()
                     .px_3()
                     .items_center()
@@ -472,7 +513,7 @@ impl StockApp {
                     .id("chart-body")
                     .flex_1()
                     .min_h_0()
-                    .min_h(px(220.))
+                    .min_h(px(100.))
                     .p_2()
                     .child(
                         div()
@@ -519,8 +560,8 @@ impl StockApp {
                                         .justify_center()
                                         .bg(cx.theme().background.opacity(0.55))
                                         .child(Skeleton::new().h_3().w_full())
-                                        .child(Skeleton::new().secondary().h_3().w(px(280.)))
-                                        .child(Skeleton::new().h_3().w(px(320.)))
+                                        .child(Skeleton::new().secondary().h_3().w_full())
+                                        .child(Skeleton::new().h_3().w_full())
                                         .child(Skeleton::new().secondary().h_3().w_full())
                                         .child(
                                             div()
@@ -606,6 +647,11 @@ impl StockApp {
                                 MouseButton::Left,
                                 cx.listener(move |this, _ev, _w, cx| {
                                     if this.drawing_mode {
+                                        if !this.visible_series_matches_selection() {
+                                            this.drawing_anchor = None;
+                                            this.draft_line = None;
+                                            return;
+                                        }
                                         if let Some(draft) = this.draft_line.take() {
                                             let commit = {
                                                 let from = draft.from;
@@ -628,10 +674,10 @@ impl StockApp {
                                                     Some(draft)
                                                 }
                                             };
-                                            if let Some(line) = commit {
-                                                let selected = this.selected.to_string();
+                                            if let Some(line) = commit
+                                                && let Some(scope) = this.drawing_scope_key() {
                                                 this.chart_lines
-                                                    .entry(selected)
+                                                    .entry(scope)
                                                     .or_default()
                                                     .push(line);
                                                 this.draw_color_ix = this.draw_color_ix.wrapping_add(1);
@@ -707,15 +753,18 @@ impl StockApp {
 
     /// 清空当前标的的全部画线。
     pub(crate) fn clear_chart_lines(&mut self, cx: &mut Context<Self>) {
-        let code = self.selected.to_string();
-        let removed = self.chart_lines.remove(&code).unwrap_or_default().len();
+        let removed = self
+            .drawing_scope_key()
+            .and_then(|key| self.chart_lines.remove(&key))
+            .unwrap_or_default()
+            .len();
         self.draft_line = None;
         self.drawing_anchor = None;
         self.status = shared(
             (if self.work_mode {
                 format!("removed {removed} line(s)")
             } else {
-                format!("已清除 {removed} 条画线")
+                format!("已清除当前周期 {removed} 条画线；其他周期与旧画线保留")
             })
             .to_string(),
         );
@@ -779,10 +828,7 @@ impl StockApp {
     }
 
     pub(crate) fn render_hover_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let candles_match = self
-            .candles_code
-            .as_ref()
-            .is_some_and(|c| c == self.selected.as_ref());
+        let candles_match = self.visible_series_matches_selection();
         let work = self.work_mode;
         if candles_match
             && matches!(self.chart_kind, ChartKind::Intraday)
@@ -796,6 +842,7 @@ impl StockApp {
             let vol = p.minute_volume(ix.checked_sub(1).map(|j| &m.points[j]));
             return h_flex()
                 .gap_2()
+                .flex_wrap()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
                 .child(
@@ -833,6 +880,7 @@ impl StockApp {
             if work {
                 return h_flex()
                     .gap_2()
+                    .flex_wrap()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(
@@ -860,6 +908,7 @@ impl StockApp {
             }
             let row = h_flex()
                 .gap_2()
+                .flex_wrap()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
                 .child(
@@ -934,7 +983,7 @@ impl StockApp {
         let zoom_hint = if self.drawing_mode && !work {
             "画线模式：拖拽画趋势线 · 单击水平线 · Esc 退出".to_string()
         } else if matches!(self.chart_kind, ChartKind::Intraday) {
-            if let Some(m) = self.minute.as_ref() {
+            if let Some(m) = self.minute.as_ref().filter(|_| candles_match) {
                 let date = if m.date.len() >= 8 {
                     format!("{}-{}-{}", &m.date[..4], &m.date[4..6], &m.date[6..8])
                 } else {
@@ -1009,5 +1058,48 @@ impl StockApp {
         self.detail_tab = tab;
         self.schedule_persist(cx);
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod quote_header_tests {
+    use super::QuoteHeaderValues;
+    use crate::domain::market::{Availability, Freshness, Market, QuoteRecord};
+    use crate::domain::money::Currency;
+
+    #[test]
+    fn missing_quote_never_fabricates_price_change_or_break_even_return() {
+        let values = QuoteHeaderValues::from_quote(None);
+        assert_eq!(values.last, None);
+        assert_eq!(values.change_pct, None);
+        assert_eq!(values.cost_return_pct(15.0), None);
+    }
+
+    #[test]
+    fn header_price_and_change_come_from_the_same_canonical_quote() {
+        let mut quote = QuoteRecord {
+            code: "600519".into(),
+            market: Market::AShare,
+            currency: Currency::Cny,
+            name: "fixture".into(),
+            price: Some(10.0),
+            change_pct: Some(-2.0),
+            volume: None,
+            source: "offline canonical fixture".into(),
+            fetched_at: 0,
+            market_time: None,
+            availability: Availability::Available,
+            freshness: Freshness::Unknown,
+        };
+        let values = QuoteHeaderValues::from_quote(Some(&quote));
+        assert_eq!(values.last, Some(10.0));
+        assert_eq!(values.change_pct, Some(-2.0));
+        assert_eq!(values.cost_return_pct(8.0), Some(25.0));
+        assert_eq!(values.cost_return_pct(0.0), None);
+        quote.price = None;
+        let missing = QuoteHeaderValues::from_quote(Some(&quote));
+        assert_eq!(missing.last, None);
+        assert_eq!(missing.change_pct, None);
+        assert_eq!(missing.cost_return_pct(8.0), None);
     }
 }

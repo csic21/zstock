@@ -6,6 +6,7 @@ use gpui::{
 };
 use gpui_component::{ActiveTheme, h_flex, input::Input, v_flex};
 
+use crate::controller::state::RequestState;
 use crate::model::Symbol;
 
 use super::super::StockApp;
@@ -23,6 +24,19 @@ impl StockApp {
         let n_local = local.len();
         let highlight = self.palette_index;
         let work = self.work_mode;
+        let search_status = match &self.palette_search.state {
+            RequestState::Loading => Some(if work {
+                "Searching…".to_string()
+            } else {
+                "正在搜索…".to_string()
+            }),
+            RequestState::Failed(message) => Some(if work {
+                "Search failed. Edit the query to retry.".to_string()
+            } else {
+                format!("{message} · 修改关键词重试")
+            }),
+            _ => None,
+        };
 
         div()
             .absolute()
@@ -30,7 +44,8 @@ impl StockApp {
             .flex()
             .items_start()
             .justify_center()
-            .pt(px(88.))
+            .py(px(40.))
+            .px_3()
             .bg(gpui::hsla(0.61, 0.35, 0.035, 0.72))
             // Same modal isolation as the settings overlay: don't let wheel
             // scrolling or hover styles reach the app behind the palette.
@@ -55,20 +70,21 @@ impl StockApp {
                 v_flex()
                     .id("palette-panel")
                     .key_context("stock_palette")
-                    .w(px(620.))
-                    .max_h(px(520.))
+                    .w_full()
+                    .max_w(px(620.))
+                    .max_h(gpui::relative(1.))
                     .rounded(cx.theme().radius_lg)
                     .border_1()
                     .border_color(cx.theme().accent.opacity(0.28))
                     .bg(cx.theme().popover)
                     .overflow_hidden()
                     .on_mouse_down_out(cx.listener(|this, _, _w, cx| {
-                        this.palette_open = false;
-                        cx.notify();
+                        this.close_palette(cx);
                     }))
                     .child(
                         h_flex()
                             .h(px(48.))
+                            .flex_shrink_0()
                             .px_3()
                             .items_center()
                             .border_b_1()
@@ -89,10 +105,22 @@ impl StockApp {
                                 "快捷：输入「长线」「短线」「市场」回车 · 或搜代码"
                             }),
                     )
+                    .children(search_status.map(|message| {
+                        div()
+                            .px_3()
+                            .py_1()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(message)
+                    }))
                     .child({
                         let mut list = v_flex()
                             .id("palette-results")
                             .flex_1()
+                            .min_h_0()
+                            .max_h(px(360.))
+                            .track_scroll(&self.palette_scroll)
                             .overflow_y_scroll()
                             .p_1();
                         if !local.is_empty() {
@@ -100,6 +128,7 @@ impl StockApp {
                                 div()
                                     .px_2()
                                     .py_1()
+                                    .flex_shrink_0()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(L::palette_section_local(work)),
@@ -124,6 +153,7 @@ impl StockApp {
                                 div()
                                     .px_2()
                                     .py_1()
+                                    .flex_shrink_0()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(L::palette_section_remote(work)),
@@ -144,13 +174,24 @@ impl StockApp {
                                 ));
                             }
                         }
-                        if self.filtered_local.is_empty() && self.palette_hits.is_empty() {
+                        let empty = self.filtered_local.is_empty() && self.palette_hits.is_empty();
+                        let message = match &self.palette_search.state {
+                            RequestState::Ready(()) if empty => Some(if work {
+                                "No results. Try a different name or valid code.".to_string()
+                            } else {
+                                "没有匹配结果 · 请更换关键词，或输入有效代码后回车预览".to_string()
+                            }),
+                            RequestState::Idle if empty => Some(L::palette_empty(work).to_string()),
+                            _ => None,
+                        };
+                        if let Some(message) = message {
                             list = list.child(
                                 div()
                                     .p_4()
+                                    .flex_shrink_0()
                                     .text_sm()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(L::palette_empty(work)),
+                                    .child(message),
                             );
                         }
                         list
@@ -158,6 +199,7 @@ impl StockApp {
                     .child(
                         h_flex()
                             .h(px(28.))
+                            .flex_shrink_0()
                             .px_3()
                             .items_center()
                             .border_t_1()

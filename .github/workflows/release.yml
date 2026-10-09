@@ -2,26 +2,53 @@ name: Release
 
 on:
   push:
+    branches: [main]
+    paths: ['.github/release-request.json']
     tags:
       - 'v*'
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  resolve:
+    permissions:
+      contents: write
+    name: Resolve and validate release source
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+      publication_head: ${{ steps.resolve.outputs.publication_head }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      publish: ${{ steps.resolve.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve source and create or verify release tag
+        id: resolve
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { resolveRelease } = require('./scripts/resolve-release.cjs');
+            await resolveRelease({ github, context, core });
+
   quality:
+    needs: resolve
     uses: ./.github/workflows/quality.yml
+    with:
+      source_sha: ${{ needs.resolve.outputs.source_sha }}
 
   windows:
     name: Windows (x64)
-    needs: quality
+    needs: [resolve, quality]
     runs-on: windows-latest
     outputs:
       windows_sha: ${{ steps.hash.outputs.sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
@@ -32,11 +59,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Verify version matches tag
-        if: startsWith(github.ref, 'refs/tags/')
+        if: needs.resolve.outputs.publish == 'true'
         shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           cargo_version="$(sed -nE 's/^version = "([^"]+)".*/\1/p' Cargo.toml | head -1)"
-          tag_version="${GITHUB_REF_NAME#v}"
+          tag_version="${RELEASE_TAG#v}"
           if [ -z "$cargo_version" ] || [ "$cargo_version" != "$tag_version" ]; then
             echo "::error::Version mismatch: Cargo.toml=${cargo_version:-<missing>} tag=${tag_version}"
             exit 1
@@ -81,27 +110,18 @@ jobs:
         shell: bash
         run: echo "sha=$(shasum -a 256 dist/zstock-windows-x64.zip | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
-      - name: Upload to release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/zstock-windows-x64.zip
-            dist/zstock-windows-x64-setup.exe
-          generate_release_notes: true
-
-      - name: Upload artifact (manual run)
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: zstock-windows-x64
+          if-no-files-found: error
           path: |
             dist/zstock-windows-x64.zip
             dist/zstock-windows-x64-setup.exe
 
   macos:
     name: macOS (arm64 + x64)
-    needs: quality
+    needs: [resolve, quality]
     runs-on: macos-15
     outputs:
       macos_arm64_sha: ${{ steps.hash.outputs.arm64 }}
@@ -109,6 +129,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
@@ -120,11 +142,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Verify version matches tag
-        if: startsWith(github.ref, 'refs/tags/')
+        if: needs.resolve.outputs.publish == 'true'
         shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           cargo_version="$(sed -nE 's/^version = "([^"]+)".*/\1/p' Cargo.toml | head -1)"
-          tag_version="${GITHUB_REF_NAME#v}"
+          tag_version="${RELEASE_TAG#v}"
           if [ -z "$cargo_version" ] || [ "$cargo_version" != "$tag_version" ]; then
             echo "::error::Version mismatch: Cargo.toml=${cargo_version:-<missing>} tag=${tag_version}"
             exit 1
@@ -132,9 +156,11 @@ jobs:
           echo "OK: Cargo.toml version ${cargo_version} matches tag ${tag_version}"
 
       - name: Sync Info.plist version
-        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+        if: needs.resolve.outputs.publish == 'true'
         run: |
-          tag_version="${GITHUB_REF_NAME#v}"
+          tag_version="${RELEASE_TAG#v}"
           plutil -replace CFBundleShortVersionString -string "$tag_version" assets/macos/Info.plist
           plutil -replace CFBundleVersion -string "$tag_version" assets/macos/Info.plist
 
@@ -171,33 +197,22 @@ jobs:
           echo "arm64=$(shasum -a 256 dist/zstock-macos-arm64.zip | awk '{print $1}')" >> "$GITHUB_OUTPUT"
           echo "x64=$(shasum -a 256 dist/zstock-macos-x64.zip | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
-      - name: Upload to release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/zstock-macos-arm64.zip
-            dist/zstock-macos-arm64.dmg
-            dist/zstock-macos-arm64.pkg
-            dist/zstock-macos-x64.zip
-            dist/zstock-macos-x64.dmg
-            dist/zstock-macos-x64.pkg
-          generate_release_notes: true
-
-      - name: Upload artifact (manual run)
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: zstock-macos
+          if-no-files-found: error
           path: dist/zstock-macos-*
 
   linux:
     name: Linux (x64)
-    needs: quality
+    needs: [resolve, quality]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
@@ -208,11 +223,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Verify version matches tag
-        if: startsWith(github.ref, 'refs/tags/')
+        if: needs.resolve.outputs.publish == 'true'
         shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           cargo_version="$(sed -nE 's/^version = "([^"]+)".*/\1/p' Cargo.toml | head -1)"
-          tag_version="${GITHUB_REF_NAME#v}"
+          tag_version="${RELEASE_TAG#v}"
           if [ -z "$cargo_version" ] || [ "$cargo_version" != "$tag_version" ]; then
             echo "::error::Version mismatch: Cargo.toml=${cargo_version:-<missing>} tag=${tag_version}"
             exit 1
@@ -243,92 +260,55 @@ jobs:
           cd dist
           zip -r zstock-linux-x64.zip zstock-linux-x64
 
-      - name: Upload to release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/zstock-linux-x64.zip
-          generate_release_notes: true
-
-      - name: Upload artifact (manual run)
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: zstock-linux-x64
+          if-no-files-found: error
           path: dist/zstock-linux-x64.zip
 
   manifest:
-    name: Update stable manifest
-    needs: [macos, windows, linux]
-    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    name: Publish complete release and stable manifest
+    needs: [resolve, macos, windows, linux]
+    if: needs.resolve.outputs.publish == 'true'
     runs-on: ubuntu-latest
+    concurrency:
+      group: publish-stable-release
+      cancel-in-progress: false
     steps:
-      # Checkout the *tag* (default ref), not main. Asset naming lives in the
-      # tagged tree (workflow + update-manifest.sh); writing stable.json to
-      # main is done via the contents API below.
-      - name: Checkout release tag
+      - name: Checkout release source
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
 
-      - name: Generate updates/stable.json
+      - name: Collect all platform packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: zstock-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate updates/stable.json from built packages
         env:
-          TAG: ${{ github.ref_name }}
-          ASSET_PREFIX: zstock
+          TAG: ${{ needs.resolve.outputs.tag }}
         run: |
-          cd "$RUNNER_TEMP"
-          for p in macos-arm64 macos-x64 windows-x64 linux-x64; do
-            curl -fsSL -o "$p.zip" \
-              "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/${ASSET_PREFIX}-$p.zip" \
-              || { echo "::error::failed to download ${ASSET_PREFIX}-$p.zip for $TAG"; exit 1; }
-          done
-          SHA_ARM64="$(shasum -a 256 macos-arm64.zip | awk '{print $1}')"
-          SHA_X64="$(shasum -a 256 macos-x64.zip | awk '{print $1}')"
-          SHA_WIN="$(shasum -a 256 windows-x64.zip | awk '{print $1}')"
-          SHA_LINUX="$(shasum -a 256 linux-x64.zip | awk '{print $1}')"
-          echo "TAG=$TAG arm64=$SHA_ARM64 x64=$SHA_X64 win=$SHA_WIN linux=$SHA_LINUX"
-          test -n "$SHA_ARM64" && test -n "$SHA_X64" && test -n "$SHA_WIN" && test -n "$SHA_LINUX" \
-            || { echo "::error::hash computation failed"; exit 1; }
-          ASSET_PREFIX="$ASSET_PREFIX" bash "$GITHUB_WORKSPACE/scripts/update-manifest.sh" \
-            "$TAG" "$SHA_ARM64" "$SHA_X64" "$SHA_WIN" "$SHA_LINUX" \
-            || { echo "::error::update-manifest.sh failed"; exit 1; }
-          # Guard against a future script/workflow naming drift.
-          if ! grep -q "\"url\".*/${ASSET_PREFIX}-macos-arm64.zip\"" "$GITHUB_WORKSPACE/updates/stable.json"; then
-            echo "::error::stable.json asset URLs do not match ASSET_PREFIX=${ASSET_PREFIX}"
-            cat "$GITHUB_WORKSPACE/updates/stable.json"
-            exit 1
-          fi
-          cat "$GITHUB_WORKSPACE/updates/stable.json"
+          sha() { sha256sum "release-assets/zstock-$1.zip" | awk '{print $1}'; }
+          bash scripts/update-manifest.sh "$TAG" \
+            "$(sha macos-arm64)" "$(sha macos-x64)" \
+            "$(sha windows-x64)" "$(sha linux-x64)"
 
-      - name: Commit manifest to main
+      # The helper validates every uploaded asset before making the draft public.
+      # Only then is stable.json advanced, with a non-force main ref update.
+      - name: Publish verified release and commit manifest
         uses: actions/github-script@v7
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          PUBLICATION_HEAD: ${{ needs.resolve.outputs.publication_head }}
         with:
           script: |
-            try {
-              const fs = require("fs");
-              const content = fs.readFileSync("updates/stable.json", "utf8");
-              let sha;
-              try {
-                const existing = await github.rest.repos.getContent({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  path: "updates/stable.json",
-                  ref: "main",
-                });
-                sha = existing.data.sha;
-              } catch (error) {
-                if (error.status !== 404) throw error;
-              }
-              await github.rest.repos.createOrUpdateFileContents({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                path: "updates/stable.json",
-                message: `chore(update): publish stable manifest for ${process.env.TAG}`,
-                content: Buffer.from(content).toString("base64"),
-                ...(sha ? { sha } : {}),
-                branch: "main",
-              });
-            } catch (error) {
-              core.error(`manifest commit failed: ${error.message}`);
-              throw error;
-            }
+            const { publishRelease } = require('./scripts/publish-release.cjs');
+            await publishRelease({ github, context, core, tag: process.env.TAG,
+              sourceSha: process.env.SOURCE_SHA, publicationHead: process.env.PUBLICATION_HEAD });

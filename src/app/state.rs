@@ -4,7 +4,7 @@ use crate::controller::market::MarketController;
 use crate::controller::state::RequestSlot;
 use crate::domain::decision::DecisionCard;
 use crate::domain::fundamentals::FundamentalSnapshot;
-use crate::domain::market::KlineSeries;
+use crate::domain::market::{KlineSeries, SeriesIdentity};
 use crate::domain::money::Currency;
 use crate::services::fundamentals::FundamentalsProvider;
 use crate::services::performance::{PerformanceMonitor, PerformanceTracker};
@@ -44,6 +44,29 @@ pub struct MarketState {
 pub struct ChartState {
     pub controller: ChartController,
     pub visible: Option<KlineSeries>,
+    pub visible_identity: Option<SeriesIdentity>,
+    pub daily: DailyAnalysisState,
+}
+
+/// Fixed-window, daily forward-adjusted evidence, independent of chart navigation.
+#[derive(Default)]
+pub struct DailyAnalysisState {
+    pub request: RequestSlot<()>,
+    pub requested_code: Option<String>,
+    pub error: Option<(String, String)>,
+    pub code: Option<String>,
+    pub candles: Vec<crate::model::Candle>,
+    pub source: String,
+}
+
+impl DailyAnalysisState {
+    pub fn candles_for(&self, code: &str) -> &[crate::model::Candle] {
+        if self.code.as_deref() == Some(code) {
+            &self.candles
+        } else {
+            &[]
+        }
+    }
 }
 
 #[derive(Default)]
@@ -274,5 +297,68 @@ impl super::StockApp {
             eprintln!("A6_CHART_FRAMES_END completed_interactions=120");
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod daily_evidence_tests {
+    use super::*;
+    use crate::data::{levels, signals};
+    use crate::domain::market::{Adjustment, BarKind};
+    use crate::model::{Candle, shared};
+
+    #[test]
+    fn minute_view_changes_do_not_replace_daily_evidence_or_leak_between_instruments() {
+        let mut state = ChartState::default();
+        state.daily.code = Some("600519".into());
+        state.daily.source = "offline daily fixture".into();
+        state.daily.candles = (0..120)
+            .map(|index| {
+                let close = 10.0 + f64::from(index) / 20.0;
+                Candle {
+                    date: shared(format!("2026-day-{index:03}")),
+                    open: close - 0.1,
+                    high: close + 0.5,
+                    low: close - 0.5,
+                    close,
+                    volume: 1_000,
+                }
+            })
+            .collect();
+        let evidence = || {
+            let daily = state.daily.candles_for("600519");
+            (
+                signals::analyze(daily).unwrap().score,
+                serde_json::to_string(&levels::compute(daily)).unwrap(),
+            )
+        };
+        let before = evidence();
+        for bars in [
+            BarKind::Minute(1),
+            BarKind::Minute(5),
+            BarKind::Intraday,
+            BarKind::Daily,
+        ] {
+            state.visible_identity = SeriesIdentity::stock("600519", bars, Adjustment::None);
+            let daily = state.daily.candles_for("600519");
+            let after = (
+                signals::analyze(daily).unwrap().score,
+                serde_json::to_string(&levels::compute(daily)).unwrap(),
+            );
+            assert_eq!(before, after);
+        }
+        assert!(state.daily.candles_for("000001").is_empty());
+        assert_eq!(state.daily.candles_for("600519").len(), 120);
+    }
+
+    #[test]
+    fn daily_request_a_b_a_rejects_late_success_and_failure() {
+        let mut daily = DailyAnalysisState::default();
+        let old = daily.request.begin("600519");
+        daily.request.begin("000001");
+        let current = daily.request.begin("600519");
+        assert!(!daily.request.apply(&old, ()));
+        assert!(!daily.request.fail(&old, "late fixture failure"));
+        assert!(daily.request.apply(&current, ()));
     }
 }

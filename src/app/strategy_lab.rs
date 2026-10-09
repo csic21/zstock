@@ -26,7 +26,12 @@ impl super::StockApp {
             .filter(|symbol| Market::for_code(&symbol.code) == Some(market))
             .count()
             .min(100);
-        (code, market_label, watchlist_count, self.candles.len())
+        (
+            code,
+            market_label,
+            watchlist_count,
+            self.current_daily_candles().len(),
+        )
     }
 
     pub(crate) fn strategy_lab_instrument_labels(
@@ -129,8 +134,14 @@ impl super::StockApp {
     pub(crate) fn strategy_lab_create_current(&mut self, cx: &mut gpui::Context<Self>) {
         let code = self.selected.to_string();
         let market = Market::for_code(&code).unwrap_or(Market::AShare);
+        if self.current_daily_candles().len() < 30 {
+            self.strategy_lab_feature.state.status =
+                "当前标的日线证据不足 30 根，等待日线加载后再冻结实验".into();
+            cx.notify();
+            return;
+        }
         let candles = self
-            .candles
+            .current_daily_candles()
             .iter()
             .map(|candle| CandleRecord {
                 time: candle.date.to_string(),
@@ -147,7 +158,7 @@ impl super::StockApp {
                 asset_type: AssetType::Stock,
                 code,
             },
-            source: "zstock-ui-current-series-v1".into(),
+            source: format!("{} · canonical-daily-v1", self.daily_analysis_source()),
             adjustment: Adjustment::Forward,
             candles,
         };

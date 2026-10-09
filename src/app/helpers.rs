@@ -4,8 +4,9 @@ use gpui::{
     App, Context, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px, relative,
 };
+use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::tooltip::Tooltip;
-use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
+use gpui_component::{ActiveTheme, Sizable, StyledExt, h_flex, v_flex};
 
 use crate::model::{Symbol, disguise_label, format_pct, format_price, shared};
 use crate::storage::ColorScheme;
@@ -68,6 +69,7 @@ pub(crate) fn palette_row(
     } = options;
     let code = sym.code.clone();
     let name = sym.name.to_string();
+    let preview = sym.clone();
     let code_width = if work_mode && reveal_identity {
         180.0
     } else {
@@ -137,6 +139,7 @@ pub(crate) fn palette_row(
     div()
         .id(("palette-item", row_id))
         .h(px(40.))
+        .flex_shrink_0()
         .px_3()
         .rounded(cx.theme().radius)
         .flex()
@@ -145,12 +148,8 @@ pub(crate) fn palette_row(
         .cursor_pointer()
         .when(highlighted, |this| this.bg(cx.theme().accent.opacity(0.22)))
         .hover(|this| this.bg(cx.theme().accent.opacity(0.15)))
-        .on_click(cx.listener(move |this, _, window, cx| {
-            if in_watchlist {
-                this.select_symbol(shared(code.clone()), cx);
-            } else {
-                this.add_symbol(code.clone(), name.clone(), window, cx);
-            }
+        .on_click(cx.listener(move |this, _, _window, cx| {
+            this.open_research_symbol(preview.clone(), cx);
         }))
         .child(
             div()
@@ -192,10 +191,19 @@ pub(crate) fn palette_row(
         })
         .when(!in_watchlist, |this| {
             this.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().accent)
-                    .child(L::palette_add(work_mode)),
+                Button::new(("palette-add", row_id))
+                    .ghost()
+                    .xsmall()
+                    .label(L::palette_add(work_mode))
+                    .tooltip(if work_mode {
+                        "Save to list"
+                    } else {
+                        "加入自选"
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.add_symbol(code.clone(), name.clone(), window, cx);
+                    })),
             )
         })
 }

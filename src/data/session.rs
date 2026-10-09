@@ -11,7 +11,12 @@
 //! 节假日未内置日历：周末休市；工作日按上述时段轮询。盘外仅在应用启动时
 //! 由 `refresh_all` 拉一次快照，轮询循环不再打行情接口。
 
-use chrono::{Datelike, Local, NaiveTime, Weekday};
+use chrono::{Datelike, NaiveTime, TimeZone, Utc, Weekday};
+
+use crate::domain::market::exchange_offset;
+
+/// Weekday session estimate only: exchange holidays and special closures are not loaded.
+pub const SESSION_CALENDAR_NOTE: &str = "UTC+8 工作日时段估计；未接入节假日/临时休市日历";
 
 use crate::model::{is_a_share_code, is_hk_code};
 
@@ -35,7 +40,8 @@ impl MarketId {
         }
     }
 
-    pub fn is_open_at(self, now: chrono::DateTime<Local>) -> bool {
+    pub fn is_open_at<Tz: TimeZone>(self, now: chrono::DateTime<Tz>) -> bool {
+        let now = now.with_timezone(&exchange_offset());
         if !is_weekday(now) {
             return false;
         }
@@ -47,7 +53,7 @@ impl MarketId {
     }
 }
 
-fn is_weekday(now: chrono::DateTime<Local>) -> bool {
+fn is_weekday<Tz: TimeZone>(now: chrono::DateTime<Tz>) -> bool {
     !matches!(now.weekday(), Weekday::Sat | Weekday::Sun)
 }
 
@@ -105,12 +111,12 @@ impl MarketSet {
 
 /// Which markets among `present` are currently open.
 pub fn open_markets_now(present: MarketSet) -> MarketSet {
-    open_markets_at(present, Local::now())
+    open_markets_at(present, Utc::now())
 }
 
-pub fn open_markets_at(present: MarketSet, now: chrono::DateTime<Local>) -> MarketSet {
+pub fn open_markets_at<Tz: TimeZone>(present: MarketSet, now: chrono::DateTime<Tz>) -> MarketSet {
     MarketSet {
-        a: present.a && MarketId::CnA.is_open_at(now),
+        a: present.a && MarketId::CnA.is_open_at(now.clone()),
         hk: present.hk && MarketId::Hk.is_open_at(now),
     }
 }
@@ -138,10 +144,10 @@ pub fn should_poll_quotes(present: MarketSet) -> bool {
 ///
 /// 盘中不抢带宽；盘后 / 午休边缘 / 周末可以预扫。
 pub fn is_a_share_quiet_now() -> bool {
-    is_a_share_quiet_at(Local::now())
+    is_a_share_quiet_at(Utc::now())
 }
 
-pub fn is_a_share_quiet_at(now: chrono::DateTime<Local>) -> bool {
+pub fn is_a_share_quiet_at<Tz: TimeZone>(now: chrono::DateTime<Tz>) -> bool {
     !MarketId::CnA.is_open_at(now)
 }
 
@@ -154,10 +160,14 @@ pub fn should_background_long_rescan() -> bool {
 ///
 /// Caps at `max_secs` so clock skew / DST edge cases still recover.
 pub fn idle_delay_secs(present: MarketSet, max_secs: u64) -> u64 {
-    idle_delay_secs_at(present, Local::now(), max_secs)
+    idle_delay_secs_at(present, Utc::now(), max_secs)
 }
 
-pub fn idle_delay_secs_at(present: MarketSet, now: chrono::DateTime<Local>, max_secs: u64) -> u64 {
+pub fn idle_delay_secs_at<Tz: TimeZone>(
+    present: MarketSet,
+    now: chrono::DateTime<Tz>,
+    max_secs: u64,
+) -> u64 {
     let max_secs = max_secs.clamp(5, 300);
     if present.is_empty() {
         return max_secs;
@@ -169,7 +179,11 @@ pub fn idle_delay_secs_at(present: MarketSet, now: chrono::DateTime<Local>, max_
     }
 }
 
-fn secs_until_next_open(present: MarketSet, now: chrono::DateTime<Local>) -> Option<u64> {
+fn secs_until_next_open<Tz: TimeZone>(
+    present: MarketSet,
+    now: chrono::DateTime<Tz>,
+) -> Option<u64> {
+    let now = now.with_timezone(&exchange_offset());
     // Scan forward up to 8 days in 1-minute steps is heavy; jump by session anchors.
     let anchors = session_anchors(present);
     if anchors.is_empty() {
@@ -183,7 +197,10 @@ fn secs_until_next_open(present: MarketSet, now: chrono::DateTime<Local>) -> Opt
             continue;
         }
         for &anchor in &anchors {
-            let candidate = day.and_time(anchor).and_local_timezone(Local).single()?;
+            let candidate = day
+                .and_time(anchor)
+                .and_local_timezone(exchange_offset())
+                .single()?;
             if candidate > now {
                 let d = candidate.signed_duration_since(now);
                 return Some(d.num_seconds().max(0) as u64);
@@ -214,8 +231,8 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
-    fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> chrono::DateTime<Local> {
-        Local
+    fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> chrono::DateTime<chrono::FixedOffset> {
+        exchange_offset()
             .with_ymd_and_hms(y, mo, d, h, mi, 0)
             .single()
             .expect("local time")
@@ -279,5 +296,19 @@ mod tests {
         // With a higher cap, exact remaining is returned
         let d3 = idle_delay_secs_at(present, at(2026, 8, 3, 9, 14), 300);
         assert_eq!(d3, 60);
+    }
+    #[test]
+    fn session_is_exchange_time_independent_of_computer_timezone() {
+        let utc = Utc.with_ymd_and_hms(2026, 10, 9, 1, 30, 0).unwrap();
+        let new_york = utc.with_timezone(&chrono::FixedOffset::west_opt(4 * 3600).unwrap());
+        assert!(MarketId::CnA.is_open_at(utc));
+        assert!(MarketId::CnA.is_open_at(new_york));
+        let just_before = Utc.with_ymd_and_hms(2026, 10, 9, 1, 14, 30).unwrap();
+        assert_eq!(
+            idle_delay_secs_at(MarketSet { a: true, hk: false }, just_before, 300),
+            30
+        );
+        // Friday in UTC is already Saturday on the exchanges.
+        assert!(!MarketId::Hk.is_open_at(Utc.with_ymd_and_hms(2026, 10, 9, 23, 30, 0).unwrap()));
     }
 }

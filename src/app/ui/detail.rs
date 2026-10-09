@@ -25,7 +25,7 @@ use crate::model::{QuoteSnapshot, format_pct, format_price, format_volume};
 
 use super::super::helpers::*;
 use super::super::labels::L;
-use super::super::{AiPanelState, ChartKind, DetailTab, LeftTab, StockApp};
+use super::super::{AiPanelState, DetailTab, LeftTab, StockApp};
 
 impl StockApp {
     pub(crate) fn render_detail_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -128,27 +128,18 @@ impl StockApp {
         let work = self.work_mode;
         let signal = self.current_signal();
         let sym = self.current_symbol();
-        let candles_match = self
-            .candles_code
-            .as_ref()
-            .is_some_and(|c| c == self.selected.as_ref());
-        let snap = if candles_match {
-            match self.chart_kind {
-                ChartKind::Intraday => self.minute.as_ref().and_then(|m| m.snapshot()),
-                ChartKind::DayK | ChartKind::MinuteK(_) => {
-                    QuoteSnapshot::from_candles(&self.candles)
-                }
-            }
-        } else {
-            None
-        };
-        let last_candle = if candles_match {
-            self.candles.last()
-        } else {
-            None
-        };
+        // Overview analytics always describe the selected instrument's daily
+        // evidence; changing the visible chart interval cannot relabel minute bars.
+        let daily = self.current_daily_candles();
+        let snap = QuoteSnapshot::from_candles(daily);
+        let last_candle = daily.last();
         let code = self.selected.as_ref();
-        let name_raw = sym.map(|s| s.name.as_ref()).unwrap_or("");
+        let quote = self.quote_for_code(code).filter(|quote| quote.usable());
+        let name_raw = quote
+            .map(|quote| quote.name.as_str())
+            .filter(|name| is_real_name(name, code))
+            .or_else(|| sym.map(|symbol| symbol.name.as_ref()))
+            .unwrap_or("");
         let title = if work {
             self.display_code(code)
         } else if is_real_name(name_raw, code) {
@@ -156,15 +147,51 @@ impl StockApp {
         } else {
             code.to_string()
         };
+        let daily_as_of = last_candle
+            .map(|candle| candle.date.to_string())
+            .unwrap_or_else(|| "—".into());
         let period = if work {
-            format!("{} · {} pts", self.chart_label(), self.candles.len())
+            format!(
+                "Daily · {} bars · {} · {}",
+                daily.len(),
+                daily_as_of,
+                self.daily_analysis_source()
+            )
         } else {
-            format!("{} · {} 根", self.chart_label(), self.candles.len())
+            format!(
+                "日线证据 · {} 根 · {} · {}",
+                daily.len(),
+                daily_as_of,
+                self.daily_analysis_source()
+            )
         };
-        let prev = self.format_value(snap.as_ref().map(|s| s.prev_close).unwrap_or(0.0));
-        let last_price = sym.map(|s| s.last).unwrap_or(0.0);
-        let change_pct = sym.map(|s| s.change_pct).unwrap_or(0.0);
-        let volume = sym.map(|s| s.volume).unwrap_or(0);
+        let prev = snap
+            .as_ref()
+            .map(|snapshot| snapshot.prev_close)
+            .filter(|price| price.is_finite() && *price > 0.0)
+            .map(|price| self.format_value(price))
+            .unwrap_or_else(|| "—".into());
+        let last_price = quote.and_then(|quote| quote.price);
+        let change_pct = quote
+            .and_then(|quote| quote.change_pct)
+            .filter(|change| change.is_finite());
+        let quote_label = quote
+            .map(|quote| {
+                format!(
+                    "{} · {} · {}",
+                    quote.source,
+                    quote.freshness_label(),
+                    quote.as_of_label()
+                )
+            })
+            .unwrap_or_else(|| {
+                if work {
+                    "Quote unavailable"
+                } else {
+                    "行情不可用"
+                }
+                .into()
+            });
         let decision_card = self
             .analysis_state
             .decision_card
@@ -221,17 +248,28 @@ impl StockApp {
                                         div()
                                             .text_sm()
                                             .font_semibold()
-                                            .text_color(self.chg_color(change_pct >= 0.0, cx))
-                                            .child(if last_price > 0.0 {
-                                                format!(
-                                                    "{}  {}",
-                                                    self.format_value(last_price),
-                                                    format_pct(change_pct)
-                                                )
-                                            } else {
-                                                "—".into()
-                                            }),
+                                            .text_color(
+                                                change_pct
+                                                    .map(|change| self.chg_color(change >= 0.0, cx))
+                                                    .unwrap_or(cx.theme().muted_foreground),
+                                            )
+                                            .child(format!(
+                                                "{} {}  {}",
+                                                if work { "Quote" } else { "行情" },
+                                                last_price
+                                                    .map(|price| self.format_value(price))
+                                                    .unwrap_or_else(|| "—".into()),
+                                                change_pct
+                                                    .map(format_pct)
+                                                    .unwrap_or_else(|| "—".into())
+                                            )),
                                     ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(quote_label),
                             )
                             .child(if let Some(s) = signal.as_ref() {
                                 h_flex()
@@ -374,44 +412,48 @@ impl StockApp {
                     .py_1p5()
                     .rounded(cx.theme().radius)
                     .bg(cx.theme().muted.opacity(0.35))
-                    .child(metric_chip(if work { "Base" } else { "昨收" }, &prev, cx))
                     .child(metric_chip(
-                        if work { "O" } else { "开" },
+                        if work {
+                            "Previous daily close"
+                        } else {
+                            "前根日K收"
+                        },
+                        &prev,
+                        cx,
+                    ))
+                    .child(metric_chip(
+                        if work { "Daily O" } else { "日K开" },
                         &last_candle
                             .map(|c| self.format_value(c.open))
                             .unwrap_or_else(|| "—".into()),
                         cx,
                     ))
                     .child(metric_chip(
-                        if work { "H" } else { "高" },
+                        if work { "Daily H" } else { "日K高" },
                         &last_candle
                             .map(|c| self.format_value(c.high))
                             .unwrap_or_else(|| "—".into()),
                         cx,
                     ))
                     .child(metric_chip(
-                        if work { "L" } else { "低" },
+                        if work { "Daily L" } else { "日K低" },
                         &last_candle
                             .map(|c| self.format_value(c.low))
                             .unwrap_or_else(|| "—".into()),
                         cx,
                     ))
                     .child(metric_chip(
-                        if work { "C" } else { "收" },
+                        if work { "Daily C" } else { "日K收" },
                         &last_candle
                             .map(|c| self.format_value(c.close))
                             .unwrap_or_else(|| "—".into()),
                         cx,
                     ))
                     .child(metric_chip(
-                        if work { "Vol" } else { "量" },
-                        &if volume > 0 {
-                            format_volume(volume)
-                        } else {
-                            last_candle
-                                .map(|c| format_volume(c.volume))
-                                .unwrap_or_else(|| "—".into())
-                        },
+                        if work { "Daily volume" } else { "日K量" },
+                        &last_candle
+                            .map(|candle| format_volume(candle.volume))
+                            .unwrap_or_else(|| "—".into()),
                         cx,
                     ))
                     .child(div().flex_1())
@@ -1000,18 +1042,12 @@ impl StockApp {
         let work = self.work_mode;
         let code = self.selected.to_string();
         let pos = self.portfolio.position_state_of(&code);
-        let last = self
-            .symbols
-            .iter()
-            .find(|s| s.code == code)
-            .map(|s| s.last)
-            .filter(|p| *p > 0.0)
-            .or_else(|| self.candles.last().map(|c| c.close))
-            .unwrap_or(0.0);
         let mark = pos
             .as_ref()
-            .filter(|p| p.shares > 1e-9)
-            .map(|p| portfolio::PositionMark::from_position(p.clone(), last, 0.0));
+            .filter(|position| position.shares > 1e-9)
+            .map(|position| {
+                portfolio::PositionMark::from_quote(position.clone(), self.quote_for_code(&code))
+            });
         let trades: Vec<_> = self
             .portfolio
             .trades_for(&code)
@@ -1021,11 +1057,7 @@ impl StockApp {
             .cloned()
             .collect();
 
-        let current_key = self.candles.last().map(|c| {
-            let shares = pos.as_ref().map(|p| p.shares).unwrap_or(0.0);
-            let avg = pos.as_ref().map(|p| p.avg_cost).unwrap_or(0.0);
-            format!("pos:{}@{}:{:.4}:{:.4}", code, c.date, shares, avg)
-        });
+        let current_key = self.portfolio_advice_cache_key();
         let shown = current_key
             .as_ref()
             .is_some_and(|k| self.portfolio_ai_key.as_ref() == Some(k));
@@ -1088,7 +1120,10 @@ impl StockApp {
 
         // 持仓数字
         if let Some(m) = &mark {
-            let pnl_c = self.chg_color(m.unrealized_pnl >= 0.0, cx);
+            let pnl_c = m
+                .unrealized_pnl
+                .map(|pnl| self.chg_color(pnl >= 0.0, cx))
+                .unwrap_or(cx.theme().muted_foreground);
             col = col.child(
                 h_flex()
                     .gap_2()
@@ -1105,12 +1140,14 @@ impl StockApp {
                     ))
                     .child(metric_chip(
                         if work { "Last" } else { "现价" },
-                        &format_price(m.last),
+                        &m.last.map(format_price).unwrap_or_else(|| "—".into()),
                         cx,
                     ))
                     .child(metric_chip(
                         if work { "Value" } else { "市值" },
-                        &format!("{:.0}", m.market_value),
+                        &m.market_value
+                            .map(|value| format!("{value:.0}"))
+                            .unwrap_or_else(|| "—".into()),
                         cx,
                     ))
                     .child(
@@ -1130,13 +1167,31 @@ impl StockApp {
                                     .child(if work { "P&L" } else { "浮盈亏" }),
                             )
                             .child(div().text_sm().font_semibold().text_color(pnl_c).child(
-                                format!(
-                                    "{} ({})",
-                                    format_money(m.unrealized_pnl),
-                                    format_pct(m.unrealized_pnl_pct)
-                                ),
+                                match (m.unrealized_pnl, m.unrealized_pnl_pct) {
+                                    (Some(pnl), Some(pct)) => {
+                                        format!("{} ({})", format_money(pnl), format_pct(pct))
+                                    }
+                                    _ => if work { "Unavailable" } else { "估值未知" }.into(),
+                                },
                             )),
                     ),
+            );
+            col = col.child(
+                div()
+                    .text_xs()
+                    .text_color(if m.quote_is_uncertain() {
+                        cx.theme().warning
+                    } else {
+                        cx.theme().muted_foreground
+                    })
+                    .child(format!(
+                        "{}{}",
+                        m.valuation_label(work),
+                        m.quote_as_of
+                            .as_ref()
+                            .map(|as_of| format!(" · {as_of}"))
+                            .unwrap_or_default()
+                    )),
             );
             if m.position.realized_pnl.abs() > 1e-6 {
                 col = col.child(

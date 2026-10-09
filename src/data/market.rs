@@ -8,10 +8,8 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Result, anyhow};
 
-use crate::infrastructure::market::service::MarketDataService;
-use crate::model::{
-    Candle, MinutePeriod, MinuteSeries, Symbol, board_for_code, is_hk_code, shared,
-};
+use crate::infrastructure::market::service::{MarketDataService, QuoteBatch};
+use crate::model::{Candle, MinutePeriod, MinuteSeries, Symbol, is_hk_code};
 
 use super::eastmoney::{self, QuoteTick};
 pub use super::eastmoney::{IndustryHeatmapSector, SectorTick};
@@ -66,11 +64,7 @@ pub fn fetch_quotes(codes: &[String]) -> Result<Sourced<Vec<QuoteTick>>> {
             source: SRC_LABEL,
         });
     }
-    let mut service = QUOTE_SERVICE
-        .get_or_init(|| Mutex::new(MarketDataService::default()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let batch = service.fetch_quotes(codes);
+    let batch = fetch_quote_records(codes);
     let data: Vec<_> = batch
         .records
         .into_iter()
@@ -116,6 +110,25 @@ pub fn fetch_quotes(codes: &[String]) -> Result<Sourced<Vec<QuoteTick>>> {
         SRC_LABEL
     };
     Ok(Sourced { data, source })
+}
+
+/// Canonical application feed, including missing rows and fallback errors.
+pub fn fetch_quote_records(codes: &[String]) -> QuoteBatch {
+    QUOTE_SERVICE
+        .get_or_init(|| Mutex::new(MarketDataService::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .fetch_quotes(codes)
+}
+
+pub fn quote_source(records: &[crate::domain::market::QuoteRecord]) -> &'static str {
+    if !records.is_empty() && records.iter().all(|record| record.source == SRC_EASTMONEY) {
+        SRC_EASTMONEY
+    } else if !records.is_empty() && records.iter().all(|record| record.source == SRC_TENCENT) {
+        SRC_TENCENT
+    } else {
+        SRC_LABEL
+    }
 }
 
 fn try_klines_chain(
@@ -236,42 +249,6 @@ pub fn search_symbols(query: &str, limit: usize) -> Result<Sourced<Vec<Symbol>>>
             }
         }
     }
-}
-
-/// Hydrate watchlist codes with names/prices (failover quotes).
-pub fn hydrate_symbols(codes: &[String]) -> Result<Sourced<Vec<Symbol>>> {
-    let sourced = fetch_quotes(codes)?;
-    let mut map: std::collections::HashMap<String, QuoteTick> = sourced
-        .data
-        .into_iter()
-        .map(|q| (q.code.clone(), q))
-        .collect();
-    let mut out = Vec::with_capacity(codes.len());
-    for code in codes {
-        if let Some(q) = map.remove(code) {
-            out.push(Symbol {
-                code: code.clone(),
-                name: shared(q.name),
-                last: q.last,
-                change_pct: q.change_pct,
-                volume: q.volume,
-                board: board_for_code(code),
-            });
-        } else {
-            out.push(Symbol {
-                code: code.clone(),
-                name: shared(code.clone()),
-                last: 0.0,
-                change_pct: 0.0,
-                volume: 0,
-                board: board_for_code(code),
-            });
-        }
-    }
-    Ok(Sourced {
-        data: out,
-        source: sourced.source,
-    })
 }
 
 #[cfg(test)]

@@ -394,6 +394,7 @@ impl StockApp {
                                             .ghost()
                                             .label(if work { "+Long" } else { "+长线池" })
                                             .on_click(cx.listener(move |this, _, _w, cx| {
+                                                cx.stop_propagation();
                                                 this.add_pick_to_group(
                                                     &code_l, &name_l, last_l, WatchTag::Long, cx,
                                                 );
@@ -405,6 +406,7 @@ impl StockApp {
                                             .ghost()
                                             .label(if work { "+Short" } else { "+短线池" })
                                             .on_click(cx.listener(move |this, _, _w, cx| {
+                                                cx.stop_propagation();
                                                 this.add_pick_to_group(
                                                     &code_s, &name_s, last_s, WatchTag::Short, cx,
                                                 );
@@ -680,6 +682,7 @@ impl StockApp {
                                         .ghost()
                                         .label(if work { "+Short" } else { "+短线池" })
                                         .on_click(cx.listener(move |this, _, _w, cx| {
+                                            cx.stop_propagation();
                                             this.add_pick_to_group(
                                                 &code_s, &name_s, last_s, WatchTag::Short, cx,
                                             );
@@ -1045,6 +1048,7 @@ impl StockApp {
                                             let is_selected =
                                                 pick.code == selected.as_ref();
                                             let pick_owned = pick.clone();
+                                            let pick_to_save = pick.clone();
                                             let code_label = if work {
                                                 disguise_label(&pick.code, &pick.name)
                                             } else {
@@ -1185,6 +1189,16 @@ impl StockApp {
                                                             pick.buy_score
                                                         )),
                                                 )
+                                                .child(Button::new(("scout-save", ix as u32))
+                                                    .ghost().xsmall()
+                                                    .label(if work { "+Long" } else { "+长线池" })
+                                                    .on_click(cx.listener(move |this, _, _window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.add_pick_to_group(
+                                                            &pick_to_save.code, &pick_to_save.name,
+                                                            pick_to_save.close, WatchTag::Long, cx,
+                                                        );
+                                                    })))
                                         },
                                     )),
                             )
@@ -1296,6 +1310,7 @@ impl StockApp {
                         el.children(self.treasure_hits.iter().enumerate().map(|(ix, hit)| {
                         let is_selected = hit.code == selected.as_ref();
                         let hit_owned = hit.clone();
+                        let hit_to_save = hit.clone();
                         let code_label = if work {
                             disguise_label(&hit.code, &hit.name)
                         } else {
@@ -1407,6 +1422,14 @@ impl StockApp {
                                     })
                                     .child(score),
                             )
+                            .child(Button::new(("treasure-save", ix as u32))
+                                .ghost().xsmall()
+                                .label(if work { "+Long" } else { "+长线池" })
+                                .on_click(cx.listener(move |this, _, _window, cx| {
+                                    cx.stop_propagation();
+                                    this.add_pick_to_group(&hit_to_save.code, &hit_to_save.name,
+                                        hit_to_save.close, WatchTag::Long, cx);
+                                })))
                         }))
                     }),
             )

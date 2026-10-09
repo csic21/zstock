@@ -4,6 +4,8 @@ use std::collections::HashMap;
 
 use gpui::{Context, SharedString, Timer, Window};
 
+use crate::controller::state::{RequestSlot, RequestState};
+
 use crate::data::groups::{FindMode, WatchTag};
 use crate::data::limitup::{
     self, LIMITUP_KLINE_LIMIT, LIMITUP_PROBE_N, LIMITUP_RESULT_N, LIMITUP_UNIVERSE_N, LimitUpHit,
@@ -22,74 +24,102 @@ use crate::storage::{self};
 use super::helpers::*;
 use super::{ChartKind, ChartRange, DetailTab, LeftTab, StockApp, TREASURE_SCAN_GAP};
 
+pub(crate) type PaletteSearchState = RequestSlot<()>;
+
+/// Removing a watchlist membership does not remove any associated research data.
+#[derive(Debug, Clone)]
+pub(crate) struct RemovedWatchlistEntry {
+    pub(crate) symbol: Symbol,
+    position: usize,
+    pin_position: Option<usize>,
+    was_active_pin: bool,
+}
+
+/// Strict syntax at the UI boundary; normalization alone intentionally tolerates
+/// legacy strings, which is inappropriate for a newly typed search query.
+fn typed_symbol_code(raw: &str) -> Option<String> {
+    let lower = raw.trim().to_ascii_lowercase();
+    let digits = lower
+        .strip_prefix("hk.")
+        .or_else(|| lower.strip_prefix("hk"))
+        .or_else(|| lower.strip_suffix(".hk"))
+        .or_else(|| lower.strip_prefix("sh"))
+        .or_else(|| lower.strip_prefix("sz"))
+        .or_else(|| lower.strip_prefix("bj"))
+        .unwrap_or(&lower);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    normalize_code(&lower)
+}
+
+/// Headers are children of the same scrolling column as the selectable rows.
+fn palette_scroll_child(index: usize, local_count: usize) -> usize {
+    index + usize::from(local_count > 0) + usize::from(index >= local_count)
+}
+
 impl StockApp {
+    /// Ordinary selection keeps the user's chosen analysis tab and chart layout.
     pub(crate) fn select_symbol(&mut self, code: SharedString, cx: &mut Context<Self>) {
+        self.close_palette(cx);
         if self.selected == code {
-            self.palette_open = false;
-            self.detail_tab = DetailTab::Overview;
-            self.bottom_height = self.bottom_height.max(300.0);
-            if let Some(height) = self.dock.main_v.get_mut(1) {
-                *height = (*height).max(300.0);
-            }
-            self.schedule_persist(cx);
             cx.notify();
             return;
         }
         self.portfolio_state.selected_currency =
             crate::domain::money::Currency::for_code(code.as_ref());
         self.selected = code;
+        if self
+            .preview_symbol
+            .as_ref()
+            .is_some_and(|symbol| symbol.code != self.selected.as_ref())
+        {
+            self.preview_symbol = None;
+        }
         self.signal_cache = None;
         self.levels_cache = None;
         self.backtest_report = None;
         self.backtest_comparison.clear();
         self.analysis_state.decision_card = None;
-        self.palette_open = false;
-        // A new selection is a new decision. Keep the process visible instead
-        // of leaving the user on an unrelated detail tab or a collapsed dock.
-        self.detail_tab = DetailTab::Overview;
-        self.bottom_height = self.bottom_height.max(300.0);
-        if let Some(height) = self.dock.main_v.get_mut(1) {
-            *height = (*height).max(300.0);
-        }
         self.schedule_persist(cx);
         self.reload_fundamentals(cx);
         self.reload_chart(cx);
     }
 
-    /// 从寻宝列表点选：必要时临时加入自选，并切到 3Y 以便对照多年高低。
+    /// Global search must reveal the selected chart, including from Today,
+    /// settings, market analysis, and the verification workspace.
+    pub(crate) fn open_research_symbol(&mut self, symbol: Symbol, cx: &mut Context<Self>) {
+        let detail_tab = self.detail_tab;
+        self.settings_open = false;
+        self.market_analysis_open = false;
+        self.market_heatmap_fullscreen = false;
+        if !self.work_mode {
+            self.set_primary_task(crate::app::state::PrimaryTask::Research, cx);
+            self.left_tab = LeftTab::Watchlist;
+            self.detail_tab = detail_tab;
+        }
+        self.preview_symbol(symbol, cx);
+    }
+
+    pub(crate) fn preview_symbol(&mut self, symbol: Symbol, cx: &mut Context<Self>) {
+        let code = shared(symbol.code.clone());
+        self.preview_symbol = Some(symbol);
+        self.select_symbol(code, cx);
+    }
+
+    /// Candidate rows only preview. Saving a candidate is a separate explicit action.
     pub(crate) fn select_treasure_hit(&mut self, hit: &TreasureHit, cx: &mut Context<Self>) {
-        let code = hit.code.clone();
-        let display = display_name_str(&hit.name, &code);
-        if !self.symbols.iter().any(|s| s.code == code) {
-            self.symbols.push(Symbol {
-                code: code.clone(),
-                name: shared(display.clone()),
+        self.preview_symbol(
+            Symbol {
+                code: hit.code.clone(),
+                name: shared(display_name_str(&hit.name, &hit.code)),
                 last: hit.close,
                 change_pct: 0.0,
                 volume: 0,
-                board: board_for_code(&code),
-            });
-            self.filtered_local = (0..self.symbols.len()).collect();
-        } else if let Some(sym) = self.symbols.iter_mut().find(|s| s.code == code) {
-            // 自选里若还是代码占位，用 hit 里更好的名字
-            if !is_real_name(sym.name.as_ref(), &code) && is_real_name(&hit.name, &code) {
-                sym.name = shared(hit.name.clone());
-            }
-        }
-        // 多年对照：自动用 3Y（若已是 Max 则保留）
-        if !matches!(self.range, ChartRange::Y3 | ChartRange::Max) {
-            self.range = ChartRange::Y3;
-        }
-        // 多年对照需要日 K 视图；分时/分钟K 自动切回日 K。
-        self.chart_kind = ChartKind::DayK;
-        self.left_tab = LeftTab::Treasure;
-        self.persist();
-        self.select_symbol(shared(code.clone()), cx);
-
-        // 名称仍是代码时，立刻拉一笔报价补中文名
-        if !is_real_name(&hit.name, &code) {
-            self.fill_names_for_codes(vec![code], cx);
-        }
+                board: board_for_code(&hit.code),
+            },
+            cx,
+        );
     }
 
     /// 用批量行情补全自选 / 寻宝结果中的中文名称。
@@ -737,25 +767,17 @@ impl StockApp {
     }
 
     pub(crate) fn select_scout_pick(&mut self, pick: &ScoutPick, cx: &mut Context<Self>) {
-        // 长线可买观察默认标入长线池
-        self.watch_tags
-            .entry(pick.code.clone())
-            .or_insert(WatchTag::Long);
-        // 若在寻宝榜中，走完整寻宝选中（含 3Y 视图）；否则直接选代码
-        if let Some(hit) = self
-            .treasure_hits
-            .iter()
-            .find(|h| h.code == pick.code)
-            .cloned()
-        {
-            self.select_treasure_hit(&hit, cx);
-        } else {
-            self.left_tab = LeftTab::Treasure;
-            // Open ephemeral levels panel from the analysis dock.
-            self.detail_tab = DetailTab::Treasure;
-            self.schedule_persist(cx);
-            self.select_symbol(shared(pick.code.clone()), cx);
-        }
+        self.preview_symbol(
+            Symbol {
+                code: pick.code.clone(),
+                name: shared(display_name_str(&pick.name, &pick.code)),
+                last: pick.close,
+                change_pct: 0.0,
+                volume: 0,
+                board: board_for_code(&pick.code),
+            },
+            cx,
+        );
     }
 
     pub(crate) fn set_scout_only_buy_watch(&mut self, only: bool, cx: &mut Context<Self>) {
@@ -861,18 +883,13 @@ impl StockApp {
         }
         let code = self.selected.to_string();
         let name = self
-            .symbols
-            .iter()
-            .find(|s| s.code == code)
-            .map(|s| s.name.to_string())
+            .current_symbol()
+            .map(|symbol| symbol.name.to_string())
             .unwrap_or_else(|| code.clone());
         let price = self
-            .symbols
-            .iter()
-            .find(|s| s.code == code)
-            .map(|s| s.last)
-            .filter(|p| *p > 0.0)
-            .or_else(|| self.candles.last().map(|c| c.close));
+            .quote_for_code(&code)
+            .filter(|quote| quote.usable())
+            .and_then(|quote| quote.price);
         self.journal.push(JournalEntry {
             id: journal::new_id(),
             code,
@@ -982,6 +999,12 @@ impl StockApp {
 
     /// 标题栏 / 命令面板：打开「现在找」并按模式开扫。
     pub(crate) fn open_find_and_scan(&mut self, mode: FindMode, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        self.market_analysis_open = false;
+        self.market_heatmap_fullscreen = false;
+        if !self.work_mode {
+            self.set_primary_task(crate::app::state::PrimaryTask::Opportunities, cx);
+        }
         self.find_mode = mode;
         self.left_tab = LeftTab::Treasure;
         self.schedule_persist(cx);
@@ -1259,31 +1282,17 @@ impl StockApp {
     }
 
     pub(crate) fn select_radar_hit(&mut self, hit: &RadarHit, cx: &mut Context<Self>) {
-        let code = hit.code.clone();
-        let display = display_name_str(&hit.name, &code);
-        if !self.symbols.iter().any(|s| s.code == code) {
-            self.symbols.push(Symbol {
-                code: code.clone(),
-                name: shared(display),
+        self.preview_symbol(
+            Symbol {
+                code: hit.code.clone(),
+                name: shared(display_name_str(&hit.name, &hit.code)),
                 last: hit.close,
                 change_pct: hit.change_pct,
                 volume: 0,
-                board: board_for_code(&code),
-            });
-            self.filtered_local = (0..self.symbols.len()).collect();
-        }
-        // 默认标为短线池，方便后续盯盘
-        self.watch_tags
-            .entry(code.clone())
-            .or_insert(WatchTag::Short);
-        self.left_tab = LeftTab::Treasure;
-        self.find_mode = FindMode::Short;
-        self.detail_tab = DetailTab::Strategy;
-        self.schedule_persist(cx);
-        if !matches!(self.range, ChartRange::M1 | ChartRange::M3) {
-            self.range = ChartRange::M3;
-        }
-        self.select_symbol(shared(code), cx);
+                board: board_for_code(&hit.code),
+            },
+            cx,
+        );
     }
 
     pub(crate) fn visible_radar_hits(&self) -> Vec<&RadarHit> {
@@ -1521,31 +1530,17 @@ impl StockApp {
     }
 
     pub(crate) fn select_limitup_hit(&mut self, hit: &LimitUpHit, cx: &mut Context<Self>) {
-        let code = hit.code.clone();
-        let display = display_name_str(&hit.name, &code);
-        if !self.symbols.iter().any(|s| s.code == code) {
-            self.symbols.push(Symbol {
-                code: code.clone(),
-                name: shared(display),
+        self.preview_symbol(
+            Symbol {
+                code: hit.code.clone(),
+                name: shared(display_name_str(&hit.name, &hit.code)),
                 last: hit.close,
                 change_pct: hit.change_pct,
                 volume: 0,
-                board: board_for_code(&code),
-            });
-            self.filtered_local = (0..self.symbols.len()).collect();
-        }
-        // 连板默认标为短线池，方便后续盯盘与分组筛选。
-        self.watch_tags
-            .entry(code.clone())
-            .or_insert(WatchTag::Short);
-        self.left_tab = LeftTab::Treasure;
-        self.find_mode = FindMode::LimitUp;
-        self.detail_tab = DetailTab::Strategy;
-        self.schedule_persist(cx);
-        if !matches!(self.range, ChartRange::M1 | ChartRange::M3) {
-            self.range = ChartRange::M3;
-        }
-        self.select_symbol(shared(code), cx);
+                board: board_for_code(&hit.code),
+            },
+            cx,
+        );
     }
 
     pub(crate) fn visible_limitup_hits(&self) -> Vec<&LimitUpHit> {
@@ -1617,21 +1612,26 @@ impl StockApp {
     ) {
         use crate::data::backtest;
         self.backtest_active_rule = rule;
-        if !matches!(self.chart_kind, ChartKind::DayK) || self.candles.len() < 60 {
+        if self.current_daily_candles().len() < 60 {
             self.backtest_report = None;
             self.analysis_state.decision_card = Some(self.decision_card_view_model());
             self.status = shared(if self.work_mode {
-                "Switch to daily K and load at least 60 bars"
+                "Load at least 60 daily bars"
             } else {
-                "请切到日 K，并至少加载 60 根后再验证"
+                "请等待至少 60 根日 K 加载后再验证"
             });
             cx.notify();
             return;
         }
         let currency = crate::domain::money::Currency::for_code(self.selected.as_ref())
             .unwrap_or(crate::domain::money::Currency::Cny);
-        let report =
-            backtest::run_for_instrument(&self.candles, self.selected.as_ref(), rule, 10, currency);
+        let report = backtest::run_for_instrument(
+            self.current_daily_candles(),
+            self.selected.as_ref(),
+            rule,
+            10,
+            currency,
+        );
         self.backtest_report = report;
         if let Some(report) = self.backtest_report.clone()
             && let Some(existing) = self
@@ -1651,14 +1651,14 @@ impl StockApp {
     pub(crate) fn run_backtest_comparison(&mut self, cx: &mut Context<Self>) {
         use crate::data::backtest::{self, BacktestRule};
 
-        if !matches!(self.chart_kind, ChartKind::DayK) || self.candles.len() < 60 {
+        if self.current_daily_candles().len() < 60 {
             self.backtest_comparison.clear();
             self.backtest_report = None;
             self.analysis_state.decision_card = Some(self.decision_card_view_model());
             self.status = shared(if self.work_mode {
-                "Switch to daily K and load at least 60 bars"
+                "Load at least 60 daily bars"
             } else {
-                "请切到日 K，并至少加载 60 根后再比较"
+                "请等待至少 60 根日 K 加载后再比较"
             });
             cx.notify();
             return;
@@ -1669,7 +1669,7 @@ impl StockApp {
             .into_iter()
             .filter_map(|rule| {
                 backtest::run_for_instrument(
-                    &self.candles,
+                    self.current_daily_candles(),
                     self.selected.as_ref(),
                     rule,
                     10,
@@ -1714,77 +1714,96 @@ impl StockApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.symbols.iter().any(|s| s.code == code) {
-            self.select_symbol(shared(code), cx);
+        let Some(code) = typed_symbol_code(&code) else {
+            self.status = shared("请输入有效的 6 位 A 股或 5 位港股代码");
+            cx.notify();
             return;
+        };
+        let symbol = self
+            .symbols
+            .iter()
+            .find(|symbol| symbol.code == code)
+            .cloned()
+            .unwrap_or_else(|| Symbol {
+                code: code.clone(),
+                name: shared(name),
+                last: 0.0,
+                change_pct: 0.0,
+                volume: 0,
+                board: board_for_code(&code),
+            });
+        if !self.symbols.iter().any(|symbol| symbol.code == code) {
+            self.symbols.push(symbol.clone());
+            self.filtered_local = (0..self.symbols.len()).collect();
+            self.schedule_persist(cx);
         }
-        self.symbols.push(Symbol {
-            code: code.clone(),
-            name: shared(name),
-            last: 0.0,
-            change_pct: 0.0,
-            volume: 0,
-            board: board_for_code(&code),
-        });
-        self.filtered_local = (0..self.symbols.len()).collect();
-        self.persist();
-        self.select_symbol(shared(code), cx);
+        self.open_research_symbol(symbol, cx);
         self.palette_query.update(cx, |input, cx| {
             input.set_value("", window, cx);
         });
     }
 
-    /// 从自选里删除指定代码；删除的是当前选中标的时，自动选中相邻标的。
+    /// Remove membership only. The current research chart and all associated
+    /// alerts, drawings, nicknames, and tags survive, including for the last row.
     pub(crate) fn remove_symbol(&mut self, code: &str, cx: &mut Context<Self>) {
-        if self.symbols.len() <= 1 {
-            self.status = shared(if self.work_mode {
-                "At least one symbol"
-            } else {
-                "至少保留一只自选"
-            });
-            cx.notify();
-            return;
-        }
-        let Some(pos) = self.symbols.iter().position(|s| s.code == code) else {
+        let Some(position) = self.symbols.iter().position(|symbol| symbol.code == code) else {
             return;
         };
-        let was_selected = self.selected.as_ref() == code;
-        self.symbols.remove(pos);
-        self.buy_alerts.remove(code);
-        self.work_aliases.remove(code);
-        self.chart_lines.remove(code);
-        self.watch_tags.remove(code);
+        let symbol = self.symbols.remove(position);
+        if self.selected.as_ref() == code {
+            self.preview_symbol = Some(symbol.clone());
+        }
+        let pin_position = self.status_bar_codes.iter().position(|pin| pin == code);
+        let was_active_pin = self.status_bar_active == code;
+        if let Some(index) = pin_position {
+            self.status_bar_codes.remove(index);
+        }
+        self.watchlist_undo = Some(RemovedWatchlistEntry {
+            symbol,
+            position,
+            pin_position,
+            was_active_pin,
+        });
         self.filtered_local = (0..self.symbols.len()).collect();
-        if was_selected {
-            self.selected = shared(
-                self.symbols
-                    .get(pos)
-                    .or_else(|| self.symbols.last())
-                    .map(|s| s.code.clone())
-                    .unwrap_or_default(),
-            );
-            if self.work_alias_editing {
-                self.work_alias_editing = false;
-            }
-            self.signal_cache = None;
-            self.levels_cache = None;
-            self.backtest_report = None;
-            self.backtest_comparison.clear();
-            self.analysis_state.decision_card = None;
-        }
-        // Drop from status-bar pins if present.
-        if let Some(ix) = self.status_bar_codes.iter().position(|c| c == code) {
-            self.status_bar_codes.remove(ix);
-            if self.status_bar_active == code {
-                self.status_bar_active = self.status_bar_codes.first().cloned().unwrap_or_default();
-            }
-        }
         self.normalize_status_bar_state();
-        self.persist();
+        self.schedule_persist(cx);
         self.sync_status_bar();
-        if was_selected {
-            self.reload_klines(cx);
+        self.status = shared(if self.work_mode {
+            "Removed from list · research data kept · Undo available"
+        } else {
+            "已移出自选 · 提醒、画线、昵称和标签已保留 · 可撤销"
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn undo_remove_symbol(&mut self, cx: &mut Context<Self>) {
+        let Some(removed) = self.watchlist_undo.take() else {
+            return;
+        };
+        let code = removed.symbol.code.clone();
+        if !self.symbols.iter().any(|symbol| symbol.code == code) {
+            let position = removed.position.min(self.symbols.len());
+            self.symbols.insert(position, removed.symbol);
         }
+        if let Some(position) = removed.pin_position
+            && !self.status_bar_codes.contains(&code)
+            && self.status_bar_codes.len() < crate::storage::STATUS_BAR_MAX_CODES
+        {
+            let position = position.min(self.status_bar_codes.len());
+            self.status_bar_codes.insert(position, code.clone());
+            if removed.was_active_pin {
+                self.status_bar_active = code;
+            }
+        }
+        self.filtered_local = (0..self.symbols.len()).collect();
+        self.normalize_status_bar_state();
+        self.schedule_persist(cx);
+        self.sync_status_bar();
+        self.status = shared(if self.work_mode {
+            "Restored to list"
+        } else {
+            "已恢复自选"
+        });
         cx.notify();
     }
 
@@ -1803,62 +1822,103 @@ impl StockApp {
         self.reload_klines(cx);
     }
 
+    pub(crate) fn close_palette(&mut self, cx: &mut Context<Self>) {
+        self.palette_open = false;
+        self.palette_search.cancel();
+        self.palette_hits.clear();
+        cx.notify();
+    }
+
     pub(crate) fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.palette_open = !self.palette_open;
         if self.palette_open {
-            self.palette_hits.clear();
-            self.filtered_local = (0..self.symbols.len()).collect();
-            self.palette_index = 0;
-            self.palette_query.update(cx, |input, cx| {
-                input.set_value("", window, cx);
-            });
-            window.focus(&self.palette_focus);
-            self.palette_query.update(cx, |input, cx| {
-                input.focus(window, cx);
-            });
+            self.close_palette(cx);
+            return;
         }
+        self.palette_search.cancel();
+        self.palette_open = true;
+        self.palette_hits.clear();
+        self.filtered_local = (0..self.symbols.len()).collect();
+        self.palette_index = 0;
+        self.palette_scroll.scroll_to_item(0);
+        self.palette_query.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        window.focus(&self.palette_focus);
+        self.palette_query.update(cx, |input, cx| {
+            input.focus(window, cx);
+        });
         cx.notify();
     }
 
     pub(crate) fn on_palette_query_changed(&mut self, q: &str, cx: &mut Context<Self>) {
-        let q_l = q.trim().to_lowercase();
+        self.palette_search.cancel();
+        self.palette_hits.clear();
         self.palette_index = 0;
-        if q_l.is_empty() {
-            self.filtered_local = (0..self.symbols.len()).collect();
-            self.palette_hits.clear();
-            cx.notify();
-            return;
-        }
+        self.palette_scroll.scroll_to_item(0);
+        let query = q.trim().to_string();
+        let query_lower = query.to_lowercase();
         self.filtered_local = self
             .symbols
             .iter()
             .enumerate()
-            .filter(|(_, s)| {
-                s.code.to_lowercase().contains(&q_l)
-                    || s.name.to_lowercase().contains(&q_l)
-                    || s.board.to_lowercase().contains(&q_l)
+            .filter(|(_, symbol)| {
+                query_lower.is_empty()
+                    || symbol.code.to_lowercase().contains(&query_lower)
+                    || symbol.name.to_lowercase().contains(&query_lower)
+                    || symbol.board.to_lowercase().contains(&query_lower)
             })
-            .map(|(i, _)| i)
+            .map(|(index, _)| index)
             .collect();
-
-        // Async remote search
-        let query = q.trim().to_string();
+        if query.is_empty() || !self.palette_open {
+            cx.notify();
+            return;
+        }
+        let ticket = self.palette_search.begin(query.clone());
         cx.spawn(async move |this, cx| {
+            // Avoid firing a request for every keystroke, while immediately
+            // invalidating old hits above so Enter cannot choose a stale row.
+            Timer::after(std::time::Duration::from_millis(180)).await;
+            let current = this
+                .update(cx, |app, _| {
+                    app.palette_open && app.palette_search.is_current(&ticket)
+                })
+                .unwrap_or(false);
+            if !current {
+                return;
+            }
             let result = smol::unblock(move || market::search_symbols(&query, 12)).await;
-            this.update(cx, |app, cx| {
-                if let Ok(sourced) = result {
-                    app.palette_hits = sourced.data;
-                    // Keep highlight in range after remote results arrive.
-                    let n = app.palette_item_count();
-                    if n > 0 {
-                        app.palette_index = app.palette_index.min(n - 1);
-                    } else {
-                        app.palette_index = 0;
-                    }
-                    cx.notify();
+            let _ = this.update(cx, |app, cx| {
+                if !app.palette_open || !app.palette_search.is_current(&ticket) {
+                    return;
                 }
-            })
-            .ok();
+                match result {
+                    Ok(sourced) => {
+                        let mut seen: std::collections::HashSet<String> = app
+                            .filtered_local
+                            .iter()
+                            .filter_map(|&index| app.symbols.get(index))
+                            .map(|symbol| symbol.code.clone())
+                            .collect();
+                        app.palette_hits = sourced
+                            .data
+                            .into_iter()
+                            .filter(|symbol| {
+                                typed_symbol_code(&symbol.code).is_some()
+                                    && seen.insert(symbol.code.clone())
+                            })
+                            .collect();
+                        app.palette_search.apply(&ticket, ());
+                    }
+                    Err(error) => {
+                        app.palette_search
+                            .fail(&ticket, format!("搜索失败：{error}"));
+                    }
+                }
+                app.palette_index = app
+                    .palette_index
+                    .min(app.palette_item_count().saturating_sub(1));
+                cx.notify();
+            });
         })
         .detach();
         cx.notify();
@@ -1881,11 +1941,13 @@ impl StockApp {
             (cur + 1) % n
         };
         self.palette_index = next;
+        self.palette_scroll
+            .scroll_to_item(palette_scroll_child(next, self.filtered_local.len()));
         cx.notify();
     }
 
-    /// Activate the highlighted palette row, or try to add the typed code.
-    pub(crate) fn palette_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Open the highlighted result or a valid typed code without saving it.
+    pub(crate) fn palette_confirm(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if !self.palette_open {
             return;
         }
@@ -1917,7 +1979,8 @@ impl StockApp {
                 | "情绪"
                 | "market"
         ) {
-            self.palette_open = false;
+            self.close_palette(cx);
+            self.settings_open = false;
             match q_intent.as_str() {
                 "短线" | "找短线" | "short" | "雷达" => {
                     self.open_find_and_scan(FindMode::Short, cx);
@@ -1941,31 +2004,99 @@ impl StockApp {
         let total = n_local + n_remote;
         if total == 0 {
             let q = q_raw.trim();
-            if q.is_empty() {
+            if q.is_empty() || matches!(self.palette_search.state, RequestState::Loading) {
                 return;
             }
-            if let Some(code) = normalize_code(q) {
-                let name = q.to_string();
-                self.add_symbol(code, name, window, cx);
+            if let Some(code) = typed_symbol_code(q) {
+                self.open_research_symbol(
+                    Symbol {
+                        name: shared(code.clone()),
+                        board: board_for_code(&code),
+                        code,
+                        last: 0.0,
+                        change_pct: 0.0,
+                        volume: 0,
+                    },
+                    cx,
+                );
             } else {
-                // Raw 5-digit HK / free-form: still try as code.
-                self.add_symbol(q.to_string(), q.to_string(), window, cx);
+                self.palette_search.state = RequestState::Failed(
+                    "未找到匹配结果。请修改名称，或输入 6 位 A 股 / 5 位港股代码".into(),
+                );
+                cx.notify();
             }
             return;
         }
         let ix = self.palette_index.min(total - 1);
-        if ix < n_local {
-            let code = self.symbols[self.filtered_local[ix]].code.clone();
-            self.select_symbol(shared(code), cx);
+        let symbol = if ix < n_local {
+            self.symbols[self.filtered_local[ix]].clone()
         } else {
-            let hit = self.palette_hits[ix - n_local].clone();
-            self.add_symbol(hit.code.clone(), hit.name.to_string(), window, cx);
-        }
+            self.palette_hits[ix - n_local].clone()
+        };
+        self.open_research_symbol(symbol, cx);
     }
 
     pub(crate) fn current_symbol(&self) -> Option<&Symbol> {
         self.symbols
             .iter()
             .find(|s| s.code == self.selected.as_ref())
+            .or_else(|| {
+                self.preview_symbol
+                    .as_ref()
+                    .filter(|symbol| symbol.code == self.selected.as_ref())
+            })
+    }
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::*;
+
+    #[test]
+    fn typed_codes_reject_arbitrary_text_and_embedded_garbage() {
+        for query in [
+            "",
+            "茅台",
+            "hello",
+            "123",
+            "shabc600519",
+            "hkxyz700",
+            "600519!",
+            "1234567",
+        ] {
+            assert_eq!(typed_symbol_code(query), None, "{query}");
+        }
+        for (query, code) in [
+            ("600519", "600519"),
+            ("sh600519", "600519"),
+            ("00700", "00700"),
+            ("HK700", "00700"),
+            ("700.HK", "00700"),
+        ] {
+            assert_eq!(typed_symbol_code(query).as_deref(), Some(code));
+        }
+    }
+
+    #[test]
+    fn query_switch_clear_close_and_reopen_reject_stale_search() {
+        let mut state = PaletteSearchState::default();
+        let first = state.begin("a");
+        let second = state.begin("ab");
+        assert!(!state.apply(&first, ()));
+        assert!(state.apply(&second, ()));
+        state.cancel();
+        assert!(!state.fail(&second, "old error"));
+        let reopened = state.begin("ab");
+        assert!(!state.apply(&second, ()));
+        assert!(state.apply(&reopened, ()));
+    }
+
+    #[test]
+    fn palette_keyboard_scroll_accounts_for_section_headers() {
+        assert_eq!(palette_scroll_child(0, 0), 1);
+        assert_eq!(palette_scroll_child(0, 3), 1);
+        assert_eq!(palette_scroll_child(2, 3), 3);
+        assert_eq!(palette_scroll_child(3, 3), 5);
+        assert_eq!(palette_scroll_child(8, 3), 10);
     }
 }

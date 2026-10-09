@@ -8,9 +8,9 @@ use crate::data::{
     eastmoney, market,
     market_analysis::{self as analysis, MarketAnalysisContext, MarketIndexPoint},
 };
-use crate::model::shared;
+use crate::model::{Symbol, board_for_code, shared};
 
-use super::{AiPanelState, AiSource, MarketRegion, StockApp, state::PrimaryTask};
+use super::{AiPanelState, AiSource, MarketRegion, StockApp};
 
 impl StockApp {
     /// Load sector breadth when Today needs a climate reading but the
@@ -27,7 +27,7 @@ impl StockApp {
 
     pub(crate) fn open_market_analysis(&mut self, cx: &mut Context<Self>) {
         self.settings_open = false;
-        self.palette_open = false;
+        self.close_palette(cx);
         self.market_analysis_open = true;
         if self.market_analysis_region == MarketRegion::AShare
             && ((self.market_analysis_sectors.is_empty() && !self.market_analysis_loading)
@@ -391,14 +391,18 @@ impl StockApp {
         last: f64,
         cx: &mut Context<Self>,
     ) {
-        self.ensure_in_watchlist(&code, &name, last);
-        self.set_watch_tag(&code, crate::data::groups::WatchTag::Short, cx);
-        self.market_analysis_open = false;
-        self.market_heatmap_fullscreen = false;
-        // Market analysis can be opened from Today. Selecting a heatmap stock
-        // must therefore switch to Research as the overlay closes, otherwise
-        // the selected symbol remains hidden behind the Today dashboard.
-        self.set_primary_task(PrimaryTask::Research, cx);
-        self.select_symbol(shared(code), cx);
+        // Opening an industry constituent is research, not consent to save it
+        // or to change its watchlist grouping.
+        self.open_research_symbol(
+            Symbol {
+                board: board_for_code(&code),
+                code,
+                name: shared(name),
+                last,
+                change_pct: 0.0,
+                volume: 0,
+            },
+            cx,
+        );
     }
 }

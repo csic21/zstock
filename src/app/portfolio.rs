@@ -3,7 +3,9 @@
 use gpui::{Context, Timer, Window};
 
 use crate::data::ai::{self};
-use crate::data::portfolio::{PortfolioSummary, TradeDraft, TradeSide, format_shares};
+use crate::data::portfolio::{
+    LocalTradeForm, PortfolioSummary, TradeConfirmation, TradeSide, format_shares,
+};
 use crate::domain::money::Currency;
 use crate::domain::portfolio::{PortfolioRiskView, RiskItem};
 use crate::model::{Symbol, board_for_code, format_price, normalize_code, shared};
@@ -11,6 +13,40 @@ use crate::storage::{self, AppConfig};
 
 use super::helpers::*;
 use super::{AiCacheEntry, AiPanelState, AiSource, DetailTab, LeftTab, StockApp};
+
+fn portfolio_advice_key(
+    code: &str,
+    daily: &[crate::model::Candle],
+    position: Option<&crate::data::portfolio::Position>,
+    quote: Option<&crate::domain::market::QuoteRecord>,
+    now_millis: i64,
+) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let latest = daily.last()?;
+    let mut evidence = std::collections::hash_map::DefaultHasher::new();
+    for candle in daily {
+        candle.date.as_ref().hash(&mut evidence);
+        candle.open.to_bits().hash(&mut evidence);
+        candle.high.to_bits().hash(&mut evidence);
+        candle.low.to_bits().hash(&mut evidence);
+        candle.close.to_bits().hash(&mut evidence);
+        candle.volume.hash(&mut evidence);
+    }
+    Some(format!(
+        "pos:{code}@{}:{:x}:{:?}:{:?}:{:?}:{:?}:{:?}",
+        latest.date,
+        evidence.finish(),
+        position.map(|position| (
+            position.shares.to_bits(),
+            position.avg_cost.to_bits(),
+            position.realized_pnl.to_bits()
+        )),
+        quote.and_then(|quote| quote.price).map(f64::to_bits),
+        quote.and_then(|quote| quote.change_pct).map(f64::to_bits),
+        quote.map(|quote| quote.source.as_str()),
+        quote.map(|quote| (quote.availability, quote.effective_freshness(now_millis)))
+    ))
+}
 
 impl StockApp {
     pub(crate) fn prefill_position_sized_buy(
@@ -33,7 +69,9 @@ impl StockApp {
                 return;
             }
         };
-        self.open_trade_form(TradeSide::Buy, window, cx);
+        if !self.open_trade_form(TradeSide::Buy, window, cx) {
+            return;
+        }
         self.trade_shares_input.update(cx, |state, cx| {
             state.set_value(plan.shares.to_string(), window, cx);
         });
@@ -83,7 +121,9 @@ impl StockApp {
         } else {
             TradeSide::Sell
         };
-        self.open_trade_form(side, window, cx);
+        if !self.open_trade_form(side, window, cx) {
+            return;
+        }
         self.trade_shares_input.update(cx, |state, cx| {
             state.set_value(plan.shares.to_string(), window, cx);
         });
@@ -180,15 +220,10 @@ impl StockApp {
         }
     }
 
-    /// 组合汇总：现价优先取自选行情，否则用成本占位。
+    /// Quotes belong to instruments, not the user's watchlist.
     pub(crate) fn portfolio_summary(&self) -> PortfolioSummary {
-        self.portfolio.summarize_with(|code| {
-            if let Some(sym) = self.symbols.iter().find(|s| s.code == code) {
-                (sym.last, sym.change_pct, sym.name.to_string())
-            } else {
-                (0.0, 0.0, String::new())
-            }
-        })
+        self.portfolio
+            .summarize_with(|code| self.quote_for_code(code).cloned())
     }
 
     /// A risk projection built from current holdings and deterministic alert
@@ -206,29 +241,12 @@ impl StockApp {
                     .map(|totals| totals.total_market_value)
                     .unwrap_or_default();
                 let position_weight_pct = if group_value > 0.0 {
-                    mark.market_value / group_value * 100.0
+                    mark.market_value.unwrap_or(0.0) / group_value * 100.0
                 } else {
                     0.0
                 };
-                let contract = match &self.services.market.quotes.state {
-                    crate::controller::state::RequestState::Ready(records) => records
-                        .iter()
-                        .find(|record| record.code == mark.position.code),
-                    _ => None,
-                };
-                let raw_quote = contract
-                    .filter(|record| record.usable())
-                    .and_then(|record| record.price)
-                    .or_else(|| {
-                        self.symbols
-                            .iter()
-                            .find(|symbol| symbol.code == mark.position.code)
-                            .map(|symbol| symbol.last)
-                            .filter(|price| price.is_finite() && *price > 0.0)
-                    });
-                let quote_stale = contract.is_none_or(|record| {
-                    !record.usable() || record.freshness == crate::domain::market::Freshness::Stale
-                });
+                let raw_quote = mark.last;
+                let quote_stale = mark.quote_is_uncertain();
                 let stop = self
                     .buy_alerts
                     .get(&mark.position.code)
@@ -258,7 +276,7 @@ impl StockApp {
         PortfolioRiskView::from_items(items)
     }
 
-    /// 确保代码在自选中（持仓需要行情）。
+    /// Explicitly add a code to the watchlist; holdings receive quotes independently.
     pub(crate) fn ensure_in_watchlist(&mut self, code: &str, name: &str, last: f64) {
         let code = normalize_code(code).unwrap_or_else(|| code.trim().to_string());
         if code.is_empty() {
@@ -296,12 +314,12 @@ impl StockApp {
             return;
         }
         if self.palette_open {
-            self.palette_open = false;
-            cx.notify();
+            self.close_palette(cx);
             return;
         }
-        if self.trade_form_side.is_some() {
-            self.trade_form_side = None;
+        if self.trade_form.is_some() {
+            self.trade_form = None;
+            self.trade_feedback = None;
             cx.notify();
             return;
         }
@@ -334,185 +352,184 @@ impl StockApp {
         }
     }
 
-    /// 打开买入/卖出表单，默认填充现价与（卖出时）全部可卖股数。
+    /// Open an editable local record, binding its identity before any input.
+    /// A quote is only a reference; recording a trade never sends a broker order.
     pub(crate) fn open_trade_form(
         &mut self,
         side: TradeSide,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
+        if let Some(form) = &self.trade_form {
+            self.trade_feedback = Some(shared(format!(
+                "{} {} {} · 请先完成或取消当前本地记录",
+                form.name,
+                form.code,
+                form.currency.symbol()
+            )));
+            self.left_tab = LeftTab::Portfolio;
+            cx.notify();
+            return false;
+        }
         let code = self.selected.to_string();
-        let last = self
-            .symbols
-            .iter()
-            .find(|s| s.code == code)
-            .map(|s| s.last)
-            .filter(|p| *p > 0.0)
-            .or_else(|| {
-                self.candles
-                    .last()
-                    .filter(|_| {
-                        self.candles_code
-                            .as_ref()
-                            .is_some_and(|c| c == code.as_str())
-                    })
-                    .map(|c| c.close)
-            })
-            .unwrap_or(0.0);
-        let held = self
-            .portfolio
-            .position_of(&code)
-            .map(|p| p.shares)
-            .unwrap_or(0.0);
-
-        let price_s = if last > 0.0 {
-            format_price(last)
+        let position = self.portfolio.position_of(&code);
+        let quote = self.quote_for_code(&code).filter(|quote| quote.usable());
+        let name = quote
+            .map(|quote| quote.name.clone())
+            .filter(|name| is_real_name(name, &code))
+            .or_else(|| position.as_ref().map(|position| position.name.clone()))
+            .or_else(|| self.current_symbol().map(|symbol| symbol.name.to_string()))
+            .unwrap_or_else(|| code.clone());
+        let mut form = match LocalTradeForm::new(&code, &name, side) {
+            Ok(form) => form,
+            Err(error) => {
+                self.trade_feedback = Some(shared(error.to_string()));
+                self.left_tab = LeftTab::Portfolio;
+                cx.notify();
+                return false;
+            }
+        };
+        let price_s = quote
+            .and_then(|quote| quote.price)
+            .map(format_price)
+            .unwrap_or_default();
+        form.reference_hint = if let Some(quote) = quote {
+            format!(
+                "参考行情：{} · {} · {}；请按实际成交修改价格与费用",
+                quote.source,
+                quote.freshness_label(),
+                quote.as_of_label()
+            )
+        } else {
+            "行情不可用，请填写实际成交价格与费用".into()
+        };
+        let shares_s = if side == TradeSide::Sell {
+            position
+                .as_ref()
+                .map(|position| position.shares.to_string())
+                .unwrap_or_default()
         } else {
             String::new()
         };
-        let shares_s = match side {
-            TradeSide::Sell if held > 0.0 => format_shares(held),
-            _ => String::new(),
-        };
-
-        self.trade_price_input.update(cx, |s, cx| {
-            s.set_value(price_s, window, cx);
-        });
-        self.trade_shares_input.update(cx, |s, cx| {
-            s.set_value(shares_s, window, cx);
-        });
-        self.trade_fee_input.update(cx, |s, cx| {
-            s.set_value("0", window, cx);
-        });
-        self.trade_note_input.update(cx, |s, cx| {
-            s.set_value("", window, cx);
-        });
-        self.trade_form_side = Some(side);
+        self.trade_price_input
+            .update(cx, |state, cx| state.set_value(price_s, window, cx));
+        self.trade_shares_input
+            .update(cx, |state, cx| state.set_value(shares_s, window, cx));
+        self.trade_fee_input
+            .update(cx, |state, cx| state.set_value("0", window, cx));
+        self.trade_note_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.trade_form = Some(form);
+        self.trade_feedback = None;
         self.left_tab = LeftTab::Portfolio;
         self.persist();
+        cx.notify();
+        true
+    }
+
+    pub(crate) fn review_trade(&mut self, cx: &mut Context<Self>) {
+        if self.trade_form.is_none() {
+            return;
+        }
+        let shares = parse_f64(&self.trade_shares_input.read(cx).value());
+        let price = parse_f64(&self.trade_price_input.read(cx).value());
+        let raw_fee = self.trade_fee_input.read(cx).value();
+        let fee = if raw_fee.trim().is_empty() {
+            Some(0.0)
+        } else {
+            parse_f64(&raw_fee)
+        };
+        let note = self.trade_note_input.read(cx).value().to_string();
+        let confirmation = shares
+            .ok_or(crate::data::portfolio::TradeError::InvalidShares)
+            .and_then(|shares| {
+                let price = price.ok_or(crate::data::portfolio::TradeError::InvalidPrice)?;
+                let fee = fee.ok_or(crate::data::portfolio::TradeError::InvalidFee)?;
+                TradeConfirmation::new(shares, price, fee, note)
+            });
+        match confirmation {
+            Ok(confirmation) => {
+                if let Some(form) = &mut self.trade_form {
+                    form.confirmation = Some(confirmation);
+                }
+                self.trade_feedback = None;
+            }
+            Err(error) => self.trade_feedback = Some(shared(error.to_string())),
+        }
         cx.notify();
     }
 
     pub(crate) fn submit_trade(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(side) = self.trade_form_side else {
+        let Some(form) = self.trade_form.clone() else {
             return;
         };
-        let code = self.selected.to_string();
-        let name = self
-            .symbols
-            .iter()
-            .find(|s| s.code == code)
-            .map(|s| s.name.to_string())
-            .unwrap_or_else(|| code.clone());
-
-        let shares = parse_f64(&self.trade_shares_input.read(cx).value());
-        let price = parse_f64(&self.trade_price_input.read(cx).value());
-        let fee = parse_f64(&self.trade_fee_input.read(cx).value()).unwrap_or(0.0);
-        let note = self.trade_note_input.read(cx).value().to_string();
-
-        let (Some(shares), Some(price)) = (shares, price) else {
-            self.status = shared(if self.work_mode {
-                "Invalid shares/price"
-            } else {
-                "请填写有效的股数与价格"
-            });
-            cx.notify();
+        let Some(draft) = form.confirmed_draft() else {
+            // A click on the editing screen cannot write an unreviewed record.
             return;
         };
-
-        match self.portfolio.record_trade(TradeDraft {
-            code: &code,
-            name: &name,
-            side,
-            shares,
-            price,
-            fee,
-            note: &note,
-            time: None,
-        }) {
+        let confirmation = form.confirmation.as_ref().expect("confirmed draft");
+        match self.portfolio.record_trade(draft) {
             Ok(_) => {
-                self.ensure_in_watchlist(&code, &name, price);
                 self.persist_portfolio();
-                self.persist();
-                self.trade_form_side = None;
-                self.status = shared(if self.work_mode {
-                    format!(
-                        "{} {} × {} @ {}",
-                        side.label_work(),
-                        code,
-                        format_shares(shares),
-                        format_price(price)
-                    )
-                } else {
-                    format!(
-                        "{} {} × {} 股 @ {} 元",
-                        side.label(),
-                        code,
-                        format_shares(shares),
-                        format_price(price)
-                    )
-                });
+                self.trade_form = None;
+                let message = shared(format!(
+                    "已保存本地{}记录：{} {} · {} · {} 股 @ {} · 费用 {:.2} · 合计 {:.2}（未连接券商）",
+                    form.side.label(),
+                    form.name,
+                    form.code,
+                    form.currency.symbol(),
+                    format_shares(confirmation.shares),
+                    format_price(confirmation.price),
+                    confirmation.fee,
+                    confirmation.total(form.side)
+                ));
+                self.status = message.clone();
+                self.trade_feedback = Some(message);
                 self.detail_tab = DetailTab::Portfolio;
-                self.persist(); // immediate: trade is structural
-                // 清空表单
-                self.trade_shares_input.update(cx, |s, cx| {
-                    s.set_value("", window, cx);
-                });
-                self.trade_note_input.update(cx, |s, cx| {
-                    s.set_value("", window, cx);
-                });
+                self.persist();
+                self.trade_shares_input
+                    .update(cx, |state, cx| state.set_value("", window, cx));
+                self.trade_note_input
+                    .update(cx, |state, cx| state.set_value("", window, cx));
             }
-            Err(e) => {
-                self.status = shared(e.to_string());
+            Err(error) => {
+                let message = shared(error.to_string());
+                self.status = message.clone();
+                self.trade_feedback = Some(message);
             }
         }
         cx.notify();
     }
 
-    pub(crate) fn close_selected_position(&mut self, cx: &mut Context<Self>) {
-        let code = self.selected.to_string();
-        let price = self
-            .symbols
-            .iter()
-            .find(|s| s.code == code)
-            .map(|s| s.last)
-            .filter(|p| *p > 0.0)
-            .or_else(|| self.candles.last().map(|c| c.close).filter(|p| *p > 0.0))
-            .unwrap_or(0.0);
-        if price <= 0.0 {
-            self.status = shared(if self.work_mode {
-                "No price for close"
+    /// Full exit only prepares a sell record. Price and fees remain editable,
+    /// and the same review/confirmation step is required as every local record.
+    pub(crate) fn close_selected_position(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.portfolio.position_of(self.selected.as_ref()).is_none() {
+            self.trade_feedback = Some(shared(if self.work_mode {
+                "No position"
             } else {
-                "无法清仓：缺少现价"
-            });
+                "当前无持仓"
+            }));
             cx.notify();
             return;
         }
-        match self.portfolio.close_position(&code, price, 0.0, "清仓") {
-            Ok(Some(_)) => {
-                self.persist_portfolio();
-                self.status = shared(if self.work_mode {
-                    format!("Closed {code} @ {}", format_price(price))
-                } else {
-                    format!("已清仓 {code} @ {} 元", format_price(price))
-                });
-            }
-            Ok(None) => {
-                self.status = shared(if self.work_mode {
-                    "No position"
-                } else {
-                    "当前无持仓"
-                });
-            }
-            Err(e) => {
-                self.status = shared(e.to_string());
-            }
+        if self.trade_form.is_some() {
+            self.open_trade_form(TradeSide::Sell, window, cx);
+            return;
         }
-        cx.notify();
+        if !self.open_trade_form(TradeSide::Sell, window, cx) {
+            return;
+        }
+        self.trade_note_input
+            .update(cx, |state, cx| state.set_value("清仓记录", window, cx));
     }
 
     pub(crate) fn undo_last_trade_for_selected(&mut self, cx: &mut Context<Self>) {
         let code = self.selected.to_string();
+        self.undo_last_trade_for_code(&code, cx);
+    }
+
+    pub(crate) fn undo_last_trade_for_code(&mut self, code: &str, cx: &mut Context<Self>) {
         let id = self
             .portfolio
             .trades
@@ -526,6 +543,7 @@ impl StockApp {
             } else {
                 "没有可撤销的成交"
             });
+            self.trade_feedback = Some(self.status.clone());
             cx.notify();
             return;
         };
@@ -543,6 +561,7 @@ impl StockApp {
                 "无法撤销：会破坏后续卖出流水"
             });
         }
+        self.trade_feedback = Some(shared(format!("{code} · {}", self.status)));
         cx.notify();
     }
 
@@ -587,54 +606,80 @@ impl StockApp {
         cx.notify();
     }
 
+    /// The producer and display use the same daily/quote identity. Intraday
+    /// chart selections never participate in a daily position-advice cache key.
+    pub(crate) fn portfolio_advice_cache_key(&self) -> Option<String> {
+        let code = self.selected.as_ref();
+        portfolio_advice_key(
+            code,
+            self.current_daily_candles(),
+            self.portfolio.position_state_of(code).as_ref(),
+            self.quote_for_code(code),
+            chrono::Utc::now().timestamp_millis(),
+        )
+    }
+
     pub(crate) fn request_portfolio_ai(&mut self, cx: &mut Context<Self>) {
         let code = self.selected.to_string();
-        let matched = self
-            .candles_code
-            .as_ref()
-            .is_some_and(|c| c == code.as_str());
-        if !matched || self.candles.is_empty() {
+        // Also invalidate an in-flight response when a new request is blocked.
+        self.portfolio_ai_gen = self.portfolio_ai_gen.wrapping_add(1);
+        let req_id = self.portfolio_ai_gen;
+        let Some(cache_key) = self.portfolio_advice_cache_key() else {
+            self.portfolio_ai_key = None;
             self.portfolio_ai_panel = AiPanelState::Ready {
                 text: shared(if self.work_mode {
-                    "Load daily chart first."
+                    "Load daily evidence first."
                 } else {
-                    "请先加载该标的日 K 数据。"
+                    "请先加载该标的日线证据。"
                 }),
                 source: AiSource::Local,
                 note: None,
             };
             cx.notify();
             return;
-        }
+        };
+        self.portfolio_ai_key = Some(cache_key.clone());
         let name = self
-            .symbols
-            .iter()
-            .find(|s| s.code == code)
-            .map(|s| s.name.to_string())
+            .quote_for_code(&code)
+            .map(|quote| quote.name.clone())
+            .filter(|name| is_real_name(name, &code))
+            .or_else(|| self.current_symbol().map(|symbol| symbol.name.to_string()))
             .unwrap_or_default();
         let pos = self.portfolio.position_state_of(&code);
         let (shares, avg_cost, realized) = pos
             .map(|p| (p.shares, p.avg_cost, p.realized_pnl))
             .unwrap_or((0.0, 0.0, 0.0));
-        let last = self
-            .symbols
-            .iter()
-            .find(|s| s.code == code)
-            .map(|s| s.last)
-            .filter(|p| *p > 0.0)
-            .unwrap_or_else(|| self.candles.last().map(|c| c.close).unwrap_or(0.0));
-        let date = self
-            .candles
-            .last()
-            .map(|c| c.date.to_string())
-            .unwrap_or_default();
-        let cache_key = format!("pos:{}@{}:{:.4}:{:.4}", code, date, shares, avg_cost);
+        let quote = self.quote_for_code(&code).filter(|quote| {
+            quote.usable()
+                && matches!(
+                    quote.effective_freshness(chrono::Utc::now().timestamp_millis()),
+                    crate::domain::market::Freshness::Live
+                        | crate::domain::market::Freshness::Delayed
+                )
+        });
+        let Some(last) = quote.and_then(|quote| quote.price) else {
+            self.portfolio_ai_panel = AiPanelState::Ready {
+                text: shared("当前持仓行情缺失、过期或时间未知，暂不生成基于现价的建议。"),
+                source: AiSource::Local,
+                note: None,
+            };
+            cx.notify();
+            return;
+        };
+        let quote_note = quote.map(|quote| {
+            shared(format!(
+                "行情快照：{} · {} · {}",
+                quote.source,
+                quote.freshness_label(),
+                quote.as_of_label()
+            ))
+        });
 
         if let Some(hit) = self.portfolio_ai_cache.get(&cache_key).cloned() {
             self.portfolio_ai_panel = AiPanelState::Ready {
                 text: hit.text.into(),
                 source: hit.source,
-                note: None,
+                note: quote_note.clone(),
             };
             self.portfolio_ai_key = Some(cache_key);
             cx.notify();
@@ -642,7 +687,7 @@ impl StockApp {
         }
 
         let Some(mut snap) = ai::build_position_advice(
-            &self.candles,
+            self.current_daily_candles(),
             &code,
             &name,
             shares,
@@ -676,7 +721,7 @@ impl StockApp {
             self.portfolio_ai_panel = AiPanelState::Ready {
                 text: local.into(),
                 source: AiSource::Local,
-                note: None,
+                note: quote_note.clone(),
             };
             cx.notify();
             return;
@@ -685,14 +730,14 @@ impl StockApp {
         self.portfolio_ai_panel = AiPanelState::Loading {
             text: local.clone().into(),
         };
-        self.portfolio_ai_gen = self.portfolio_ai_gen.wrapping_add(1);
-        let req_id = self.portfolio_ai_gen;
         let cfg = self.ai_config.clone();
         let source_label = cfg.source_label();
         cx.spawn(async move |this, cx| {
             let res = smol::unblock(move || ai::llm_position_advice(&cfg, &snap)).await;
             let _ = this.update(cx, |app, cx| {
-                if app.portfolio_ai_gen != req_id {
+                if app.portfolio_ai_gen != req_id
+                    || app.portfolio_advice_cache_key().as_ref() != Some(&cache_key)
+                {
                     return;
                 }
                 match res {
@@ -711,7 +756,7 @@ impl StockApp {
                         app.portfolio_ai_panel = AiPanelState::Ready {
                             text: text.into(),
                             source,
-                            note: None,
+                            note: quote_note.clone(),
                         };
                     }
                     Ok(_) => {
@@ -734,5 +779,80 @@ impl StockApp {
         })
         .detach();
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod advice_identity_tests {
+    use super::portfolio_advice_key;
+    use crate::domain::market::{
+        Availability, Freshness, Market, QuoteRecord, parse_market_timestamp,
+    };
+    use crate::domain::money::Currency;
+    use crate::model::Candle;
+
+    fn fixtures() -> (Vec<Candle>, QuoteRecord, i64) {
+        let time = "2026-10-09 10:00:00";
+        let now = parse_market_timestamp(time).unwrap();
+        let daily = vec![Candle {
+            date: "2026-10-09".into(),
+            open: 10.0,
+            high: 12.0,
+            low: 9.0,
+            close: 11.0,
+            volume: 100,
+        }];
+        let quote = QuoteRecord {
+            code: "600519".into(),
+            market: Market::AShare,
+            currency: Currency::Cny,
+            name: "Fixture".into(),
+            price: Some(12.0),
+            change_pct: Some(1.0),
+            volume: Some(100),
+            source: "fixture".into(),
+            fetched_at: now,
+            market_time: Some(time.into()),
+            availability: Availability::Available,
+            freshness: Freshness::Live,
+        };
+        (daily, quote, now)
+    }
+
+    #[test]
+    fn advice_key_rejects_empty_daily_evidence_and_tracks_instrument_and_daily_revisions() {
+        let (mut daily, quote, now) = fixtures();
+        assert!(portfolio_advice_key("600519", &[], None, Some(&quote), now).is_none());
+        let original = portfolio_advice_key("600519", &daily, None, Some(&quote), now);
+        assert_ne!(
+            original,
+            portfolio_advice_key("000001", &daily, None, Some(&quote), now)
+        );
+        daily[0].high = 13.0;
+        assert_ne!(
+            original,
+            portfolio_advice_key("600519", &daily, None, Some(&quote), now)
+        );
+    }
+
+    #[test]
+    fn advice_key_changes_with_price_or_staleness_but_not_flat_fetch_time() {
+        let (daily, mut quote, now) = fixtures();
+        let original = portfolio_advice_key("600519", &daily, None, Some(&quote), now);
+        quote.fetched_at += 1000;
+        quote.market_time = Some("2026-10-09 10:00:01".into());
+        assert_eq!(
+            original,
+            portfolio_advice_key("600519", &daily, None, Some(&quote), now + 1000)
+        );
+        assert_ne!(
+            original,
+            portfolio_advice_key("600519", &daily, None, Some(&quote), now + 400_000)
+        );
+        quote.price = Some(13.0);
+        assert_ne!(
+            original,
+            portfolio_advice_key("600519", &daily, None, Some(&quote), now + 1000)
+        );
     }
 }

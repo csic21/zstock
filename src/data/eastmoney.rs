@@ -869,7 +869,7 @@ fn fetch_quotes_by_secids_with_hosts(secids: &[String], hosts: &[&str]) -> Resul
         "/api/qt/ulist.np/get?\
          fltt=2&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281\
          &secids={secids}\
-         &fields=f12,f13,f14,f2,f3,f4,f5,f6,f15,f16,f17,f18"
+         &fields=f12,f13,f14,f2,f3,f4,f5,f6,f15,f16,f17,f18,f124"
     );
 
     let value =
@@ -1192,7 +1192,7 @@ pub fn fetch_sector_constituents(sector_code: &str, limit: usize) -> Result<Vec<
         let path = format!(
             "/api/qt/clist/get?pn={page}&pz={CLIST_PAGE_SIZE}&po=1&np=1\
              &ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2\
-             &fid=f6&fs=b:{code}&fields=f12,f14,f2,f3,f5,f6,f15,f16,f17,f18"
+             &fid=f6&fs=b:{code}&fields=f12,f14,f2,f3,f5,f6,f15,f16,f17,f18,f124"
         );
         let value = fetch_push2_json(&path, PUSH2_HOSTS)
             .map_err(|error| anyhow!("板块成分不可用: {error}"))?;
@@ -1318,6 +1318,14 @@ fn parse_quote_item(item: &Value) -> Option<QuoteTick> {
     }
     let currency = Currency::for_code(&code)?;
     let last = num_f64(item.get("f2"));
+    let fetched_at = chrono::Utc::now().timestamp_millis();
+    let market_time = item
+        .get("f124")
+        .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+        .filter(|seconds| *seconds > 0)
+        .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+        .map(|time| time.to_rfc3339());
+    let freshness = Freshness::from_market_time(market_time.as_deref(), fetched_at);
     Some(QuoteTick {
         code,
         name: item
@@ -1331,14 +1339,14 @@ fn parse_quote_item(item: &Value) -> Option<QuoteTick> {
         amount: num_f64(item.get("f6")),
         currency,
         source: "东方财富".into(),
-        fetched_at: chrono::Utc::now().timestamp_millis(),
-        market_time: None,
+        fetched_at,
+        market_time,
         availability: if last > 0.0 {
             Availability::Available
         } else {
             Availability::Invalid
         },
-        freshness: Freshness::Live,
+        freshness,
     })
 }
 
@@ -1496,7 +1504,7 @@ pub fn fetch_rising_a_shares(limit: usize) -> Result<Vec<RisingRow>> {
     let mut out: Vec<RisingRow> = Vec::with_capacity(limit);
     let mut page = 1u32;
     let fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23";
-    let fields = "f12,f14,f2,f3,f6,f15,f16,f17,f18";
+    let fields = "f12,f14,f2,f3,f6,f15,f16,f17,f18,f124";
 
     while out.len() < limit && page <= 10 {
         let path = format!(
@@ -2120,5 +2128,26 @@ mod fundamental_tests {
         assert!(reports.iter().all(|report| {
             !report.reporting_period.is_empty() && report.announced_on > report.reporting_period
         }));
+    }
+}
+
+#[cfg(test)]
+mod quote_timestamp_tests {
+    use super::*;
+
+    #[test]
+    fn provider_time_is_distinct_from_http_fetch_time() {
+        let timestamp = 1_786_323_600_i64;
+        let tick =
+            parse_quote_item(&serde_json::json!({"f12": "600519", "f2": 10, "f124": timestamp}))
+                .unwrap();
+        assert_eq!(
+            tick.market_time
+                .as_deref()
+                .and_then(crate::domain::market::parse_market_timestamp),
+            Some(timestamp * 1_000)
+        );
+        let unknown = parse_quote_item(&serde_json::json!({"f12": "600519", "f2": 10})).unwrap();
+        assert_eq!(unknown.freshness, Freshness::Unknown);
     }
 }

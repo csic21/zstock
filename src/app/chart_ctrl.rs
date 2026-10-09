@@ -15,23 +15,34 @@ use super::helpers::*;
 use super::{ChartKind, StockApp};
 
 impl StockApp {
+    /// Legacy code-only entries remain in config, but their unknown period is never inferred.
+    pub(crate) fn drawing_scope_key(&self) -> Option<String> {
+        if !self.visible_series_matches_selection() || self.candles.is_empty() {
+            return None;
+        }
+        let identity = self.chart_kind.series_identity(self.selected.as_ref())?;
+        let range = match self.chart_kind {
+            ChartKind::DayK => self.range.label().to_string(),
+            ChartKind::MinuteK(period) => period.param().to_string(),
+            ChartKind::Intraday => self.minute.as_ref()?.date.clone(),
+        };
+        Some(identity.drawing_scope_key(
+            &range,
+            self.candles.iter().map(|candle| candle.date.as_ref()),
+        ))
+    }
+
     pub(crate) fn chart_paint_data(&self, cx: &App) -> ChartPaintData {
         let theme = cx.theme();
-        let matched = self
-            .candles_code
-            .as_ref()
-            .is_some_and(|c| c == self.selected.as_ref());
+        let matched = self.visible_series_matches_selection();
         let minute_matched = matches!(self.chart_kind, ChartKind::Intraday)
             && self
                 .minute_code
                 .as_ref()
                 .is_some_and(|c| c == self.selected.as_ref());
-        // While loading a new series, keep painting the previous candles to avoid a blank flash.
-        let show_series = if matches!(self.chart_kind, ChartKind::Intraday) {
-            minute_matched && matched
-        } else {
-            matched || (self.loading && !self.candles.is_empty())
-        };
+        // A previous instrument/interval may never appear under the new header or cost line.
+        let show_series =
+            matched && (!matches!(self.chart_kind, ChartKind::Intraday) || minute_matched);
         let (start, end) = if show_series {
             self.chart_visible_range()
         } else {
@@ -81,8 +92,8 @@ impl StockApp {
         let mut lines = Vec::new();
         if show_series && end > start && !work {
             let owned = self
-                .chart_lines
-                .get(self.selected.as_ref())
+                .drawing_scope_key()
+                .and_then(|key| self.chart_lines.get(&key))
                 .cloned()
                 .unwrap_or_default();
             for line in owned {
@@ -194,10 +205,7 @@ impl StockApp {
             .minute_code
             .as_ref()
             .is_some_and(|c| c == self.selected.as_ref())
-            && self
-                .candles_code
-                .as_ref()
-                .is_some_and(|c| c == self.selected.as_ref());
+            && self.visible_series_matches_selection();
         if !matched {
             return None;
         }
@@ -309,10 +317,7 @@ impl StockApp {
 
     /// Price base for index rebased display (first visible close, else last).
     pub(crate) fn price_base(&self) -> f64 {
-        let matched = self
-            .candles_code
-            .as_ref()
-            .is_some_and(|c| c == self.selected.as_ref());
+        let matched = self.visible_series_matches_selection();
         if matched {
             let (start, end) = self.chart_visible_range();
             if end > start
@@ -399,58 +404,42 @@ impl StockApp {
         base + vol
     }
 
-    /// Strategy snapshot for the selected series (filled in `apply_klines` / minute).
+    /// Strategy snapshot uses canonical daily evidence, never visible minute bars.
     pub(crate) fn current_signal(&self) -> Option<signals::SignalSnapshot> {
-        self.candles_code
-            .as_ref()
-            .is_some_and(|code| code == self.selected.as_ref())
+        (!self.current_daily_candles().is_empty())
             .then(|| self.signal_cache.clone())
             .flatten()
     }
 
-    /// Reference buy/sell bands for the selected series (filled with the candles).
     pub(crate) fn current_levels(&self) -> Option<levels::ReferenceLevels> {
-        self.candles_code
-            .as_ref()
-            .is_some_and(|code| code == self.selected.as_ref())
+        (!self.current_daily_candles().is_empty())
             .then(|| self.levels_cache.clone())
             .flatten()
     }
 
-    /// Recompute strategy + levels once when the candle series changes.
     pub(crate) fn refresh_analysis_cache(&mut self) {
         self.backtest_comparison.clear();
-        if self.candles.is_empty() {
-            self.signal_cache = None;
-            self.levels_cache = None;
-            self.backtest_report = None;
-            self.analysis_state.decision_card = None;
+        let candles = self.current_daily_candles().to_vec();
+        self.signal_cache = signals::analyze(&candles);
+        self.levels_cache = levels::compute(&candles);
+        self.backtest_report = if candles.len() >= 60 {
+            let currency = Currency::for_code(self.selected.as_ref()).unwrap_or(Currency::Cny);
+            backtest::run_for_instrument(
+                &candles,
+                self.selected.as_ref(),
+                self.backtest_active_rule,
+                10,
+                currency,
+            )
         } else {
-            self.signal_cache = signals::analyze(&self.candles);
-            self.levels_cache = levels::compute(&self.candles);
-            self.backtest_report = if matches!(self.chart_kind, ChartKind::DayK)
-                && self.candles.len() >= 60
-            {
-                let currency = Currency::for_code(self.selected.as_ref()).unwrap_or(Currency::Cny);
-                backtest::run_for_instrument(
-                    &self.candles,
-                    self.selected.as_ref(),
-                    self.backtest_active_rule,
-                    10,
-                    currency,
-                )
-            } else {
-                None
-            };
-            self.analysis_state.decision_card = Some(self.decision_card_view_model());
-        }
+            None
+        };
+        self.analysis_state.decision_card =
+            (!candles.is_empty()).then(|| self.decision_card_view_model());
     }
 
     pub(crate) fn spark_closes(&self) -> Vec<f64> {
-        let matched = self
-            .candles_code
-            .as_ref()
-            .is_some_and(|c| c == self.selected.as_ref());
+        let matched = self.visible_series_matches_selection();
         if !matched || self.candles.is_empty() {
             return Vec::new();
         }

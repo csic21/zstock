@@ -19,7 +19,7 @@ use crate::domain::today::{
     TodayAction, TodayActionTarget, TodayAlertSnapshot, TodayDashboard, TodayDashboardInput,
     TodayOpportunity, TodayPlanSnapshot, TodayRiskSnapshot, build_today_dashboard,
 };
-use crate::model::shared;
+use crate::model::{Symbol, board_for_code, shared};
 
 use super::{StockApp, state::PrimaryTask};
 
@@ -102,18 +102,39 @@ impl StockApp {
     pub(crate) fn today_dashboard_view_model(&self) -> TodayDashboard {
         let summary = self.portfolio_summary();
         let risk_view = self.portfolio_risk_view(&summary);
+        let now_millis = chrono::Utc::now().timestamp_millis();
         let alerts = self
             .buy_alerts
             .iter()
             .filter(|(_, alert)| alert.any_armed())
             .map(|(code, alert)| {
-                let symbol = self.symbols.iter().find(|symbol| symbol.code == *code);
+                let quote = self.quote_for_code(code);
+                let symbol = self
+                    .symbols
+                    .iter()
+                    .find(|symbol| symbol.code == *code)
+                    .or_else(|| {
+                        self.preview_symbol
+                            .as_ref()
+                            .filter(|symbol| symbol.code == *code)
+                    });
                 TodayAlertSnapshot {
                     code: code.clone(),
-                    name: symbol
-                        .map(|symbol| symbol.name.to_string())
+                    name: quote
+                        .map(|quote| quote.name.clone())
+                        .filter(|name| !name.is_empty())
+                        .or_else(|| symbol.map(|symbol| symbol.name.to_string()))
                         .unwrap_or_else(|| code.clone()),
-                    last: symbol.map(|symbol| symbol.last).unwrap_or_default(),
+                    // Near-target warnings need current evidence. Retained triggered
+                    // rules still appear with “等待有效行情” when their quote ages out.
+                    last: quote
+                        .filter(|quote| {
+                            quote.usable()
+                                && quote.effective_freshness(now_millis)
+                                    == crate::domain::market::Freshness::Live
+                        })
+                        .and_then(|quote| quote.price)
+                        .unwrap_or_default(),
                     buy_target: alert.is_valid().then_some(alert.target_price),
                     buy_triggered: alert.triggered,
                     sell_target: alert.sell_price,
@@ -314,18 +335,15 @@ impl StockApp {
     }
 
     fn daily_records_for(&self, code: &str) -> Option<Vec<CandleRecord>> {
+        if self.selected.as_ref() == code && !self.current_daily_candles().is_empty() {
+            return Some(candles_to_records(self.current_daily_candles()));
+        }
         if let Some(cached) =
             self.series_cache
                 .lookup_klines(super::types::ChartKind::DayK, code, 0)
             && !cached.candles.is_empty()
         {
             return Some(candles_to_records(&cached.candles));
-        }
-        if self.selected.as_ref() == code
-            && self.chart_kind == super::types::ChartKind::DayK
-            && !self.candles.is_empty()
-        {
-            return Some(candles_to_records(&self.candles));
         }
         None
     }
@@ -398,24 +416,53 @@ impl StockApp {
         if self.symbols.iter().any(|symbol| symbol.code == code) {
             return;
         }
-        if let Some(mark) = self
-            .portfolio_summary()
-            .positions
-            .into_iter()
-            .find(|mark| mark.position.code == code)
-        {
-            self.ensure_in_watchlist(&mark.position.code, &mark.position.name, mark.last);
-            return;
-        }
-        if let Some(pick) = self.scout_picks.iter().find(|pick| pick.code == code) {
-            let (name, close) = (pick.name.clone(), pick.close);
-            self.ensure_in_watchlist(code, &name, close);
-            return;
-        }
-        if let Some(hit) = self.radar_hits.iter().find(|hit| hit.code == code) {
-            let (name, close) = (hit.name.clone(), hit.close);
-            self.ensure_in_watchlist(code, &name, close);
-        }
+        let quote = self.quote_for_code(code);
+        let name = quote
+            .map(|quote| quote.name.clone())
+            .filter(|name| !name.is_empty())
+            .or_else(|| {
+                self.portfolio
+                    .position_of(code)
+                    .map(|position| position.name)
+            })
+            .or_else(|| {
+                self.scout_picks
+                    .iter()
+                    .find(|pick| pick.code == code)
+                    .map(|pick| pick.name.clone())
+            })
+            .or_else(|| {
+                self.radar_hits
+                    .iter()
+                    .find(|hit| hit.code == code)
+                    .map(|hit| hit.name.clone())
+            })
+            .or_else(|| {
+                self.limitup_hits
+                    .iter()
+                    .find(|hit| hit.code == code)
+                    .map(|hit| hit.name.clone())
+            })
+            .or_else(|| {
+                self.treasure_hits
+                    .iter()
+                    .find(|hit| hit.code == code)
+                    .map(|hit| hit.name.clone())
+            })
+            .unwrap_or_else(|| code.to_string());
+        // Task navigation only stages research metadata. Saving membership is
+        // a separate action, and unknown prices remain a metadata placeholder.
+        self.preview_symbol = Some(Symbol {
+            code: code.to_string(),
+            name: shared(name),
+            last: quote
+                .filter(|quote| quote.usable())
+                .and_then(|quote| quote.price)
+                .unwrap_or(0.0),
+            change_pct: quote.and_then(|quote| quote.change_pct).unwrap_or(0.0),
+            volume: quote.and_then(|quote| quote.volume).unwrap_or(0),
+            board: board_for_code(code),
+        });
     }
 }
 
