@@ -136,6 +136,9 @@ impl StockApp {
             return;
         }
         self.work_mode = on;
+        if !self.palette_open {
+            self.app_focus_pending = true;
+        }
         #[cfg(feature = "work-mode")]
         self.work_mode_feature.state.set_enabled(on);
         self.market_analysis_open = false;
@@ -359,6 +362,7 @@ impl StockApp {
                 .unwrap_or(""),
         );
         self.work_alias_editing = true;
+        self.app_focus_pending = false;
         self.work_alias_input.update(cx, |input, cx| {
             input.set_placeholder(format!("tag for {placeholder} · empty clears"), window, cx);
             input.set_value(current, window, cx);
@@ -372,6 +376,7 @@ impl StockApp {
             return;
         }
         self.work_alias_editing = false;
+        self.app_focus_pending = true;
         cx.notify();
     }
 
@@ -382,6 +387,7 @@ impl StockApp {
         let code = self.selected.to_string();
         let raw = self.work_alias_input.read(cx).value().to_string();
         self.work_alias_editing = false;
+        self.app_focus_pending = true;
         if code.is_empty() {
             cx.notify();
             return;
@@ -858,6 +864,7 @@ impl StockApp {
 
     pub(crate) fn toggle_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_open = !self.settings_open;
+        self.app_focus_pending = true;
         if self.settings_open {
             self.close_palette(cx);
             self.market_analysis_open = false;
@@ -876,6 +883,7 @@ impl StockApp {
             return;
         }
         self.settings_section = section;
+        self.app_focus_pending = true;
         cx.notify();
     }
 
@@ -884,6 +892,7 @@ impl StockApp {
             return;
         }
         self.settings_open = false;
+        self.app_focus_pending = true;
         cx.notify();
     }
 

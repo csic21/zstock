@@ -26,6 +26,7 @@ impl StockApp {
     }
 
     pub(crate) fn open_market_analysis(&mut self, cx: &mut Context<Self>) {
+        self.app_focus_pending = true;
         self.settings_open = false;
         self.close_palette(cx);
         self.market_analysis_open = true;
@@ -44,6 +45,7 @@ impl StockApp {
             return;
         }
         self.market_analysis_open = false;
+        self.app_focus_pending = true;
         self.market_heatmap_fullscreen = false;
         cx.notify();
     }

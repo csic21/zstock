@@ -343,6 +343,7 @@ impl StockApp {
         }
         if self.trade_form.is_some() {
             self.trade_form = None;
+            self.app_focus_pending = true;
             self.trade_feedback = None;
             cx.notify();
             return;
@@ -496,6 +497,7 @@ impl StockApp {
             Ok(_) => {
                 self.persist_portfolio();
                 self.trade_form = None;
+                self.app_focus_pending = true;
                 let message = shared(format!(
                     "已保存本地{}记录：{} {} · {} · {} 股 @ {} · 费用 {:.2} · 合计 {:.2}（未连接券商）",
                     form.side.label(),

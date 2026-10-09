@@ -1823,6 +1823,9 @@ impl StockApp {
     }
 
     pub(crate) fn close_palette(&mut self, cx: &mut Context<Self>) {
+        if self.palette_open {
+            self.app_focus_pending = true;
+        }
         self.palette_open = false;
         self.palette_search.cancel();
         self.palette_hits.clear();
@@ -1843,6 +1846,8 @@ impl StockApp {
         self.palette_query.update(cx, |input, cx| {
             input.set_value("", window, cx);
         });
+        // Reopening before a pending frame must preserve the new visible input.
+        self.app_focus_pending = false;
         window.focus(&self.palette_focus);
         self.palette_query.update(cx, |input, cx| {
             input.focus(window, cx);

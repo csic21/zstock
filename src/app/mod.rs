@@ -228,6 +228,9 @@ pub struct AppState {
     quote_interval_secs: u64,
     palette_query: Entity<InputState>,
     palette_focus: FocusHandle,
+    /// Restore the root dispatch path once a focused input's panel is hidden.
+    /// Consumed on the next render, never on ordinary data refreshes.
+    app_focus_pending: bool,
     /// Search results for palette (remote + local).
     palette_hits: Vec<Symbol>,
     palette_search: symbols::PaletteSearchState,
@@ -748,6 +751,7 @@ impl StockApp {
                 quote_interval_secs: clamp_quote_interval_secs(cfg.quote_interval_secs),
                 palette_query,
                 palette_focus,
+                app_focus_pending: false,
                 palette_hits: Vec::new(),
                 palette_search: Default::default(),
                 palette_scroll: Default::default(),
@@ -885,6 +889,9 @@ impl StockApp {
             app.status = shared(error);
         }
 
+        // X11 window activation does not select a GPUI dispatch node. Without
+        // this, shortcuts have no path through the app until an input is clicked.
+        window.focus(&app.palette_focus);
         window.set_window_title(app.window_title());
         app.bootstrap(cx);
         app.strategy_lab_start_daily_observation(cx);
@@ -897,6 +904,9 @@ impl StockApp {
 impl Render for StockApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let render_started = Instant::now();
+        if std::mem::take(&mut self.app_focus_pending) {
+            window.focus(&self.palette_focus);
+        }
         // Persist the window frame whenever it changes (complete dock serialization).
         if !window.is_fullscreen() {
             let b = window.bounds();
@@ -1231,6 +1241,67 @@ fn apply_zstock_theme(cx: &mut App) {
     theme.scrollbar_thumb_hover = theme.muted_foreground.opacity(0.46);
 }
 
+/// Register the production keymap for native windows and dispatch regression tests.
+fn bind_app_keys(cx: &mut App) {
+    cx.bind_keys([
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-k", ToggleCommandPalette, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-k", ToggleCommandPalette, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-p", ToggleCommandPalette, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-p", ToggleCommandPalette, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-r", RefreshData, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-r", RefreshData, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-1", SelectTodayTask, Some("stock && !Input")),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-1", SelectTodayTask, Some("stock && !Input")),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-2", SelectResearchTask, Some("stock && !Input")),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-2", SelectResearchTask, Some("stock && !Input")),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-3", SelectOpportunitiesTask, Some("stock && !Input")),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-3", SelectOpportunitiesTask, Some("stock && !Input")),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-4", SelectPortfolioTask, Some("stock && !Input")),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-4", SelectPortfolioTask, Some("stock && !Input")),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-t", ToggleTreasure, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-t", ToggleTreasure, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-shift-w", ToggleWorkMode, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-w", ToggleWorkMode, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-,", ToggleSettings, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-,", ToggleSettings, None),
+        KeyBinding::new("escape", DismissOverlay, None),
+        // `stock && !Input`：根节点始终带 `stock` 上下文；输入框聚焦时叠加
+        // `Input` 上下文并自动禁用这些纯按键绑定，避免吞掉输入框的
+        // 退格/删除/数字/字母/方向键。输入框有独立的 Input 上下文绑定。
+        KeyBinding::new("up", SelectPrevSymbol, Some("stock && !Input")),
+        KeyBinding::new("down", SelectNextSymbol, Some("stock && !Input")),
+        KeyBinding::new("k", SelectPrevSymbol, Some("stock && !Input")),
+        KeyBinding::new("j", SelectNextSymbol, Some("stock && !Input")),
+        KeyBinding::new("backspace", RemoveSelectedSymbol, Some("stock && !Input")),
+        KeyBinding::new("delete", RemoveSelectedSymbol, Some("stock && !Input")),
+        KeyBinding::new("0", ResetChartZoom, Some("stock && !Input")),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-q", Quit, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("alt-f4", Quit, None),
+    ]);
+}
+
 pub fn run() {
     // IconName resolves SVG paths through the application's asset source.
     // Embed the component icons so packaged builds work without source files.
@@ -1258,63 +1329,7 @@ pub fn run() {
     app.run(move |cx| {
         gpui_component::init(cx);
 
-        cx.bind_keys([
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-k", ToggleCommandPalette, None),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-k", ToggleCommandPalette, None),
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-p", ToggleCommandPalette, None),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-p", ToggleCommandPalette, None),
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-r", RefreshData, None),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-r", RefreshData, None),
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-1", SelectTodayTask, Some("stock && !Input")),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-1", SelectTodayTask, Some("stock && !Input")),
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-2", SelectResearchTask, Some("stock && !Input")),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-2", SelectResearchTask, Some("stock && !Input")),
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-3", SelectOpportunitiesTask, Some("stock && !Input")),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-3", SelectOpportunitiesTask, Some("stock && !Input")),
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-4", SelectPortfolioTask, Some("stock && !Input")),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-4", SelectPortfolioTask, Some("stock && !Input")),
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-t", ToggleTreasure, None),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-t", ToggleTreasure, None),
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-shift-w", ToggleWorkMode, None),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-shift-w", ToggleWorkMode, None),
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-,", ToggleSettings, None),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-,", ToggleSettings, None),
-            KeyBinding::new("escape", DismissOverlay, None),
-            // `stock && !Input`：根节点始终带 `stock` 上下文；输入框聚焦时叠加
-            // `Input` 上下文并自动禁用这些纯按键绑定，避免吞掉输入框的
-            // 退格/删除/数字/字母/方向键。输入框有独立的 Input 上下文绑定。
-            KeyBinding::new("up", SelectPrevSymbol, Some("stock && !Input")),
-            KeyBinding::new("down", SelectNextSymbol, Some("stock && !Input")),
-            KeyBinding::new("k", SelectPrevSymbol, Some("stock && !Input")),
-            KeyBinding::new("j", SelectNextSymbol, Some("stock && !Input")),
-            KeyBinding::new("backspace", RemoveSelectedSymbol, Some("stock && !Input")),
-            KeyBinding::new("delete", RemoveSelectedSymbol, Some("stock && !Input")),
-            KeyBinding::new("0", ResetChartZoom, Some("stock && !Input")),
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-q", Quit, None),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("alt-f4", Quit, None),
-        ]);
+        bind_app_keys(cx);
 
         cx.on_action(|_: &Quit, cx: &mut App| {
             cx.quit();
@@ -1984,3 +1999,6 @@ mod layout_regression_tests {
 
 #[cfg(test)]
 mod ux_regression_tests;
+
+#[cfg(test)]
+mod focus_regression_tests;

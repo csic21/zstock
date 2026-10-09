@@ -165,6 +165,9 @@ impl super::StockApp {
             // Re-selecting the current task is still navigation when a settings
             // or market page is covering it. This also covers keyboard shortcuts.
             if self.settings_open || self.market_analysis_open {
+                if !self.palette_open {
+                    self.app_focus_pending = true;
+                }
                 self.settings_open = false;
                 self.market_analysis_open = false;
                 self.market_heatmap_fullscreen = false;
@@ -173,6 +176,9 @@ impl super::StockApp {
             return;
         }
         self.runtime_state.performance.begin_navigation();
+        if !self.palette_open {
+            self.app_focus_pending = true;
+        }
         let previous = match self.ui_state.primary_task {
             PrimaryTask::Today => TaskName::Today,
             PrimaryTask::Research => TaskName::Research,
