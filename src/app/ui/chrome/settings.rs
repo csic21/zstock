@@ -11,6 +11,7 @@ use gpui_component::{
 };
 
 use crate::data::ai::{AiCliProvider, AiKind, AiTransport};
+use crate::model::shared;
 use crate::storage::{ColorScheme, WorkDensity};
 use crate::update::UpdateState;
 
@@ -61,10 +62,16 @@ impl StockApp {
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(if work {
-                                "Saved locally · Esc to leave"
+                            .child(if self.ai_api_key_dirty.get() {
+                                if work {
+                                    "API key not saved · Esc to leave"
+                                } else {
+                                    "API Key 尚未保存 · Esc 返回"
+                                }
+                            } else if work {
+                                "Auto-save · Esc to leave"
                             } else {
-                                "本地保存 · Esc 返回"
+                                "自动保存 · Esc 返回"
                             }),
                     ),
             )
@@ -971,14 +978,30 @@ impl StockApp {
                         .text_xs()
                         .text_color(cx.theme().muted_foreground.opacity(0.75))
                         .child(if work {
-                            "Key stays in local config.json. Only the metric snapshot is sent."
+                            "Key is saved in the system credential store. Only the metric snapshot is sent."
                         } else {
-                            "Key 仅保存在本机 config.json；只上传指标快照，不上传原始行情。"
+                            "Key 保存在系统凭据库；只上传指标快照，不上传原始行情。"
                         }),
                 );
         }
 
-        col.child(
+        col.when(self.ai_api_key_dirty.get(), |col| {
+            col.child(
+                div()
+                    .id("ai-api-key-save-pending")
+                    .w_full()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(self.ai_api_key_save_error.clone().unwrap_or_else(|| {
+                        shared(if work {
+                            "API key changes are waiting to be saved securely."
+                        } else {
+                            "API Key 更改尚未安全保存，正在等待写入系统凭据库。"
+                        })
+                    })),
+            )
+        })
+        .child(
             div()
                 .w_full()
                 .text_xs()

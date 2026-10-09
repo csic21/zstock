@@ -93,6 +93,24 @@ where
 }
 
 pub fn backup_before_migration(path: &Path, from_version: u32) -> Result<Option<PathBuf>> {
+    backup_before_migration_with_bytes(path, from_version, None)
+}
+
+/// Back up a redacted document instead of copying sensitive legacy bytes.
+pub fn backup_before_migration_with_value<T: Serialize>(
+    path: &Path,
+    from_version: u32,
+    value: &T,
+) -> Result<Option<PathBuf>> {
+    let bytes = serde_json::to_vec_pretty(value).context("serialize migration backup")?;
+    backup_before_migration_with_bytes(path, from_version, Some(&bytes))
+}
+
+fn backup_before_migration_with_bytes(
+    path: &Path,
+    from_version: u32,
+    redacted: Option<&[u8]>,
+) -> Result<Option<PathBuf>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -106,7 +124,11 @@ pub fn backup_before_migration(path: &Path, from_version: u32) -> Result<Option<
         .unwrap_or_default()
         .as_millis();
     let backup = parent.join(format!("{file_name}.bak.v{from_version}.{stamp}"));
-    fs::copy(path, &backup).with_context(|| format!("backup {}", path.display()))?;
+    if let Some(bytes) = redacted {
+        atomic_write(&backup, bytes)?;
+    } else {
+        fs::copy(path, &backup).with_context(|| format!("backup {}", path.display()))?;
+    }
     #[cfg(windows)]
     let file = OpenOptions::new()
         .read(true)

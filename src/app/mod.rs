@@ -25,6 +25,7 @@ mod types;
 mod ui;
 mod view_models;
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -362,6 +363,10 @@ pub struct AppState {
     index_cyb: Option<IndexSnap>,
     /// LLM 配置（设置面板可编辑，写入 config.json）。
     ai_config: AiConfig,
+    /// Set only by an actual API-key input edit; never inferred from load failure.
+    ai_api_key_dirty: Cell<bool>,
+    /// Keep failed key writes visible in settings even after other status updates.
+    ai_api_key_save_error: Option<SharedString>,
     /// 底部「AI 点评」状态。
     ai_panel: AiPanelState,
     /// 当前展示的点评对应的缓存键 `code@date`（用于防止串股）。
@@ -568,9 +573,13 @@ impl StockApp {
             cx.subscribe_in(&ai_api_key_input, window, {
                 move |this, state: &Entity<InputState>, event: &InputEvent, _window, cx| {
                     if matches!(event, InputEvent::Change) {
-                        this.ai_config.api_key = state.read(cx).unmask_value().to_string();
-                        this.schedule_persist(cx);
-                        cx.notify();
+                        let api_key = state.read(cx).unmask_value().to_string();
+                        if this.ai_config.api_key != api_key {
+                            this.ai_config.api_key = api_key;
+                            this.ai_api_key_dirty.set(true);
+                            this.schedule_persist(cx);
+                            cx.notify();
+                        }
                     }
                 }
             }),
@@ -825,6 +834,8 @@ impl StockApp {
                 index_hs300: None,
                 index_cyb: None,
                 ai_config: ai_cfg,
+                ai_api_key_dirty: Cell::new(false),
+                ai_api_key_save_error: None,
                 ai_panel: AiPanelState::Idle,
                 ai_key: None,
                 ai_cache: HashMap::new(),

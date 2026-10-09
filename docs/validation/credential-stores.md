@@ -1,5 +1,19 @@
 # Native credential-store validation
 
+Ordinary app and storage unit tests use an in-memory credential store. Filesystem
+isolation through `HOME` or `ZSTOCK_DATA_DIR` alone does not isolate a native
+credential service. Only the explicitly ignored smoke test below instantiates
+`NativeSecretStore` in test builds.
+
+Normal preference saves never write or delete credentials. Explicit API-key edits
+are persisted separately, so an unavailable credential service does not prevent
+watchlist and layout changes from saving. A failed legacy plaintext migration
+keeps its original config unchanged until secure storage succeeds. A conflicting
+native key or a failed credential read pauses automatic migration without replacing
+either copy. Explicit edits never stage legacy data over an existing native key.
+New migration backups are redacted; existing backups are not rewritten. Failed
+mid-session edits remain visibly pending in AI settings until a retry succeeds.
+
 The ignored `native_secret_round_trip_smoke` test creates a randomized account, writes a fixed
 non-production value, reads it back, deletes it and confirms it is absent. No user API key is read
 or modified.

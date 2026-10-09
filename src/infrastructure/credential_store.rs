@@ -82,12 +82,76 @@ fn get_secret(account: &str) -> Result<Option<String>, SecretError> {
         .args(["lookup", "service", SERVICE, "account", account])
         .output()
         .map_err(command_error)?;
-    if output.status.success() {
-        let value =
-            String::from_utf8(output.stdout).map_err(|error| SecretError(error.to_string()))?;
-        return Ok((!value.trim().is_empty()).then(|| value.trim_end().to_string()));
+    match parse_linux_lookup_output(&output)? {
+        LinuxLookup::Found(value) => Ok(Some(value)),
+        LinuxLookup::CheckAbsence => {
+            // A cancelled unlock can look exactly like a missing key to lookup.
+            // Search without --unlock also includes locked matches. Only a
+            // successful, completely empty search proves absence.
+            let search = Command::new("secret-tool")
+                .args(["search", "--all", "service", SERVICE, "account", account])
+                .output()
+                .map_err(command_error)?;
+            confirm_linux_secret_absent(&search)?;
+            Ok(None)
+        }
     }
-    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum LinuxLookup {
+    Found(String),
+    CheckAbsence,
+}
+
+/// GNOME secret-tool returns 0 with raw password bytes on stdout; it appends a
+/// newline only for a TTY. Both lookup errors (with stderr) and a NULL result
+/// return 1. NULL also covers an unsuccessful unlock, not just missing items.
+/// Sources: official libsecret tool/secret-tool.c and on_lookup_unlocked in
+/// https://gnome.pages.gitlab.gnome.org/libsecret/coverage/tool/secret-tool.c.gcov.html
+/// https://gnome.pages.gitlab.gnome.org/libsecret/coverage/libsecret/secret-methods.c.gcov.html
+#[cfg(target_os = "linux")]
+fn parse_linux_lookup_output(output: &std::process::Output) -> Result<LinuxLookup, SecretError> {
+    if !output.stderr.is_empty() {
+        return Err(linux_output_error("read", output));
+    }
+    if output.status.success() {
+        return String::from_utf8(output.stdout.clone())
+            .map(LinuxLookup::Found)
+            .map_err(|_| SecretError("credential store returned a non-UTF-8 password".into()));
+    }
+    if output.status.code() == Some(1) && output.stdout.is_empty() {
+        return Ok(LinuxLookup::CheckAbsence);
+    }
+    Err(linux_output_error("read", output))
+}
+
+/// secret-tool search exits 0 even when there are no matches. Matching items
+/// produce output, including locked ones; backend failures produce stderr.
+/// https://gnome.pages.gitlab.gnome.org/libsecret/method.Service.search_sync.html
+#[cfg(target_os = "linux")]
+fn confirm_linux_secret_absent(output: &std::process::Output) -> Result<(), SecretError> {
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(linux_output_error("search", output));
+    }
+    if !output.stdout.is_empty() {
+        // Search output may include a secret. Never put it in an error message.
+        return Err(SecretError(
+            "credential exists but could not be read; unlock the credential store and retry".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_output_error(operation: &str, output: &std::process::Output) -> SecretError {
+    let detail = String::from_utf8_lossy(&output.stderr);
+    SecretError(format!(
+        "credential store {operation} failed ({}): {}",
+        output.status,
+        detail.trim()
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -272,5 +336,109 @@ mod native_tests {
         );
         store.delete(&account).expect("delete native credential");
         assert_eq!(store.get(&account).expect("confirm deletion"), None);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_output_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{ExitStatus, Output};
+
+    fn output(code: i32, stdout: &[u8], stderr: &[u8]) -> Output {
+        Output {
+            status: ExitStatus::from_raw(code << 8),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        }
+    }
+
+    #[test]
+    fn successful_lookup_preserves_raw_password_including_empty_value() {
+        for value in [
+            b"fixture-password".as_slice(),
+            b"  trailing  ",
+            b"line\n",
+            b"",
+        ] {
+            assert_eq!(
+                parse_linux_lookup_output(&output(0, value, b"")).unwrap(),
+                LinuxLookup::Found(String::from_utf8(value.to_vec()).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn silent_lookup_exit_one_requires_independent_absence_confirmation() {
+        assert_eq!(
+            parse_linux_lookup_output(&output(1, b"", b"")).unwrap(),
+            LinuxLookup::CheckAbsence
+        );
+        assert!(confirm_linux_secret_absent(&output(0, b"", b"")).is_ok());
+    }
+
+    #[test]
+    fn lookup_diagnostics_never_mean_absence_even_on_success() {
+        for code in [0, 1, 2] {
+            for stderr in [
+                b"secret-tool: service unavailable".as_slice(),
+                b"secret-tool: collection is locked",
+                b"secret-tool: prompt dismissed",
+                b"\n",
+            ] {
+                assert!(parse_linux_lookup_output(&output(code, b"", stderr)).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn abnormal_lookup_status_and_partial_output_fail_closed() {
+        for code in [2, 3, 126, 127] {
+            assert!(parse_linux_lookup_output(&output(code, b"", b"")).is_err());
+        }
+        assert!(parse_linux_lookup_output(&output(1, b"partial", b"")).is_err());
+        let signalled = Output {
+            status: ExitStatus::from_raw(9),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        assert!(parse_linux_lookup_output(&signalled).is_err());
+    }
+
+    #[test]
+    fn invalid_utf8_lookup_fails_without_exposing_password_bytes() {
+        let error = parse_linux_lookup_output(&output(0, b"fixture-password\xff", b""))
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("fixture-password"));
+    }
+
+    #[test]
+    fn locked_or_other_matching_item_is_not_absence() {
+        let error = confirm_linux_secret_absent(&output(
+            0,
+            b"[/item/fixture]\nsecret = fixture-password\n",
+            b"",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("could not be read"));
+        assert!(!error.contains("fixture-password"));
+        assert!(confirm_linux_secret_absent(&output(0, b"\n", b"")).is_err());
+    }
+
+    #[test]
+    fn absence_search_errors_never_allow_migration() {
+        for code in [0, 1, 2] {
+            assert!(
+                confirm_linux_secret_absent(&output(
+                    code,
+                    b"",
+                    b"secret-tool: collection unavailable"
+                ))
+                .is_err()
+            );
+        }
+        assert!(confirm_linux_secret_absent(&output(1, b"", b"")).is_err());
     }
 }

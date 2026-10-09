@@ -149,7 +149,7 @@ impl StockApp {
     }
 
     /// Write config.json immediately (structural changes: add/remove symbol, trades).
-    pub(crate) fn persist(&self) {
+    pub(crate) fn persist(&mut self) {
         let mut dock = self.dock.clone();
         dock.window = self.window_bounds;
         let cfg = AppConfig {
@@ -194,8 +194,31 @@ impl StockApp {
                 .collect(),
             watch_filter: self.watch_filter.id().into(),
         };
+        if self.ai_api_key_dirty.get() {
+            match storage::save_ai_api_key(&self.ai_config.api_key) {
+                Ok(()) => {
+                    self.ai_api_key_dirty.set(false);
+                    self.ai_api_key_save_error = None;
+                    self.status = shared(if self.ai_config.api_key.trim().is_empty() {
+                        "API Key 已从系统凭据库删除"
+                    } else {
+                        "API Key 已安全保存到系统凭据库"
+                    });
+                }
+                Err(error) => {
+                    let message = format!("API Key 尚未保存：{error:#}");
+                    self.ai_api_key_save_error = Some(shared(message.clone()));
+                    storage::record_storage_error(message);
+                }
+            }
+        }
+        // Non-secret preferences still save if an explicit credential edit
+        // fails. Keep that edit pending so a later persistence attempt retries.
         if let Err(error) = storage::save_config(&cfg) {
             storage::record_storage_error(format!("保存配置失败：{error:#}"));
+        }
+        if let Some(error) = storage::take_storage_error() {
+            self.status = shared(error);
         }
     }
 
@@ -205,9 +228,10 @@ impl StockApp {
         let token = self.persist_gen;
         cx.spawn(async move |this, cx| {
             Timer::after(super::PERSIST_DEBOUNCE).await;
-            let _ = this.update(cx, |app, _cx| {
+            let _ = this.update(cx, |app, cx| {
                 if app.persist_gen == token {
                     app.persist();
+                    cx.notify();
                 }
             });
         })

@@ -1,7 +1,7 @@
 //! Local persistence for watchlist, UI preferences, and treasure scan cache.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -13,6 +13,9 @@ use crate::data::journal::Journal;
 use crate::data::portfolio::Portfolio;
 use crate::data::radar::RadarCache;
 use crate::data::treasure::TreasureCache;
+#[cfg(test)]
+use crate::infrastructure::credential_store::MemorySecretStore;
+#[cfg(not(test))]
 use crate::infrastructure::credential_store::NativeSecretStore;
 use crate::infrastructure::storage::json_store::{self, LoadError};
 use crate::infrastructure::storage::migrations::DocumentKind;
@@ -501,20 +504,55 @@ pub fn journal_path() -> PathBuf {
     app_data_dir().join("journal.json")
 }
 
+/// Unit tests must never access the developer's native credential store. Changing
+/// HOME or ZSTOCK_DATA_DIR does not isolate Keychain / Secret Service / DPAPI.
+fn config_secret_store() -> &'static dyn SecretStore {
+    #[cfg(not(test))]
+    {
+        &NativeSecretStore
+    }
+    #[cfg(test)]
+    {
+        static STORE: OnceLock<MemorySecretStore> = OnceLock::new();
+        STORE.get_or_init(MemorySecretStore::default)
+    }
+}
+
 pub fn load_config() -> AppConfig {
-    let path = config_path();
-    match json_store::load::<AppConfig>(&path, DocumentKind::Config) {
+    load_config_with_store(&config_path(), config_secret_store())
+}
+
+fn load_config_with_store(path: &Path, secrets: &dyn SecretStore) -> AppConfig {
+    match json_store::load::<AppConfig>(path, DocumentKind::Config) {
         Ok(mut loaded) => {
-            let secrets = NativeSecretStore;
-            if let Some(secret) = loaded.migration.legacy_api_key.take() {
-                if let Err(error) = secrets.set(AI_API_KEY_ACCOUNT, &secret) {
-                    record_storage_error(format!(
-                        "配置升级暂停：API Key 尚未写入系统凭据库（{error}）；原文件保持不变"
-                    ));
-                    loaded.value.ai_api.api_key = secret;
-                    return loaded.value;
+            if let Some(secret) = loaded.migration.legacy_api_key.as_ref() {
+                match secrets.get(AI_API_KEY_ACCOUNT) {
+                    Ok(Some(stored)) => {
+                        let matches_legacy = stored == *secret;
+                        loaded.value.ai_api.api_key = stored;
+                        if !matches_legacy {
+                            record_storage_error(
+                                "配置升级暂停：旧配置的 API Key 与系统凭据库不一致；保留现有凭据和原文件，请在 AI 设置中明确更新或清除 Key",
+                            );
+                            return loaded.value;
+                        }
+                    }
+                    Ok(None) => {
+                        loaded.value.ai_api.api_key = secret.clone();
+                        if let Err(error) = secrets.set(AI_API_KEY_ACCOUNT, secret) {
+                            record_storage_error(format!(
+                                "配置升级暂停：API Key 尚未写入系统凭据库（{error}）；原文件保持不变"
+                            ));
+                            return loaded.value;
+                        }
+                    }
+                    Err(error) => {
+                        record_storage_error(format!(
+                            "配置升级暂停：系统凭据库读取失败（{error}）；现有凭据和原文件保持不变"
+                        ));
+                        return loaded.value;
+                    }
                 }
-                loaded.value.ai_api.api_key = secret;
             } else {
                 match secrets.get(AI_API_KEY_ACCOUNT) {
                     Ok(Some(secret)) => loaded.value.ai_api.api_key = secret,
@@ -522,19 +560,16 @@ pub fn load_config() -> AppConfig {
                     Err(error) => record_storage_error(format!("系统凭据库读取失败：{error}")),
                 }
             }
-            if loaded.migration.migrated {
-                let migrated =
-                    json_store::backup_before_migration(&path, loaded.migration.from_version)
-                        .and_then(|_| json_store::save(&path, &loaded.value));
-                if let Err(error) = migrated {
-                    record_storage_error(format!("配置迁移未落盘，原文件保持不变：{error:#}"));
-                }
+            if loaded.migration.migrated
+                && let Err(error) = finish_config_migration(path, &loaded)
+            {
+                record_storage_error(format!("配置迁移未落盘，原文件保持不变：{error:#}"));
             }
             loaded.value
         }
         Err(LoadError::NotFound) => AppConfig::default(),
         Err(error) => {
-            let backups = json_store::latest_backups(&path).unwrap_or_default();
+            let backups = json_store::latest_backups(path).unwrap_or_default();
             record_storage_error(format!(
                 "配置进入恢复模式：{error}；可用备份 {} 份",
                 backups.len()
@@ -544,21 +579,77 @@ pub fn load_config() -> AppConfig {
     }
 }
 
+fn finish_config_migration(path: &Path, loaded: &json_store::Loaded<AppConfig>) -> Result<()> {
+    // The migrated JSON retains the original non-secret fields. Do not create
+    // another plaintext copy of a legacy key in the migration backup.
+    json_store::backup_before_migration_with_value(
+        path,
+        loaded.migration.from_version,
+        &loaded.migration.value,
+    )?;
+    json_store::save(path, &loaded.value)
+}
+
+/// Save only ordinary preferences. An empty in-memory key may mean that the
+/// credential store could not be read; it must never imply credential deletion.
 pub fn save_config(cfg: &AppConfig) -> Result<()> {
-    let path = config_path();
-    let secrets = NativeSecretStore;
-    if cfg.ai_api.api_key.trim().is_empty() {
+    save_config_at(&config_path(), cfg)
+}
+
+fn save_config_at(path: &Path, cfg: &AppConfig) -> Result<()> {
+    match json_store::load::<AppConfig>(path, DocumentKind::Config) {
+        Ok(loaded) if loaded.migration.legacy_api_key.is_some() => {
+            anyhow::bail!(
+                "API Key 安全迁移尚未完成；为保留原密钥，暂不覆盖旧配置，请解锁系统凭据库后重试"
+            );
+        }
+        Ok(_) | Err(LoadError::NotFound) => json_store::save(path, cfg),
+        Err(error) => anyhow::bail!("为保留原配置，暂不覆盖无法读取的文件：{error}"),
+    }
+}
+
+/// Called only after an actual edit of the API-key input. Empty text explicitly
+/// clears the stored credential; routine preferences never call this function.
+pub fn save_ai_api_key(api_key: &str) -> Result<()> {
+    save_ai_api_key_with_store(&config_path(), api_key, config_secret_store())
+}
+
+fn save_ai_api_key_with_store(path: &Path, api_key: &str, secrets: &dyn SecretStore) -> Result<()> {
+    // Scrub legacy plaintext before applying an explicit edit so clearing a
+    // key cannot resurrect it at the next launch. Preserve any existing native
+    // key until the requested edit succeeds; never overwrite it with legacy
+    // data as an intermediate migration step.
+    match json_store::load::<AppConfig>(path, DocumentKind::Config) {
+        Ok(loaded) => {
+            if let Some(secret) = loaded.migration.legacy_api_key.as_deref() {
+                let existing = secrets
+                    .get(AI_API_KEY_ACCOUNT)
+                    .map_err(anyhow::Error::new)
+                    .context("read credential store before legacy API key edit")?;
+                if existing.is_none() {
+                    secrets
+                        .set(AI_API_KEY_ACCOUNT, secret)
+                        .map_err(anyhow::Error::new)
+                        .context("migrate legacy API key to credential store")?;
+                }
+                finish_config_migration(path, &loaded)?;
+            }
+        }
+        Err(LoadError::NotFound) => {}
+        Err(error) => anyhow::bail!("cannot safely edit API key with unreadable config: {error}"),
+    }
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
         secrets
             .delete(AI_API_KEY_ACCOUNT)
             .map_err(anyhow::Error::new)
-            .context("delete API key from credential store")?;
+            .context("delete API key from credential store")
     } else {
         secrets
-            .set(AI_API_KEY_ACCOUNT, cfg.ai_api.api_key.trim())
+            .set(AI_API_KEY_ACCOUNT, api_key)
             .map_err(anyhow::Error::new)
-            .context("save API key to credential store")?;
+            .context("save API key to credential store")
     }
-    json_store::save(&path, cfg)
 }
 
 pub fn load_treasure_cache() -> TreasureCache {
@@ -642,4 +733,436 @@ pub fn export_journal(journal: &Journal) -> Result<PathBuf> {
     let path = app_data_dir().join(format!("journal-export-{stamp}.json"));
     json_store::save(&path, journal)?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod credential_persistence_tests {
+    use super::*;
+    use crate::services::secrets::SecretError;
+
+    #[derive(Default)]
+    struct TestSecretStore {
+        memory: MemorySecretStore,
+        calls: Mutex<Vec<&'static str>>,
+        fail_get: bool,
+        fail_set: bool,
+        fail_delete: bool,
+    }
+
+    impl SecretStore for TestSecretStore {
+        fn get(&self, account: &str) -> std::result::Result<Option<String>, SecretError> {
+            self.calls.lock().unwrap().push("get");
+            if self.fail_get {
+                return Err(SecretError("fixture read unavailable".into()));
+            }
+            self.memory.get(account)
+        }
+
+        fn set(&self, account: &str, secret: &str) -> std::result::Result<(), SecretError> {
+            self.calls.lock().unwrap().push("set");
+            if self.fail_set {
+                return Err(SecretError("fixture write unavailable".into()));
+            }
+            self.memory.set(account, secret)
+        }
+
+        fn delete(&self, account: &str) -> std::result::Result<(), SecretError> {
+            self.calls.lock().unwrap().push("delete");
+            if self.fail_delete {
+                return Err(SecretError("fixture delete unavailable".into()));
+            }
+            self.memory.delete(account)
+        }
+    }
+
+    struct ConfigFixture(PathBuf);
+
+    impl ConfigFixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "zstock-credential-prefs-{}-{stamp}-{id}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&directory).unwrap();
+            Self(directory.join("config.json"))
+        }
+
+        fn legacy(&self) -> Vec<u8> {
+            let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+            value.as_object_mut().unwrap().remove("schema_version");
+            value["ai_api"]["api_key"] = serde_json::json!("fixture-legacy-secret");
+            let bytes = serde_json::to_vec_pretty(&value).unwrap();
+            fs::write(&self.0, &bytes).unwrap();
+            bytes
+        }
+
+        fn assert_redacted(&self) {
+            for entry in fs::read_dir(self.0.parent().unwrap()).unwrap() {
+                let bytes = fs::read(entry.unwrap().path()).unwrap();
+                let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert!(value.pointer("/ai_api/api_key").is_none());
+                let text = String::from_utf8(bytes).unwrap();
+                assert!(!text.contains("fixture-legacy-secret"));
+                assert!(!text.contains("fixture-new-secret"));
+            }
+        }
+    }
+
+    impl Drop for ConfigFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(self.0.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn ordinary_preferences_save_without_credential_service() {
+        let fixture = ConfigFixture::new();
+        let mut cfg = AppConfig::default();
+        cfg.watchlist.clear();
+        cfg.dock.main_h = vec![280.0, 720.0];
+        cfg.ai_api.api_key = "fixture-new-secret".into();
+        save_config_at(&fixture.0, &cfg).unwrap();
+        cfg.ai_api.api_key.clear();
+        cfg.work_mode = true;
+        save_config_at(&fixture.0, &cfg).unwrap();
+        let loaded = json_store::load::<AppConfig>(&fixture.0, DocumentKind::Config).unwrap();
+        assert!(loaded.value.watchlist.is_empty());
+        assert_eq!(loaded.value.dock.main_h, vec![280.0, 720.0]);
+        assert!(loaded.value.work_mode);
+        fixture.assert_redacted();
+    }
+
+    #[test]
+    fn failed_credential_read_never_turns_preference_save_into_delete() {
+        let fixture = ConfigFixture::new();
+        save_config_at(&fixture.0, &AppConfig::default()).unwrap();
+        let secrets = TestSecretStore {
+            fail_get: true,
+            ..Default::default()
+        };
+        secrets
+            .memory
+            .set(AI_API_KEY_ACCOUNT, "fixture-existing-secret")
+            .unwrap();
+        let mut cfg = load_config_with_store(&fixture.0, &secrets);
+        assert!(cfg.ai_api.api_key.is_empty());
+        cfg.watchlist.clear();
+        save_config_at(&fixture.0, &cfg).unwrap();
+        assert_eq!(*secrets.calls.lock().unwrap(), vec!["get"]);
+        assert_eq!(
+            secrets.memory.get(AI_API_KEY_ACCOUNT).unwrap().as_deref(),
+            Some("fixture-existing-secret")
+        );
+        assert!(
+            json_store::load::<AppConfig>(&fixture.0, DocumentKind::Config)
+                .unwrap()
+                .value
+                .watchlist
+                .is_empty()
+        );
+        fixture.assert_redacted();
+    }
+
+    #[test]
+    fn explicit_key_edits_store_trimmed_secret_and_clear_it() {
+        let fixture = ConfigFixture::new();
+        save_config_at(&fixture.0, &AppConfig::default()).unwrap();
+        let secrets = TestSecretStore::default();
+        save_ai_api_key_with_store(&fixture.0, "  fixture-new-secret  ", &secrets).unwrap();
+        assert_eq!(
+            load_config_with_store(&fixture.0, &secrets).ai_api.api_key,
+            "fixture-new-secret"
+        );
+        save_ai_api_key_with_store(&fixture.0, "  ", &secrets).unwrap();
+        assert!(
+            load_config_with_store(&fixture.0, &secrets)
+                .ai_api
+                .api_key
+                .is_empty()
+        );
+        assert_eq!(
+            *secrets.calls.lock().unwrap(),
+            vec!["set", "get", "delete", "get"]
+        );
+        fixture.assert_redacted();
+    }
+
+    #[test]
+    fn failed_explicit_key_edit_does_not_block_ordinary_preferences() {
+        let fixture = ConfigFixture::new();
+        let mut cfg = AppConfig::default();
+        save_config_at(&fixture.0, &cfg).unwrap();
+        let secrets = TestSecretStore {
+            fail_set: true,
+            ..Default::default()
+        };
+        secrets
+            .memory
+            .set(AI_API_KEY_ACCOUNT, "fixture-existing-secret")
+            .unwrap();
+        cfg.ai_api.api_key = "fixture-new-secret".into();
+        cfg.watchlist.clear();
+        assert!(save_ai_api_key_with_store(&fixture.0, &cfg.ai_api.api_key, &secrets).is_err());
+        save_config_at(&fixture.0, &cfg).unwrap();
+        assert_eq!(
+            secrets.memory.get(AI_API_KEY_ACCOUNT).unwrap().as_deref(),
+            Some("fixture-existing-secret")
+        );
+        let loaded = json_store::load::<AppConfig>(&fixture.0, DocumentKind::Config).unwrap();
+        assert!(loaded.value.watchlist.is_empty());
+        fixture.assert_redacted();
+    }
+
+    #[test]
+    fn failed_explicit_delete_preserves_stored_key() {
+        let fixture = ConfigFixture::new();
+        save_config_at(&fixture.0, &AppConfig::default()).unwrap();
+        let secrets = TestSecretStore {
+            fail_delete: true,
+            ..Default::default()
+        };
+        secrets
+            .memory
+            .set(AI_API_KEY_ACCOUNT, "fixture-existing-secret")
+            .unwrap();
+        assert!(save_ai_api_key_with_store(&fixture.0, "", &secrets).is_err());
+        assert_eq!(
+            secrets.memory.get(AI_API_KEY_ACCOUNT).unwrap().as_deref(),
+            Some("fixture-existing-secret")
+        );
+        fixture.assert_redacted();
+    }
+
+    #[test]
+    fn legacy_migration_stores_secret_before_redacting_config_and_backup() {
+        let fixture = ConfigFixture::new();
+        fixture.legacy();
+        let secrets = TestSecretStore::default();
+        let cfg = load_config_with_store(&fixture.0, &secrets);
+        assert_eq!(cfg.ai_api.api_key, "fixture-legacy-secret");
+        assert_eq!(*secrets.calls.lock().unwrap(), vec!["get", "set"]);
+        assert_eq!(json_store::latest_backups(&fixture.0).unwrap().len(), 1);
+        fixture.assert_redacted();
+        assert_eq!(
+            load_config_with_store(&fixture.0, &secrets).ai_api.api_key,
+            "fixture-legacy-secret"
+        );
+        assert_eq!(*secrets.calls.lock().unwrap(), vec!["get", "set", "get"]);
+    }
+
+    #[test]
+    fn failed_legacy_migration_preserves_original_through_unrelated_saves() {
+        let fixture = ConfigFixture::new();
+        let original = fixture.legacy();
+        let secrets = TestSecretStore {
+            fail_set: true,
+            ..Default::default()
+        };
+        let mut cfg = load_config_with_store(&fixture.0, &secrets);
+        assert_eq!(cfg.ai_api.api_key, "fixture-legacy-secret");
+        cfg.watchlist.clear();
+        assert!(save_config_at(&fixture.0, &cfg).is_err());
+        assert_eq!(fs::read(&fixture.0).unwrap(), original);
+        assert!(json_store::latest_backups(&fixture.0).unwrap().is_empty());
+        assert_eq!(*secrets.calls.lock().unwrap(), vec!["get", "set"]);
+    }
+
+    #[test]
+    fn explicit_clear_after_legacy_migration_cannot_resurrect_secret() {
+        let fixture = ConfigFixture::new();
+        fixture.legacy();
+        let secrets = TestSecretStore::default();
+        save_ai_api_key_with_store(&fixture.0, "", &secrets).unwrap();
+        assert_eq!(*secrets.calls.lock().unwrap(), vec!["get", "set", "delete"]);
+        assert!(
+            load_config_with_store(&fixture.0, &secrets)
+                .ai_api
+                .api_key
+                .is_empty()
+        );
+        fixture.assert_redacted();
+        // Restoring the sanitized migration backup cannot restore the removed key.
+        let backup = json_store::latest_backups(&fixture.0).unwrap().remove(0);
+        json_store::restore_backup(&fixture.0, &backup).unwrap();
+        assert!(
+            load_config_with_store(&fixture.0, &secrets)
+                .ai_api
+                .api_key
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn explicit_replacement_after_legacy_migration_keeps_new_secret() {
+        let fixture = ConfigFixture::new();
+        fixture.legacy();
+        let secrets = TestSecretStore::default();
+        save_ai_api_key_with_store(&fixture.0, "fixture-new-secret", &secrets).unwrap();
+        assert_eq!(*secrets.calls.lock().unwrap(), vec!["get", "set", "set"]);
+        assert_eq!(
+            load_config_with_store(&fixture.0, &secrets).ai_api.api_key,
+            "fixture-new-secret"
+        );
+        fixture.assert_redacted();
+    }
+
+    #[test]
+    fn failed_legacy_clear_keeps_the_only_copy_and_never_deletes() {
+        let fixture = ConfigFixture::new();
+        let original = fixture.legacy();
+        let secrets = TestSecretStore {
+            fail_set: true,
+            ..Default::default()
+        };
+        assert!(save_ai_api_key_with_store(&fixture.0, "", &secrets).is_err());
+        assert_eq!(fs::read(&fixture.0).unwrap(), original);
+        assert_eq!(*secrets.calls.lock().unwrap(), vec!["get", "set"]);
+    }
+
+    #[test]
+    fn legacy_migration_conflict_preserves_newer_native_key_and_original_file() {
+        let fixture = ConfigFixture::new();
+        let original = fixture.legacy();
+        let secrets = TestSecretStore::default();
+        secrets
+            .memory
+            .set(AI_API_KEY_ACCOUNT, "fixture-new-secret")
+            .unwrap();
+        let cfg = load_config_with_store(&fixture.0, &secrets);
+        assert_eq!(cfg.ai_api.api_key, "fixture-new-secret");
+        assert_eq!(fs::read(&fixture.0).unwrap(), original);
+        assert!(save_config_at(&fixture.0, &cfg).is_err());
+        assert_eq!(*secrets.calls.lock().unwrap(), vec!["get"]);
+        assert_eq!(
+            secrets.memory.get(AI_API_KEY_ACCOUNT).unwrap().as_deref(),
+            Some("fixture-new-secret")
+        );
+        assert!(json_store::latest_backups(&fixture.0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn matching_legacy_and_native_key_migrates_without_rewriting_credential() {
+        let fixture = ConfigFixture::new();
+        fixture.legacy();
+        let secrets = TestSecretStore::default();
+        secrets
+            .memory
+            .set(AI_API_KEY_ACCOUNT, "fixture-legacy-secret")
+            .unwrap();
+        let cfg = load_config_with_store(&fixture.0, &secrets);
+        assert_eq!(cfg.ai_api.api_key, "fixture-legacy-secret");
+        assert_eq!(*secrets.calls.lock().unwrap(), vec!["get"]);
+        fixture.assert_redacted();
+    }
+
+    #[test]
+    fn legacy_store_read_failure_blocks_migration_and_explicit_edit_without_writes() {
+        let fixture = ConfigFixture::new();
+        let original = fixture.legacy();
+        let secrets = TestSecretStore {
+            fail_get: true,
+            ..Default::default()
+        };
+        secrets
+            .memory
+            .set(AI_API_KEY_ACCOUNT, "fixture-new-secret")
+            .unwrap();
+        let cfg = load_config_with_store(&fixture.0, &secrets);
+        assert!(cfg.ai_api.api_key.is_empty());
+        assert!(save_config_at(&fixture.0, &cfg).is_err());
+        assert!(save_ai_api_key_with_store(&fixture.0, "replacement", &secrets).is_err());
+        assert_eq!(*secrets.calls.lock().unwrap(), vec!["get", "get"]);
+        assert_eq!(fs::read(&fixture.0).unwrap(), original);
+        assert_eq!(
+            secrets.memory.get(AI_API_KEY_ACCOUNT).unwrap().as_deref(),
+            Some("fixture-new-secret")
+        );
+        assert!(json_store::latest_backups(&fixture.0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn explicit_replacement_never_temporarily_overwrites_newer_key_with_legacy() {
+        let fixture = ConfigFixture::new();
+        fixture.legacy();
+        let secrets = TestSecretStore {
+            fail_set: true,
+            ..Default::default()
+        };
+        secrets
+            .memory
+            .set(AI_API_KEY_ACCOUNT, "fixture-new-secret")
+            .unwrap();
+        assert!(save_ai_api_key_with_store(&fixture.0, "replacement", &secrets).is_err());
+        assert_eq!(*secrets.calls.lock().unwrap(), vec!["get", "set"]);
+        assert_eq!(
+            secrets.memory.get(AI_API_KEY_ACCOUNT).unwrap().as_deref(),
+            Some("fixture-new-secret")
+        );
+        fixture.assert_redacted();
+        // The failed requested write can now retry without any legacy migration.
+        let secrets = TestSecretStore {
+            memory: secrets.memory,
+            ..Default::default()
+        };
+        save_ai_api_key_with_store(&fixture.0, "replacement", &secrets).unwrap();
+        assert_eq!(*secrets.calls.lock().unwrap(), vec!["set"]);
+        assert_eq!(
+            secrets.memory.get(AI_API_KEY_ACCOUNT).unwrap().as_deref(),
+            Some("replacement")
+        );
+    }
+
+    #[test]
+    fn explicit_clear_of_conflicting_legacy_config_preserves_newer_key_until_delete() {
+        let fixture = ConfigFixture::new();
+        fixture.legacy();
+        let secrets = TestSecretStore {
+            fail_delete: true,
+            ..Default::default()
+        };
+        secrets
+            .memory
+            .set(AI_API_KEY_ACCOUNT, "fixture-new-secret")
+            .unwrap();
+        assert!(save_ai_api_key_with_store(&fixture.0, "", &secrets).is_err());
+        assert_eq!(*secrets.calls.lock().unwrap(), vec!["get", "delete"]);
+        assert_eq!(
+            secrets.memory.get(AI_API_KEY_ACCOUNT).unwrap().as_deref(),
+            Some("fixture-new-secret")
+        );
+        fixture.assert_redacted();
+    }
+
+    #[test]
+    fn unreadable_config_is_not_overwritten_or_used_for_credential_edits() {
+        let fixture = ConfigFixture::new();
+        fs::write(&fixture.0, b"{broken").unwrap();
+        let secrets = TestSecretStore::default();
+        assert!(save_config_at(&fixture.0, &AppConfig::default()).is_err());
+        assert!(save_ai_api_key_with_store(&fixture.0, "", &secrets).is_err());
+        assert_eq!(fs::read(&fixture.0).unwrap(), b"{broken");
+        assert!(secrets.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ordinary_test_store_is_persistent_in_memory() {
+        // The cfg(test) factory has no NativeSecretStore branch. This verifies
+        // repeated app/storage calls share the fake rather than recreating it.
+        let account = "credential-persistence-test-only-account";
+        config_secret_store()
+            .set(account, "fixture-new-secret")
+            .unwrap();
+        assert_eq!(
+            config_secret_store().get(account).unwrap().as_deref(),
+            Some("fixture-new-secret")
+        );
+        config_secret_store().delete(account).unwrap();
+        assert!(config_secret_store().get(account).unwrap().is_none());
+    }
 }

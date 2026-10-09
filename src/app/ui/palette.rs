@@ -69,6 +69,7 @@ impl StockApp {
             .child(
                 v_flex()
                     .id("palette-panel")
+                    .debug_selector(|| "palette-panel".into())
                     .key_context("stock_palette")
                     .w_full()
                     .max_w(px(620.))

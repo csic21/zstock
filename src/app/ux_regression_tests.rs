@@ -4,9 +4,9 @@
 
 use gpui::VisualContext;
 use gpui::{AppContext, Context, TestAppContext, VisualTestContext, Window};
-use gpui_component::PixelsExt;
+use gpui_component::{PixelsExt, Root};
 
-use super::layout_regression_tests::test_window;
+use super::layout_regression_tests::test_window as unwrapped_test_window;
 use super::state::PrimaryTask;
 use super::{ChartKind, ChartRange, DetailTab, StockApp};
 use crate::controller::state::RequestState;
@@ -17,6 +17,20 @@ use crate::data::radar::{RadarHit, RadarStrategy};
 use crate::data::scout::{ScoutPick, ScoutVerdict};
 use crate::data::treasure::TreasureHit;
 use crate::model::{MinutePeriod, Symbol, TrendLine, board_for_code, shared};
+
+/// The older layout fixture uses StockApp directly as its root. Input focus and
+/// component overlays require the same Root wrapper used in the production app.
+fn test_window(cx: &mut TestAppContext, width: f32, height: f32) -> VisualTestContext {
+    let mut window = unwrapped_test_window(cx, width, height);
+    let handle = window.window_handle();
+    window
+        .cx
+        .update_window(handle, |view, window, cx| {
+            window.replace_root(cx, |window, cx| Root::new(view, window, cx));
+        })
+        .expect("install component root");
+    window
+}
 
 fn symbol(code: &str) -> Symbol {
     Symbol {
@@ -37,9 +51,15 @@ fn update_app<R>(
     window
         .cx
         .update_window(handle, |view, window, cx| {
-            view.downcast::<StockApp>()
-                .expect("StockApp window")
-                .update(cx, |app, cx| update(app, window, cx))
+            let app = view
+                .downcast::<Root>()
+                .expect("component root")
+                .read(cx)
+                .view()
+                .clone()
+                .downcast::<StockApp>()
+                .expect("StockApp content");
+            app.update(cx, |app, cx| update(app, window, cx))
         })
         .expect("update fixture window")
 }
@@ -230,6 +250,7 @@ fn palette_is_visible_and_bounded_over_compact_settings_and_market(cx: &mut Test
         });
         // Draw synchronously; do not run background network tasks to get a frame.
         window.update(|window, cx| {
+            window.refresh();
             let _ = window.draw(cx);
         });
         let panel = window
@@ -273,6 +294,110 @@ fn palette_clear_close_reopen_and_invalid_text_are_safe(cx: &mut TestAppContext)
         assert!(app.palette_open);
         assert!(matches!(app.palette_search.state, RequestState::Failed(_)));
         assert_eq!(serde_json::to_value(&app.symbols).unwrap(), membership);
+    });
+}
+
+#[gpui::test]
+fn only_explicit_credential_edits_persist_through_the_test_secret_store(cx: &mut TestAppContext) {
+    let mut window = test_window(cx, 920.0, 580.0);
+    update_app(&mut window, |app, window, cx| {
+        assert!(
+            !app.ai_api_key_dirty.get(),
+            "loading config must not edit credentials"
+        );
+        let initial = app.ai_config.api_key.clone();
+        app.ai_api_key_input
+            .update(cx, |input, cx| input.set_value(initial, window, cx));
+    });
+    // Separate updates flush InputEvent::Change subscriptions between assertions.
+    update_app(&mut window, |app, window, cx| {
+        assert!(
+            !app.ai_api_key_dirty.get(),
+            "unchanged input must stay clean"
+        );
+        app.ai_api_key_input.update(cx, |input, cx| {
+            input.set_value("fixture-api-key", window, cx)
+        });
+    });
+    update_app(&mut window, |app, window, cx| {
+        assert!(
+            app.ai_api_key_dirty.get(),
+            "explicit input change must be tracked"
+        );
+        let fixture_dir = crate::infrastructure::storage::paths::app_data_dir();
+        assert!(fixture_dir.starts_with(std::env::temp_dir()));
+        // Ordinary test builds inject an in-memory store. This cannot touch the
+        // developer's native keychain, and the config remains fixture-only.
+        app.persist();
+        assert!(!app.ai_api_key_dirty.get());
+        assert_eq!(
+            crate::storage::load_config().ai_api.api_key,
+            "fixture-api-key"
+        );
+        app.ai_api_key_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+    });
+    update_app(&mut window, |app, _window, _cx| {
+        assert!(app.ai_api_key_dirty.get(), "explicit clear must be tracked");
+        app.persist();
+        assert!(!app.ai_api_key_dirty.get());
+        assert!(crate::storage::load_config().ai_api.api_key.is_empty());
+    });
+}
+
+#[gpui::test]
+fn credential_save_failure_is_visible_and_recovers_without_losing_config(cx: &mut TestAppContext) {
+    let mut window = test_window(cx, 920.0, 580.0);
+    let broken = b"{ fixture interrupted config";
+    let (path, original) = update_app(&mut window, |app, window, cx| {
+        assert!(!app.ai_api_key_dirty.get());
+        let fixture_dir = crate::infrastructure::storage::paths::app_data_dir();
+        assert!(fixture_dir.starts_with(std::env::temp_dir()));
+        let path = fixture_dir.join("config.json");
+        let original = std::fs::read(&path).expect("read valid fixture config");
+        std::fs::write(&path, broken).expect("seed interrupted fixture config");
+        app.ai_api_key_input.update(cx, |input, cx| {
+            input.set_value("fixture-retry-api-key", window, cx);
+        });
+        (path, original)
+    });
+    update_app(&mut window, |app, _window, _cx| {
+        assert!(app.ai_api_key_dirty.get());
+        app.persist();
+        assert!(app.ai_api_key_dirty.get(), "failed key write stays pending");
+        assert!(
+            app.ai_api_key_save_error
+                .as_ref()
+                .is_some_and(|error| error.contains("API Key 尚未保存"))
+        );
+        assert!(
+            app.status.contains("保存配置失败"),
+            "failure must be visible during the session"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            broken,
+            "failed save must preserve the interrupted original"
+        );
+    });
+
+    std::fs::write(&path, original).expect("restore valid fixture config");
+    update_app(&mut window, |app, window, cx| {
+        app.persist();
+        assert!(!app.ai_api_key_dirty.get());
+        assert!(app.ai_api_key_save_error.is_none());
+        assert_eq!(
+            crate::storage::load_config().ai_api.api_key,
+            "fixture-retry-api-key"
+        );
+        app.ai_api_key_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+    });
+    update_app(&mut window, |app, _window, _cx| {
+        app.persist();
+        assert!(!app.ai_api_key_dirty.get());
+        assert!(app.ai_api_key_save_error.is_none());
+        assert!(crate::storage::load_config().ai_api.api_key.is_empty());
     });
 }
 
