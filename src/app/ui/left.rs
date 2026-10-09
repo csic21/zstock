@@ -50,10 +50,14 @@ impl StockApp {
         };
         let count = match self.left_tab {
             LeftTab::Watchlist => {
-                let n = self.watchlist_display_order().len();
                 if self.watch_filter == WatchTag::None {
                     format!("{}", self.symbols.len())
                 } else {
+                    let n = self
+                        .symbols
+                        .iter()
+                        .filter(|symbol| self.tag_for(&symbol.code) == self.watch_filter)
+                        .count();
                     format!("{n}/{}", self.symbols.len())
                 }
             }

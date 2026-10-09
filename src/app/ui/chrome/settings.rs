@@ -1,9 +1,9 @@
 use gpui::{
-    Context, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled,
-    Window, div, prelude::FluentBuilder, px,
+    Context, Div, ElementId, InteractiveElement, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, Sizable, StyledExt,
+    ActiveTheme, Disableable, IconName, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
     input::Input,
@@ -17,6 +17,41 @@ use crate::update::UpdateState;
 
 use crate::app::{QUOTE_INTERVAL_PRESETS, SettingsSection, StockApp};
 
+/// Group related preferences into readable surfaces rather than loose tiny pills.
+fn settings_group(cx: &Context<StockApp>) -> Div {
+    v_flex()
+        .w_full()
+        .gap_3()
+        .p_4()
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(cx.theme().border)
+        .bg(cx.theme().sidebar)
+}
+
+pub(super) fn settings_choice(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    selected: bool,
+    cx: &Context<StockApp>,
+) -> Button {
+    Button::new(id)
+        .small()
+        .h(px(32.))
+        .min_w(px(64.))
+        .px_3()
+        .outline()
+        .rounded(px(6.))
+        .label(label)
+        .when(selected, |button| {
+            button
+                .icon(IconName::Check)
+                .bg(cx.theme().accent.opacity(0.16))
+                .border_color(cx.theme().accent.opacity(0.6))
+                .text_color(cx.theme().foreground)
+        })
+}
+
 impl StockApp {
     pub(crate) fn render_settings(
         &self,
@@ -25,7 +60,7 @@ impl StockApp {
     ) -> impl IntoElement {
         let work = self.work_mode;
         let section = self.settings_section;
-        let _ = window; // height comes from flex layout
+        let compact = window.bounds().size.width < px(800.);
 
         v_flex()
             .id("settings-panel")
@@ -34,7 +69,8 @@ impl StockApp {
             .bg(cx.theme().background)
             .child(
                 h_flex()
-                    .h(px(44.))
+                    .h(px(52.))
+                    .flex_shrink_0()
                     .px_3()
                     .items_center()
                     .gap_2()
@@ -44,8 +80,11 @@ impl StockApp {
                     .child(
                         Button::new("settings-back")
                             .ghost()
-                            .xsmall()
-                            .label(if work { "← Back" } else { "← 返回行情" })
+                            .small()
+                            .h(px(32.))
+                            .icon(IconName::ArrowLeft)
+                            .label(if work { "Back" } else { "返回上一页" })
+                            .debug_selector(|| "settings-back".into())
                             .on_click(cx.listener(|this, _, _w, cx| {
                                 this.close_settings(cx);
                             })),
@@ -60,7 +99,7 @@ impl StockApp {
                     .child(div().flex_1())
                     .child(
                         div()
-                            .text_xs()
+                            .text_sm()
                             .text_color(cx.theme().muted_foreground)
                             .child(if self.ai_api_key_dirty.get() {
                                 if work {
@@ -82,7 +121,7 @@ impl StockApp {
                     .w_full()
                     .child(
                         v_flex()
-                            .w(px(200.))
+                            .w(px(if compact { 148. } else { 184. }))
                             .h_full()
                             .flex_shrink_0()
                             .border_r_1()
@@ -94,7 +133,13 @@ impl StockApp {
                                 let on = section == sec;
                                 Button::new(("settings-nav", sec as u32))
                                     .ghost()
-                                    .when(on, |b| b.primary())
+                                    .h(px(36.))
+                                    .justify_start()
+                                    .when(on, |b| {
+                                        b.icon(IconName::Check)
+                                            .bg(cx.theme().accent.opacity(0.16))
+                                            .text_color(cx.theme().foreground)
+                                    })
                                     .label(sec.label(work))
                                     .on_click(cx.listener(move |this, _, _w, cx| {
                                         this.set_settings_section(sec, cx);
@@ -104,11 +149,13 @@ impl StockApp {
                     .child(
                         div()
                             .id("settings-body")
+                            .debug_selector(|| "settings-body".into())
+                            .min_w_0()
                             .flex_1()
                             .min_h_0()
                             .h_full()
                             .overflow_y_scroll()
-                            .p_5()
+                            .p_4()
                             .child(match section {
                                 SettingsSection::General => {
                                     self.render_settings_general(work, cx).into_any_element()
@@ -140,7 +187,7 @@ impl StockApp {
 
         v_flex()
             .gap_5()
-            .max_w(px(640.))
+            .w_full().max_w(px(880.))
             .child(
                 div()
                     .text_sm()
@@ -150,18 +197,17 @@ impl StockApp {
             )
             // Quote interval
             .child(
-                v_flex()
-                    .gap_2()
+                settings_group(cx)
                     .child(
                         div()
-                            .text_xs()
+                            .text_sm()
                             .font_semibold()
                             .text_color(cx.theme().muted_foreground)
                             .child(if work { "Poll interval" } else { "行情刷新间隔" }),
                     )
                     .child(
                         div()
-                            .text_xs()
+                            .text_sm()
                             .text_color(cx.theme().muted_foreground.opacity(0.9))
                             .child(if work {
                                 "Poll only in session (CN 09:15–15:00 incl. auction; HK 09:00–16:10). Off-hours: once on open."
@@ -170,14 +216,11 @@ impl StockApp {
                             }),
                     )
                     .child(
-                        h_flex().gap_1().flex_wrap().children(
+                        h_flex().gap_2().flex_wrap().debug_selector(|| "settings-interval-options".into()).children(
                             QUOTE_INTERVAL_PRESETS.iter().map(|&secs| {
                                 let active = interval == secs;
-                                Button::new(("qi", secs as u32))
-                                    .xsmall()
-                                    .when(active, |b| b.primary())
-                                    .when(!active, |b| b.ghost())
-                                    .label(format!("{secs}s"))
+                                settings_choice(("qi", secs as u32), format!("{secs}s"), active, cx)
+                                    .debug_selector(move || format!("settings-interval-{secs}").into())
                                     .on_click(cx.listener(move |this, _, _w, cx| {
                                         this.set_quote_interval_secs(secs, cx);
                                     }))
@@ -186,7 +229,7 @@ impl StockApp {
                     )
                     .child(
                         div()
-                            .text_xs()
+                            .text_sm()
                             .text_color(cx.theme().muted_foreground)
                             .child(format!(
                                 "{}: {interval}s",
@@ -196,27 +239,22 @@ impl StockApp {
             )
             // Color scheme
             .child(
-                v_flex()
-                    .gap_2()
+                settings_group(cx)
                     .child(
                         div()
-                            .text_xs()
+                            .text_sm()
                             .font_semibold()
                             .text_color(cx.theme().muted_foreground)
                             .child(if work { "Color scheme" } else { "涨跌配色" }),
                     )
                     .child(
-                        h_flex().gap_1().children([ColorScheme::Cn, ColorScheme::Us].map(|s| {
+                        h_flex().gap_2().flex_wrap().children([ColorScheme::Cn, ColorScheme::Us].map(|s| {
                             let active = scheme == s;
                             let id = match s {
                                 ColorScheme::Cn => "set-scheme-cn",
                                 ColorScheme::Us => "set-scheme-us",
                             };
-                            Button::new(id)
-                                .xsmall()
-                                .when(active, |b| b.primary())
-                                .when(!active, |b| b.ghost())
-                                .label(s.label())
+                            settings_choice(id, s.label(), active, cx)
                                 .on_click(cx.listener(move |this, _, _w, cx| {
                                     this.set_color_scheme(s, cx);
                                 }))
@@ -225,18 +263,17 @@ impl StockApp {
             )
             // Work mode
             .child(
-                v_flex()
-                    .gap_2()
+                settings_group(cx)
                     .child(
                         div()
-                            .text_xs()
+                            .text_sm()
                             .font_semibold()
                             .text_color(cx.theme().muted_foreground)
                             .child(if work { "Focus layout" } else { "工作模式" }),
                     )
                     .child(
                         div()
-                            .text_xs()
+                            .text_sm()
                             .text_color(cx.theme().muted_foreground.opacity(0.9))
                             .child(if work {
                                 "Full-page metrics dashboard with neutral chrome. Looks like a service monitor; quotes stay readable under the skin."
@@ -248,21 +285,13 @@ impl StockApp {
                         h_flex()
                             .gap_1()
                             .child(
-                                Button::new("set-work-off")
-                                    .xsmall()
-                                    .when(!work, |b| b.primary())
-                                    .when(work, |b| b.ghost())
-                                    .label(if work { "Off" } else { "关闭" })
+                                settings_choice("set-work-off", if work { "Off" } else { "关闭" }, !work, cx)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.set_work_mode(false, window, cx);
                                     })),
                             )
                             .child(
-                                Button::new("set-work-on")
-                                    .xsmall()
-                                    .when(work, |b| b.primary())
-                                    .when(!work, |b| b.ghost())
-                                    .label(if work { "On" } else { "开启" })
+                                settings_choice("set-work-on", if work { "On" } else { "开启" }, work, cx)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.set_work_mode(true, window, cx);
                                     })),
@@ -274,7 +303,7 @@ impl StockApp {
                                 .gap_1()
                                 .child(
                                     div()
-                                        .text_xs()
+                                        .text_sm()
                                         .text_color(cx.theme().muted_foreground.opacity(0.9))
                                         .child(
                                             "Window size · layout density (also in title bar): Wide → Fit → Mini. Drag the split between service list and host panel.",
@@ -283,11 +312,7 @@ impl StockApp {
                                 .child(
                                     h_flex().gap_1().children(WorkDensity::all().map(|d| {
                                         let active = self.work_density == d;
-                                        Button::new(("set-work-density", d as u32))
-                                            .xsmall()
-                                            .when(active, |b| b.primary())
-                                            .when(!active, |b| b.ghost())
-                                            .label(d.label())
+                                        settings_choice(("set-work-density", d as u32), d.label(), active, cx)
                                             .tooltip(d.tooltip())
                                             .on_click(cx.listener(move |this, _, window, cx| {
                                                 this.set_work_density(d, window, cx);
@@ -295,9 +320,9 @@ impl StockApp {
                                     })),
                                 ),
                         )
-                    })
-                    .child(self.render_work_mode_help(work, cx)),
+                    }),
             )
+            .child(self.render_work_mode_help(work, cx))
     }
 
     /// Full keyboard map + Focus/work-mode field legend (settings help panel).
@@ -313,7 +338,7 @@ impl StockApp {
                 (
                     "⌘K / Ctrl+K",
                     "Command palette",
-                    "Search or add symbols · ↑↓ · Enter",
+                    "↑↓ select · Enter previews · Add saves to watchlist",
                 ),
                 ("⌘P / Ctrl+P", "Command palette", "Same as ⌘K"),
                 (
@@ -340,7 +365,7 @@ impl StockApp {
                 (
                     "Backspace / Delete",
                     "Remove symbol",
-                    "Drop selected from watchlist (min 1)",
+                    "Remove from watchlist; research stays available and removal can be undone",
                 ),
                 (
                     "0  or  double-click chart",
@@ -359,7 +384,7 @@ impl StockApp {
                 (
                     "⌘K / Ctrl+K",
                     "命令面板",
-                    "搜索 / 添加自选 · ↑↓ 选择 · Enter 确认",
+                    "↑↓ 选择 · Enter 预览 ·「添加」按钮保存自选",
                 ),
                 ("⌘P / Ctrl+P", "命令面板", "与 ⌘K 相同"),
                 (
@@ -386,7 +411,7 @@ impl StockApp {
                 (
                     "Backspace / Delete",
                     "删除自选",
-                    "移除当前选中（至少保留 1 只）",
+                    "移出自选，保留研究数据；可撤销",
                 ),
                 ("0  或  图表双击", "重置缩放", "K 线缩放/平移恢复全览"),
                 ("Esc", "关闭浮层", "命令面板 · 设置 · Tag 编辑 · 画线模式"),
@@ -495,7 +520,7 @@ impl StockApp {
                     div()
                         .min_w(px(168.))
                         .max_w(px(200.))
-                        .text_xs()
+                        .text_sm()
                         .font_semibold()
                         .text_color(fg)
                         .child(key),
@@ -504,8 +529,8 @@ impl StockApp {
                     v_flex()
                         .flex_1()
                         .min_w_0()
-                        .child(div().text_xs().text_color(fg).child(title))
-                        .child(div().text_xs().text_color(muted.opacity(0.9)).child(desc)),
+                        .child(div().text_sm().text_color(fg).child(title))
+                        .child(div().text_sm().text_color(muted.opacity(0.9)).child(desc)),
                 )
         };
 
@@ -519,7 +544,7 @@ impl StockApp {
             .bg(bg)
             .child(
                 div()
-                    .text_xs()
+                    .text_sm()
                     .font_semibold()
                     .text_color(fg)
                     .child(if work {
@@ -533,7 +558,7 @@ impl StockApp {
                     .gap_1p5()
                     .child(
                         div()
-                            .text_xs()
+                            .text_sm()
                             .font_semibold()
                             .text_color(muted)
                             .child(if work {
@@ -553,7 +578,7 @@ impl StockApp {
                     .gap_1p5()
                     .child(
                         div()
-                            .text_xs()
+                            .text_sm()
                             .font_semibold()
                             .text_color(muted)
                             .child(if work {
@@ -573,7 +598,7 @@ impl StockApp {
                     .gap_1p5()
                     .child(
                         div()
-                            .text_xs()
+                            .text_sm()
                             .font_semibold()
                             .text_color(muted)
                             .child(if work {
@@ -591,7 +616,7 @@ impl StockApp {
                                 div()
                                     .min_w(px(120.))
                                     .max_w(px(140.))
-                                    .text_xs()
+                                    .text_sm()
                                     .font_semibold()
                                     .text_color(fg)
                                     .child(*field),
@@ -600,7 +625,7 @@ impl StockApp {
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .text_xs()
+                                    .text_sm()
                                     .text_color(muted.opacity(0.95))
                                     .child(*meaning),
                             )
@@ -611,14 +636,14 @@ impl StockApp {
                     .gap_1()
                     .child(
                         div()
-                            .text_xs()
+                            .text_sm()
                             .font_semibold()
                             .text_color(muted)
                             .child(if work { "Tips" } else { "使用提示" }),
                     )
                     .children(tips.iter().map(|line| {
                         div()
-                            .text_xs()
+                            .text_sm()
                             .text_color(muted.opacity(0.9))
                             .child(format!("· {line}"))
                     })),
@@ -632,7 +657,8 @@ impl StockApp {
     ) -> impl IntoElement {
         v_flex()
             .gap_3()
-            .max_w(px(640.))
+            .w_full()
+            .max_w(px(880.))
             .child(
                 div()
                     .text_sm()
@@ -642,7 +668,7 @@ impl StockApp {
             )
             .child(
                 div()
-                    .text_xs()
+                    .text_sm()
                     .text_color(cx.theme().muted_foreground.opacity(0.9))
                     .child(self.update_status_line(work)),
             )
@@ -651,7 +677,8 @@ impl StockApp {
                     .gap_1()
                     .child(
                         Button::new("check-update-btn")
-                            .xsmall()
+                            .small()
+                            .h(px(32.))
                             .ghost()
                             .label(if work { "Check" } else { "检查更新" })
                             .disabled(matches!(
@@ -665,7 +692,8 @@ impl StockApp {
                     .children(match &self.update_state {
                         UpdateState::Available(_) => Some(
                             Button::new("settings-update-now")
-                                .xsmall()
+                                .small()
+                                .h(px(32.))
                                 .primary()
                                 .label(if work { "Update now" } else { "立即更新" })
                                 .on_click(cx.listener(|this, _, _w, cx| {
@@ -704,7 +732,7 @@ impl StockApp {
         let mut col = v_flex()
             .gap_5()
             .w_full()
-            .max_w(px(640.))
+            .w_full().max_w(px(880.))
             // Page title
             .child(
                 div()
@@ -720,7 +748,7 @@ impl StockApp {
                     .w_full()
                     .child(
                         div()
-                            .text_xs()
+                            .text_sm()
                             .font_semibold()
                             .text_color(cx.theme().muted_foreground)
                             .child(if work { "Enable" } else { "开关" }),
@@ -728,7 +756,7 @@ impl StockApp {
                     .child(
                         div()
                             .w_full()
-                            .text_xs()
+                            .text_sm()
                             .text_color(cx.theme().muted_foreground.opacity(0.9))
                             .child(if work {
                                 "Optional LLM brief. Falls back to local rules when off or failed."
@@ -740,21 +768,13 @@ impl StockApp {
                         h_flex()
                             .gap_1()
                             .child(
-                                Button::new("ai-on")
-                                    .xsmall()
-                                    .when(self.ai_config.enabled, |b| b.primary())
-                                    .when(!self.ai_config.enabled, |b| b.ghost())
-                                    .label(if work { "On" } else { "开启" })
+                                settings_choice("ai-on", if work { "On" } else { "开启" }, self.ai_config.enabled, cx)
                                     .on_click(cx.listener(|this, _, _w, cx| {
                                         this.set_ai_enabled(true, cx);
                                     })),
                             )
                             .child(
-                                Button::new("ai-off")
-                                    .xsmall()
-                                    .when(!self.ai_config.enabled, |b| b.primary())
-                                    .when(self.ai_config.enabled, |b| b.ghost())
-                                    .label(if work { "Off" } else { "关闭" })
+                                settings_choice("ai-off", if work { "Off" } else { "关闭" }, !self.ai_config.enabled, cx)
                                     .on_click(cx.listener(|this, _, _w, cx| {
                                         this.set_ai_enabled(false, cx);
                                     })),
@@ -768,7 +788,7 @@ impl StockApp {
                     .w_full()
                     .child(
                         div()
-                            .text_xs()
+                            .text_sm()
                             .font_semibold()
                             .text_color(cx.theme().muted_foreground)
                             .child(if work { "Transport" } else { "调用方式" }),
@@ -776,7 +796,7 @@ impl StockApp {
                     .child(
                         div()
                             .w_full()
-                            .text_xs()
+                            .text_sm()
                             .text_color(cx.theme().muted_foreground.opacity(0.9))
                             .child(if work {
                                 "HTTP API or a local CLI already logged in on this machine."
@@ -790,11 +810,7 @@ impl StockApp {
                             AiTransport::Api => "ai-transport-api",
                             AiTransport::Cli => "ai-transport-cli",
                         };
-                        Button::new(id)
-                            .xsmall()
-                            .when(active, |b| b.primary())
-                            .when(!active, |b| b.ghost())
-                            .label(t.label())
+                        settings_choice(id, t.label(), active, cx)
                             .on_click(cx.listener(move |this, _, _w, cx| {
                                 this.set_ai_transport(t, cx);
                             }))
@@ -809,7 +825,7 @@ impl StockApp {
                         .w_full()
                         .child(
                             div()
-                                .text_xs()
+                                .text_sm()
                                 .font_semibold()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(if work { "CLI tool" } else { "CLI 工具" }),
@@ -826,11 +842,7 @@ impl StockApp {
                                         AiCliProvider::Opencode => "ai-cli-opencode",
                                         AiCliProvider::Claude => "ai-cli-claude",
                                     };
-                                    Button::new(id)
-                                        .xsmall()
-                                        .when(active, |b| b.primary())
-                                        .when(!active, |b| b.ghost())
-                                        .label(p.label())
+                                    settings_choice(id, p.label(), active, cx)
                                         .on_click(cx.listener(move |this, _, _w, cx| {
                                             this.set_ai_cli_provider(p, cx);
                                         }))
@@ -843,7 +855,7 @@ impl StockApp {
                         .w_full()
                         .child(
                             div()
-                                .text_xs()
+                                .text_sm()
                                 .font_semibold()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(if work {
@@ -855,7 +867,7 @@ impl StockApp {
                         .child(
                             div()
                                 .w_full()
-                                .text_xs()
+                                .text_sm()
                                 .text_color(cx.theme().muted_foreground.opacity(0.9))
                                 .child(if work {
                                     "Leave empty to use the CLI default model."
@@ -871,7 +883,7 @@ impl StockApp {
                         .w_full()
                         .child(
                             div()
-                                .text_xs()
+                                .text_sm()
                                 .font_semibold()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(if work {
@@ -883,7 +895,7 @@ impl StockApp {
                         .child(
                             div()
                                 .w_full()
-                                .text_xs()
+                                .text_sm()
                                 .text_color(cx.theme().muted_foreground.opacity(0.9))
                                 .child(if work {
                                     "Absolute path if the binary is not on PATH."
@@ -896,7 +908,7 @@ impl StockApp {
                 .child(
                     div()
                         .w_full()
-                        .text_xs()
+                        .text_sm()
                         .text_color(cx.theme().muted_foreground.opacity(0.75))
                         .child(if work {
                             "Uses your logged-in CLI. Only the metric snapshot is sent as the prompt."
@@ -912,7 +924,7 @@ impl StockApp {
                         .w_full()
                         .child(
                             div()
-                                .text_xs()
+                                .text_sm()
                                 .font_semibold()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(if work { "Protocol" } else { "协议" }),
@@ -923,11 +935,7 @@ impl StockApp {
                                 AiKind::Responses => "ai-kind-responses",
                                 AiKind::Chat => "ai-kind-chat",
                             };
-                            Button::new(id)
-                                .xsmall()
-                                .when(active, |b| b.primary())
-                                .when(!active, |b| b.ghost())
-                                .label(kind.label())
+                            settings_choice(id, kind.label(), active, cx)
                                 .on_click(cx.listener(move |this, _, _w, cx| {
                                     this.set_ai_kind(kind, cx);
                                 }))
@@ -939,7 +947,7 @@ impl StockApp {
                         .w_full()
                         .child(
                             div()
-                                .text_xs()
+                                .text_sm()
                                 .font_semibold()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(if work { "Base URL" } else { "API 地址" }),
@@ -952,7 +960,7 @@ impl StockApp {
                         .w_full()
                         .child(
                             div()
-                                .text_xs()
+                                .text_sm()
                                 .font_semibold()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(if work { "Model" } else { "模型" }),
@@ -965,7 +973,7 @@ impl StockApp {
                         .w_full()
                         .child(
                             div()
-                                .text_xs()
+                                .text_sm()
                                 .font_semibold()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(if work { "API key" } else { "API Key" }),
@@ -975,7 +983,7 @@ impl StockApp {
                 .child(
                     div()
                         .w_full()
-                        .text_xs()
+                        .text_sm()
                         .text_color(cx.theme().muted_foreground.opacity(0.75))
                         .child(if work {
                             "Key is saved in the system credential store. Only the metric snapshot is sent."
@@ -990,7 +998,7 @@ impl StockApp {
                 div()
                     .id("ai-api-key-save-pending")
                     .w_full()
-                    .text_xs()
+                    .text_sm()
                     .text_color(cx.theme().danger)
                     .child(self.ai_api_key_save_error.clone().unwrap_or_else(|| {
                         shared(if work {
@@ -1004,7 +1012,7 @@ impl StockApp {
         .child(
             div()
                 .w_full()
-                .text_xs()
+                .text_sm()
                 .text_color(cx.theme().muted_foreground)
                 .child(status),
         )
@@ -1017,7 +1025,7 @@ impl StockApp {
     ) -> impl IntoElement {
         v_flex()
             .gap_3()
-            .max_w(px(640.))
+            .w_full().max_w(px(880.))
             .child(
                 div()
                     .text_sm()
@@ -1027,7 +1035,7 @@ impl StockApp {
             )
             .child(
                 div()
-                    .text_xs()
+                    .text_sm()
                     .text_color(cx.theme().muted_foreground.opacity(0.9))
                     .child(format!(
                         "{} v{}",
@@ -1037,7 +1045,7 @@ impl StockApp {
             )
             .child(
                 div()
-                    .text_xs()
+                    .text_sm()
                     .text_color(cx.theme().muted_foreground.opacity(0.9))
                     .child(if work {
                         "Data: Eastmoney & Tencent public endpoints, personal study only."
@@ -1047,7 +1055,7 @@ impl StockApp {
             )
             .child(
                 div()
-                    .text_xs()
+                    .text_sm()
                     .text_color(cx.theme().muted_foreground.opacity(0.75))
                     .child(if work {
                         "For reference only. Quotes may be delayed or erroneous; no investment advice."
@@ -1057,7 +1065,7 @@ impl StockApp {
             )
             .child(
                 div()
-                    .text_xs()
+                    .text_sm()
                     .text_color(cx.theme().muted_foreground.opacity(0.75))
                     .child(if work {
                         "Prefs are saved locally and apply immediately."

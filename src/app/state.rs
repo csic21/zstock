@@ -162,7 +162,10 @@ impl super::StockApp {
 
     pub(crate) fn set_primary_task(&mut self, task: PrimaryTask, cx: &mut gpui::Context<Self>) {
         if self.ui_state.primary_task == task {
-            if task == PrimaryTask::Today && self.market_analysis_open {
+            // Re-selecting the current task is still navigation when a settings
+            // or market page is covering it. This also covers keyboard shortcuts.
+            if self.settings_open || self.market_analysis_open {
+                self.settings_open = false;
                 self.market_analysis_open = false;
                 self.market_heatmap_fullscreen = false;
                 cx.notify();
@@ -197,7 +200,6 @@ impl super::StockApp {
             PrimaryTask::Research => {
                 self.market_analysis_open = false;
                 self.left_tab = super::LeftTab::Watchlist;
-                self.detail_tab = super::DetailTab::Overview;
             }
             PrimaryTask::Opportunities => {
                 self.market_analysis_open = false;

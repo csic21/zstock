@@ -29,6 +29,10 @@ impl StockApp {
     }
 
     pub(crate) fn climate_evidence(&self) -> ClimateEvidence {
+        self.climate_evidence_with_open_count(self.portfolio.positions().len())
+    }
+
+    fn climate_evidence_with_open_count(&self, open_positions: usize) -> ClimateEvidence {
         let indices = [
             ("上证综指", self.index_sh),
             ("沪深300", self.index_hs300),
@@ -95,7 +99,7 @@ impl StockApp {
             sector_declines,
             sector_unchanged,
             sector_average_change,
-            open_positions: self.portfolio_summary().open_count,
+            open_positions,
         }
     }
 
@@ -243,7 +247,7 @@ impl StockApp {
             risks,
             plans,
             opportunities,
-            climate: self.climate_evidence(),
+            climate: self.climate_evidence_with_open_count(summary.open_count),
             open_positions: summary.open_count,
         })
     }
@@ -259,16 +263,18 @@ impl StockApp {
         let Some((strategy_name, compiled)) = self.strategy_lab_feature.compiled_champion() else {
             return (None, Vec::new());
         };
-        let climate = self.market_climate_report();
+        let positions = self.portfolio.positions();
+        let climate =
+            assess_market_climate(&self.climate_evidence_with_open_count(positions.len()));
         let capital = super::helpers::parse_f64(&self.position_capital_input.read(cx).value())
             .unwrap_or(100_000.0);
         let risk_pct = super::helpers::parse_f64(&self.position_risk_pct_input.read(cx).value())
             .unwrap_or(1.0)
             * climate.risk_scale;
         let mut codes = Vec::new();
-        for position in self.portfolio.positions() {
+        for position in &positions {
             if position.is_open() && !codes.iter().any(|code| code == &position.code) {
-                codes.push(position.code);
+                codes.push(position.code.clone());
             }
         }
         for symbol in &self.symbols {
@@ -281,19 +287,16 @@ impl StockApp {
         let plans = codes
             .into_iter()
             .map(|code| {
+                let position = positions.iter().find(|position| position.code == code);
                 let name = self
                     .symbols
                     .iter()
                     .find(|symbol| symbol.code == code)
                     .map(|symbol| symbol.name.to_string())
-                    .or_else(|| {
-                        self.portfolio
-                            .position_of(&code)
-                            .map(|position| position.name)
-                    })
+                    .or_else(|| position.map(|position| position.name.clone()))
                     .unwrap_or_else(|| code.clone());
                 let candles = self.daily_records_for(&code);
-                let holding = self.portfolio.position_of(&code).and_then(|position| {
+                let holding = position.and_then(|position| {
                     position.is_open().then(|| HoldingSnapshot {
                         shares: position.shares.floor().max(0.0) as u64,
                         avg_cost: position.avg_cost,
@@ -338,9 +341,9 @@ impl StockApp {
         if self.selected.as_ref() == code && !self.current_daily_candles().is_empty() {
             return Some(candles_to_records(self.current_daily_candles()));
         }
-        if let Some(cached) =
-            self.series_cache
-                .lookup_klines(super::types::ChartKind::DayK, code, 0)
+        if let Some(key) =
+            super::series_cache::SeriesCache::kline_key(super::types::ChartKind::DayK, code)
+            && let Some(cached) = self.series_cache.get_klines(&key)
             && !cached.candles.is_empty()
         {
             return Some(candles_to_records(&cached.candles));

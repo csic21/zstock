@@ -2,15 +2,12 @@ use gpui::{
     Context, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
 };
-use gpui_component::{
-    ActiveTheme, Sizable, StyledExt,
-    button::{Button, ButtonVariants},
-    h_flex, v_flex,
-};
+use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
 
 use crate::model::disguise_label;
 use crate::storage::STATUS_BAR_MAX_CODES;
 
+use super::settings::settings_choice;
 use crate::app::StockApp;
 use crate::app::helpers::*;
 
@@ -35,7 +32,7 @@ impl StockApp {
             )
             .child(
                 div()
-                    .text_xs()
+                    .text_sm()
                     .text_color(cx.theme().muted_foreground.opacity(0.9))
                     .child(if work {
                         format!(
@@ -51,21 +48,13 @@ impl StockApp {
                 h_flex()
                     .gap_1()
                     .child(
-                        Button::new("set-statusbar-off")
-                            .xsmall()
-                            .when(!enabled, |b| b.primary())
-                            .when(enabled, |b| b.ghost())
-                            .label(if work { "Off" } else { "关闭" })
+                        settings_choice("set-statusbar-off", if work { "Off" } else { "关闭" }, !enabled, cx)
                             .on_click(cx.listener(|this, _, _w, cx| {
                                 this.set_status_bar_enabled(false, cx);
                             })),
                     )
                     .child(
-                        Button::new("set-statusbar-on")
-                            .xsmall()
-                            .when(enabled, |b| b.primary())
-                            .when(!enabled, |b| b.ghost())
-                            .label(if work { "On" } else { "开启" })
+                        settings_choice("set-statusbar-on", if work { "On" } else { "开启" }, enabled, cx)
                             .on_click(cx.listener(|this, _, _w, cx| {
                                 this.set_status_bar_enabled(true, cx);
                             })),
@@ -74,7 +63,7 @@ impl StockApp {
             .when(enabled, |col| {
                 col.child(
                     div()
-                        .text_xs()
+                        .text_sm()
                         .text_color(cx.theme().muted_foreground)
                         .child(if work {
                             format!("Pinned {pin_count}/{STATUS_BAR_MAX_CODES} · click to pin/unpin · all show in menu bar")
@@ -120,7 +109,7 @@ impl StockApp {
                             div()
                                 .id(row_id)
                                 .w_full()
-                                .h(px(32.))
+                                .h(px(36.))
                                 .px_3()
                                 .flex()
                                 .items_center()
@@ -149,7 +138,7 @@ impl StockApp {
                                 .when(!code_show.is_empty(), |r| {
                                     r.child(
                                         div()
-                                            .text_xs()
+                                            .text_sm()
                                             .font_family("Menlo")
                                             .text_color(cx.theme().muted_foreground)
                                             .child(code_show),
@@ -157,7 +146,7 @@ impl StockApp {
                                 })
                                 .child(
                                     div()
-                                        .text_xs()
+                                        .text_sm()
                                         .text_color(if is_pinned {
                                             cx.theme().accent_foreground
                                         } else {
@@ -169,7 +158,7 @@ impl StockApp {
                 )
                 .child(
                     div()
-                        .text_xs()
+                        .text_sm()
                         .text_color(cx.theme().muted_foreground.opacity(0.75))
                         .child(if work {
                             "Highlighted = pinned (shown in menu bar) · click to toggle."

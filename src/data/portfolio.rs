@@ -112,7 +112,7 @@ impl Default for Portfolio {
 }
 
 /// 单标的当前持仓（由流水重放得出）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Position {
     pub code: String,
     pub name: String,
@@ -466,50 +466,16 @@ impl Portfolio {
 
     /// 按代码重放流水 → 持仓列表（仅开仓，按 code 排序）。
     pub fn positions(&self) -> Vec<Position> {
-        let mut map: BTreeMap<(Currency, String), PositionState> = BTreeMap::new();
-        for t in &self.trades {
-            let st = map
-                .entry((t.currency, t.code.clone()))
-                .or_insert_with(|| PositionState {
-                    name: t.name.clone(),
-                    currency: t.currency,
-                    shares: 0.0,
-                    cost_basis: 0.0,
-                    realized_pnl: 0.0,
-                    trade_count: 0,
-                });
-            if !t.name.is_empty() && t.name != t.code {
-                st.name = t.name.clone();
-            }
-            st.apply(t);
-        }
-        map.into_iter()
-            .filter_map(|((currency, code), st)| {
-                if st.shares <= 1e-9 {
-                    return None;
-                }
-                let avg = if st.shares > 1e-9 {
-                    st.cost_basis / st.shares
-                } else {
-                    0.0
-                };
-                Some(Position {
-                    code,
-                    name: st.name,
-                    currency,
-                    shares: st.shares,
-                    avg_cost: avg,
-                    total_cost: st.cost_basis,
-                    realized_pnl: st.realized_pnl,
-                    trade_count: st.trade_count,
-                })
-            })
-            .collect()
+        replay_positions(self.trades.iter())
     }
 
-    /// 单标的持仓（含已清仓则 None）。
+    /// Single-instrument lookup only replays that instrument's transactions.
+    /// Keep the same currency grouping/order as `positions`, including imported
+    /// records, without constructing every unrelated holding on chart hover.
     pub fn position_of(&self, code: &str) -> Option<Position> {
-        self.positions().into_iter().find(|p| p.code == code)
+        replay_positions(self.trades.iter().filter(|trade| trade.code == code))
+            .into_iter()
+            .next()
     }
 
     /// 单标的完整状态（含已清仓的已实现盈亏）。
@@ -798,6 +764,45 @@ impl Portfolio {
     }
 }
 
+/// Borrow grouping keys while replaying; allocate each returned code just once.
+fn replay_positions<'a>(trades: impl Iterator<Item = &'a Trade>) -> Vec<Position> {
+    let mut map: BTreeMap<(Currency, &'a str), PositionState> = BTreeMap::new();
+    for trade in trades {
+        let state = map
+            .entry((trade.currency, trade.code.as_str()))
+            .or_insert_with(|| PositionState {
+                name: trade.name.clone(),
+                currency: trade.currency,
+                ..PositionState::default()
+            });
+        if !trade.name.is_empty() && trade.name != trade.code && state.name != trade.name {
+            state.name.clone_from(&trade.name);
+        }
+        state.apply(trade);
+    }
+    map.into_iter()
+        .filter_map(|((currency, code), state)| {
+            if state.shares <= 1e-9 {
+                return None;
+            }
+            Some(Position {
+                code: code.to_string(),
+                name: state.name,
+                currency,
+                shares: state.shares,
+                avg_cost: if state.shares > 1e-9 {
+                    state.cost_basis / state.shares
+                } else {
+                    0.0
+                },
+                total_cost: state.cost_basis,
+                realized_pnl: state.realized_pnl,
+                trade_count: state.trade_count,
+            })
+        })
+        .collect()
+}
+
 struct PositionState {
     name: String,
     currency: Currency,
@@ -878,6 +883,140 @@ pub fn format_money(v: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn legacy_positions(portfolio: &Portfolio) -> Vec<Position> {
+        let mut map: BTreeMap<(Currency, String), PositionState> = BTreeMap::new();
+        for t in &portfolio.trades {
+            let st = map
+                .entry((t.currency, t.code.clone()))
+                .or_insert_with(|| PositionState {
+                    name: t.name.clone(),
+                    currency: t.currency,
+                    shares: 0.0,
+                    cost_basis: 0.0,
+                    realized_pnl: 0.0,
+                    trade_count: 0,
+                });
+            if !t.name.is_empty() && t.name != t.code {
+                st.name = t.name.clone();
+            }
+            st.apply(t);
+        }
+        map.into_iter()
+            .filter_map(|((currency, code), st)| {
+                if st.shares <= 1e-9 {
+                    return None;
+                }
+                let avg = if st.shares > 1e-9 {
+                    st.cost_basis / st.shares
+                } else {
+                    0.0
+                };
+                Some(Position {
+                    code,
+                    name: st.name,
+                    currency,
+                    shares: st.shares,
+                    avg_cost: avg,
+                    total_cost: st.cost_basis,
+                    realized_pnl: st.realized_pnl,
+                    trade_count: st.trade_count,
+                })
+            })
+            .collect()
+    }
+
+    fn performance_portfolio(symbols: usize, rounds: usize) -> Portfolio {
+        let trades = (0..rounds)
+            .flat_map(|round| {
+                (0..symbols).map(move |symbol| Trade {
+                    id: format!("{symbol}-{round}"),
+                    code: format!("{symbol:06}"),
+                    name: format!("Symbol {symbol}"),
+                    side: if round % 3 == 2 {
+                        TradeSide::Sell
+                    } else {
+                        TradeSide::Buy
+                    },
+                    currency: Currency::Cny,
+                    shares: 100.0,
+                    price: 10.0 + round as f64 * 0.1,
+                    fee: 5.0,
+                    time: "2026-08-20 10:00:00".into(),
+                    note: String::new(),
+                })
+            })
+            .collect();
+        Portfolio {
+            trades,
+            ..Portfolio::default()
+        }
+    }
+
+    #[test]
+    fn targeted_position_replay_matches_full_ledger_with_mixed_currencies_and_reentries() {
+        let mut portfolio = performance_portfolio(24, 12);
+        // Imported records can contain the same code in distinct currencies.
+        // Preserve the original currency grouping, name rules, and first match.
+        let mut imported = portfolio.trades[0].clone();
+        imported.currency = Currency::Hkd;
+        imported.name = "HK holding".into();
+        imported.shares = 200.0;
+        portfolio.trades.push(imported.clone());
+        imported.side = TradeSide::Sell;
+        portfolio.trades.push(imported.clone());
+        imported.side = TradeSide::Buy;
+        imported.name = imported.code.clone();
+        imported.shares = 50.0;
+        portfolio.trades.push(imported);
+
+        let expected = legacy_positions(&portfolio);
+        assert_eq!(portfolio.positions(), expected);
+        for code in portfolio.all_codes() {
+            assert_eq!(
+                portfolio.position_of(&code),
+                expected.iter().find(|p| p.code == code).cloned()
+            );
+        }
+        assert_eq!(portfolio.position_of("missing"), None);
+        assert_eq!(Portfolio::default().position_of("000001"), None);
+
+        let mut closed = Portfolio::default();
+        buy(&mut closed, "600519", 100.0, 10.0, 5.0);
+        sell(&mut closed, "600519", 100.0, 12.0, 5.0);
+        assert_eq!(closed.position_of("600519"), None);
+        buy(&mut closed, "600519", 50.0, 15.0, 3.0);
+        assert_eq!(closed.positions(), legacy_positions(&closed));
+        assert_eq!(
+            closed.position_of("600519"),
+            legacy_positions(&closed).into_iter().next()
+        );
+    }
+
+    #[test]
+    #[ignore = "deterministic render-hot-path benchmark; run with --nocapture"]
+    fn performance_single_position_render_lookup() {
+        let portfolio = performance_portfolio(500, 40);
+        let codes: Vec<_> = (0..40).map(|index| format!("{index:06}")).collect();
+        assert_eq!(portfolio.positions(), legacy_positions(&portfolio));
+        let started = std::time::Instant::now();
+        for code in &codes {
+            std::hint::black_box(
+                legacy_positions(&portfolio)
+                    .into_iter()
+                    .find(|position| position.code == *code),
+            );
+        }
+        let before = started.elapsed();
+        let started = std::time::Instant::now();
+        for code in &codes {
+            std::hint::black_box(portfolio.position_of(code));
+        }
+        let after = started.elapsed();
+        eprintln!(
+            "single_position: 20,000 trades / 500 symbols / 40 lookups, before={before:?}, after={after:?}"
+        );
+    }
 
     fn quote(code: &str, price: f64) -> QuoteRecord {
         QuoteRecord {

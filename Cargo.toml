@@ -1,6 +1,6 @@
 [package]
 name = "stock"
-version = "0.0.58"
+version = "0.0.59"
 edition = "2024"
 description = "A-share and Hong Kong stock analysis desktop app built with GPUI"
 license = "MIT"
@@ -41,6 +41,7 @@ encoding_rs = "0.8"
 # runtime_shaders avoids needing the Xcode Metal toolchain at compile time
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 gpui-component = "0.5.1"
+gpui-component-assets = "0.5.1"
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -65,3 +66,7 @@ codegen-units = 1
 block = "0.1.6"
 cocoa = "0.26"
 objc = "0.2.7"
+
+# Scoped 0.5.1 hover foreground fix; origin and checksum in vendor/README.md.
+[patch.crates-io]
+gpui-component = { path = "vendor/gpui-component" }

@@ -2004,9 +2004,12 @@ impl StockApp {
         let total = n_local + n_remote;
         if total == 0 {
             let q = q_raw.trim();
-            if q.is_empty() || matches!(self.palette_search.state, RequestState::Loading) {
+            if q.is_empty() {
                 return;
             }
+            // Exact codes do not need the search provider to resolve a name.
+            // Keep existing results above this fallback in priority, and let
+            // open_research_symbol cancel the pending search before previewing.
             if let Some(code) = typed_symbol_code(q) {
                 self.open_research_symbol(
                     Symbol {
@@ -2019,7 +2022,7 @@ impl StockApp {
                     },
                     cx,
                 );
-            } else {
+            } else if !matches!(self.palette_search.state, RequestState::Loading) {
                 self.palette_search.state = RequestState::Failed(
                     "未找到匹配结果。请修改名称，或输入 6 位 A 股 / 5 位港股代码".into(),
                 );
@@ -2051,6 +2054,42 @@ impl StockApp {
 #[cfg(test)]
 mod navigation_tests {
     use super::*;
+    use gpui::{AppContext, TestAppContext, VisualContext};
+
+    fn palette_fixture(code: &str) -> Symbol {
+        Symbol {
+            code: code.into(),
+            name: shared(format!("fixture-{code}")),
+            last: 10.0,
+            change_pct: 0.0,
+            volume: 0,
+            board: board_for_code(code),
+        }
+    }
+
+    fn with_palette_app(
+        cx: &mut TestAppContext,
+        update: impl FnOnce(&mut StockApp, &mut Window, &mut Context<StockApp>),
+    ) {
+        let mut window = super::super::layout_regression_tests::test_window(cx, 920.0, 580.0);
+        let handle = window.window_handle();
+        window
+            .cx
+            .update_window(handle, |view, window, cx| {
+                view.downcast::<StockApp>()
+                    .expect("StockApp fixture")
+                    .update(cx, |app, cx| {
+                        // Seed input and search state directly. Do not run the
+                        // background executor or make network responses part
+                        // of these synchronous interaction regressions.
+                        app._subscriptions.clear();
+                        app.symbols = vec![palette_fixture("600519")];
+                        app.selected = shared("600519");
+                        update(app, window, cx);
+                    });
+            })
+            .expect("update palette fixture");
+    }
 
     #[test]
     fn typed_codes_reject_arbitrary_text_and_embedded_garbage() {
@@ -2069,12 +2108,101 @@ mod navigation_tests {
         for (query, code) in [
             ("600519", "600519"),
             ("sh600519", "600519"),
+            ("SZ000001", "000001"),
+            ("bj430047", "430047"),
             ("00700", "00700"),
             ("HK700", "00700"),
+            ("hk.700", "00700"),
             ("700.HK", "00700"),
         ] {
             assert_eq!(typed_symbol_code(query).as_deref(), Some(code));
         }
+    }
+
+    #[gpui::test]
+    fn pending_exact_code_search_opens_preview_and_invalidates_response(cx: &mut TestAppContext) {
+        with_palette_app(cx, |app, window, cx| {
+            let membership = serde_json::to_value(&app.symbols).unwrap();
+            for (query, code) in [
+                ("600000", "600000"),
+                ("SH600000", "600000"),
+                ("sz000001", "000001"),
+                ("bj430047", "430047"),
+                ("00700", "00700"),
+                ("HK700", "00700"),
+                ("hk.700", "00700"),
+                ("700.HK", "00700"),
+            ] {
+                app.palette_query
+                    .update(cx, |input, cx| input.set_value(query, window, cx));
+                app.palette_open = true;
+                app.filtered_local.clear();
+                app.palette_hits.clear();
+                let pending = app.palette_search.begin(query);
+
+                app.palette_confirm(window, cx);
+
+                assert_eq!(app.selected.as_ref(), code, "{query}");
+                assert_eq!(app.preview_symbol.as_ref().unwrap().code, code);
+                assert!(!app.palette_open, "{query}");
+                assert_eq!(serde_json::to_value(&app.symbols).unwrap(), membership);
+                assert!(!app.palette_search.is_current(&pending));
+                assert!(!app.palette_search.apply(&pending, ()));
+                assert!(!app.palette_search.fail(&pending, "late error"));
+                assert!(app.palette_hits.is_empty());
+                assert_eq!(app.palette_search.state, RequestState::Idle);
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn pending_names_and_invalid_codes_do_not_create_previews(cx: &mut TestAppContext) {
+        with_palette_app(cx, |app, window, cx| {
+            for query in ["", "茅台", "hello", "700", "hkxyz700", "600519!"] {
+                app.palette_query
+                    .update(cx, |input, cx| input.set_value(query, window, cx));
+                app.palette_open = true;
+                app.filtered_local.clear();
+                app.palette_hits.clear();
+                let pending = app.palette_search.begin(query);
+
+                app.palette_confirm(window, cx);
+
+                assert_eq!(app.selected.as_ref(), "600519", "{query}");
+                assert!(app.preview_symbol.is_none(), "{query}");
+                assert!(app.palette_open, "{query}");
+                assert!(app.palette_search.is_current(&pending));
+                assert_eq!(app.palette_search.state, RequestState::Loading);
+                assert_eq!(app.symbols.len(), 1);
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn highlighted_search_result_keeps_priority_over_typed_code(cx: &mut TestAppContext) {
+        with_palette_app(cx, |app, window, cx| {
+            app.symbols.push(palette_fixture("000001"));
+            for local in [true, false] {
+                app.palette_query
+                    .update(cx, |input, cx| input.set_value("00700", window, cx));
+                app.palette_open = true;
+                app.filtered_local = if local { vec![0, 1] } else { Vec::new() };
+                app.palette_hits = if local {
+                    Vec::new()
+                } else {
+                    vec![palette_fixture("600519"), palette_fixture("000001")]
+                };
+                app.palette_index = 1;
+                app.palette_search.begin("00700");
+
+                app.palette_confirm(window, cx);
+
+                assert_eq!(app.selected.as_ref(), "000001");
+                assert_eq!(app.preview_symbol.as_ref().unwrap().code, "000001");
+                assert!(!app.palette_open);
+                assert_eq!(app.symbols.len(), 2);
+            }
+        });
     }
 
     #[test]

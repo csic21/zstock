@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
@@ -53,6 +53,9 @@ pub struct StrategyLabFeature {
     store: Arc<SqliteLabStore>,
     runner: Arc<BatchBacktestRunner>,
     cancellation: Option<CancellationToken>,
+    // Immutable executable specs, hydrated alongside library changes. Rendering must
+    // never wait on the SQLite connection shared with background ingestion.
+    compiled_library: HashMap<String, Arc<CompiledStrategy>>,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +128,7 @@ impl StrategyLabFeature {
             store: Arc::new(store),
             runner: Arc::new(BatchBacktestRunner::default()),
             cancellation: None,
+            compiled_library: HashMap::new(),
         };
         if let Err(error) = feature.restore() {
             feature.state.status = format!("恢复历史实验失败：{error:#}");
@@ -163,7 +167,26 @@ impl StrategyLabFeature {
     }
 
     fn restore_library(&mut self) -> Result<()> {
+        // Clear before reading: a failed restore must not retain executable plans
+        // from an old database/library snapshot. No prices or plans are cached.
+        self.compiled_library.clear();
         self.state.library = self.store.list_library_records()?;
+        for record in &self.state.library {
+            if self.compiled_library.contains_key(&record.strategy_id) {
+                continue;
+            }
+            let Some(spec) = self.store.load_strategy(&record.strategy_id).ok().flatten() else {
+                continue;
+            };
+            let Ok(compiled) = CompiledStrategy::compile(spec) else {
+                continue;
+            };
+            // The execution hash includes the universe, rules and schema version.
+            if compiled.strategy_id() == record.strategy_id {
+                self.compiled_library
+                    .insert(record.strategy_id.clone(), Arc::new(compiled));
+            }
+        }
         Ok(())
     }
 
@@ -1289,15 +1312,10 @@ impl StrategyLabFeature {
         self.arena_snapshot().champion
     }
 
-    pub fn compiled_champion(&self) -> Option<(String, CompiledStrategy)> {
+    pub fn compiled_champion(&self) -> Option<(String, Arc<CompiledStrategy>)> {
         let champion = self.champion_strategy()?;
-        let spec = self
-            .store
-            .load_strategy(&champion.record.strategy_id)
-            .ok()
-            .flatten()?;
-        let compiled = CompiledStrategy::compile(spec).ok()?;
-        Some((champion.record.strategy_name, compiled))
+        let compiled = self.compiled_library.get(&champion.record.strategy_id)?;
+        Some((champion.record.strategy_name, Arc::clone(compiled)))
     }
 
     pub fn dismiss_library_record(&mut self, record_id: String) -> Result<()> {
@@ -1370,7 +1388,195 @@ mod tests {
             store: Arc::new(SqliteLabStore::open_in_memory().unwrap()),
             runner: Arc::new(BatchBacktestRunner::default()),
             cancellation: None,
+            compiled_library: HashMap::new(),
         }
+    }
+
+    fn champion_record(strategy_id: &str, experiment_id: &str) -> StrategyLibraryRecord {
+        StrategyLibraryRecord {
+            id: format!("library:{experiment_id}:{strategy_id}"),
+            experiment_id: experiment_id.into(),
+            strategy_id: strategy_id.into(),
+            dataset_id: "dataset".into(),
+            strategy_name: "Fixture champion".into(),
+            retained_at: "2026-08-20T00:00:00Z".into(),
+            status: crate::domain::strategy_library::LibraryStatus::Retained,
+            conclusion: Some(PromotionConclusion::PaperCandidate),
+            evidence: "fixture".into(),
+            win_rate_pct: 58.0,
+            oos_win_rate_pct: Some(55.0),
+            total_return_pct: 8.0,
+            excess_return_pct: 8.0,
+            max_drawdown_pct: 7.0,
+            trade_count: 64,
+            payoff_ratio: 1.4,
+            profit_factor: 1.5,
+        }
+    }
+
+    #[test]
+    fn compiled_champion_render_access_is_memory_only_and_refresh_replaces_snapshot() {
+        let mut feature = feature();
+        let experiment_id = feature.create_local_experiment(series()).unwrap();
+        let spec = crate::domain::strategy::LocalTemplate::MaTrendPullback.build("dataset");
+        let id = feature.store.save_strategy(&spec).unwrap();
+        let record = champion_record(&id, &experiment_id);
+        feature.store.save_library_record(&record).unwrap();
+        feature.restore_library().unwrap();
+        let (_, first) = feature.compiled_champion().unwrap();
+        assert_eq!(first.strategy_id(), id);
+
+        // Remove access to the populated database. Repeated render lookups must
+        // use the already-hydrated snapshot, not query SQLite or recompile it.
+        feature.store = Arc::new(SqliteLabStore::open_in_memory().unwrap());
+        let (_, second) = feature.compiled_champion().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        feature.restore_library().unwrap();
+        assert!(feature.compiled_champion().is_none());
+        assert!(feature.compiled_library.is_empty());
+    }
+
+    #[test]
+    fn compiled_champion_follows_strategy_identity_and_excludes_missing_invalid_specs() {
+        let mut feature = feature();
+        let experiment_id = feature.create_local_experiment(series()).unwrap();
+        let spec = crate::domain::strategy::LocalTemplate::MaTrendPullback.build("dataset");
+        let id = feature.store.save_strategy(&spec).unwrap();
+        feature
+            .store
+            .save_library_record(&champion_record(&id, &experiment_id))
+            .unwrap();
+        feature.restore_library().unwrap();
+        assert_eq!(feature.compiled_champion().unwrap().1.strategy_id(), id);
+
+        // Changing the current champion must never reuse the former champion.
+        feature.state.library = vec![champion_record("missing", &experiment_id)];
+        assert!(feature.compiled_champion().is_none());
+        feature
+            .store
+            .dismiss_library_record(&format!("library:{experiment_id}:{id}"))
+            .unwrap();
+        let revised = crate::domain::strategy::LocalTemplate::MaTrendPullback.build("new-dataset");
+        let revised_id = feature.store.save_strategy(&revised).unwrap();
+        assert_ne!(id, revised_id);
+        feature
+            .store
+            .save_library_record(&champion_record(&revised_id, &experiment_id))
+            .unwrap();
+        feature.restore_library().unwrap();
+        assert_eq!(
+            feature.compiled_champion().unwrap().1.strategy_id(),
+            revised_id
+        );
+        assert!(!feature.compiled_library.contains_key(&id));
+
+        feature
+            .store
+            .dismiss_library_record(&format!("library:{experiment_id}:{revised_id}"))
+            .unwrap();
+        let mut invalid = revised;
+        invalid.schema_version = 0;
+        let invalid_id = feature.store.save_strategy(&invalid).unwrap();
+        feature
+            .store
+            .save_library_record(&champion_record(&invalid_id, &experiment_id))
+            .unwrap();
+        feature.restore_library().unwrap();
+        assert!(feature.compiled_library.is_empty());
+        assert!(feature.compiled_champion().is_none());
+    }
+
+    #[test]
+    fn compiled_champion_switches_cached_strategy_when_paper_results_change_rank() {
+        let mut feature = feature();
+        let experiment_id = feature.create_local_experiment(series()).unwrap();
+        for template in [
+            crate::domain::strategy::LocalTemplate::MaTrendPullback,
+            crate::domain::strategy::LocalTemplate::RsiOversoldRecovery,
+        ] {
+            let id = feature
+                .store
+                .save_strategy(&template.build("dataset"))
+                .unwrap();
+            feature
+                .store
+                .save_library_record(&champion_record(&id, &experiment_id))
+                .unwrap();
+        }
+        feature.restore_library().unwrap();
+        let (_, original) = feature.compiled_champion().unwrap();
+        let challenger_id = feature
+            .state
+            .library
+            .iter()
+            .find(|record| record.strategy_id != original.strategy_id())
+            .unwrap()
+            .strategy_id
+            .clone();
+        let challenger = Arc::clone(feature.compiled_library.get(&challenger_id).unwrap());
+        // Mature daily observation changes the winner without changing the library.
+        feature.state.paper_runs.push(PaperRunResult {
+            candidate_id: "paper-challenger".into(),
+            strategy_id: challenger_id.clone(),
+            observation_dataset_id: "dataset".into(),
+            observation_content_sha256: "fixture".into(),
+            as_of: "2026-08-21".into(),
+            generated_at: "2026-08-21T00:00:00Z".into(),
+            signals: Vec::new(),
+            trades: Vec::new(),
+            open_positions: Vec::new(),
+        });
+        feature.state.paper_comparisons.push((
+            "paper-challenger".into(),
+            PaperBehaviorComparison {
+                paper_signal_count: 0,
+                paper_trade_count: 0,
+                missed_signal_pct: 0.0,
+                average_holding_sessions: 0.0,
+                backtest_average_holding_sessions: 0.0,
+                average_execution_gap_bps: 0.0,
+                backtest_trade_count: 64,
+                observation_days: 30,
+                minimum_observation_met: true,
+                warnings: Vec::new(),
+            },
+        ));
+        let (_, current) = feature.compiled_champion().unwrap();
+        assert_eq!(current.strategy_id(), challenger_id);
+        assert!(Arc::ptr_eq(&current, &challenger));
+        assert!(!Arc::ptr_eq(&current, &original));
+    }
+
+    #[test]
+    #[ignore = "deterministic render-hot-path benchmark; run with --nocapture"]
+    fn performance_compiled_champion_render_lookup() {
+        let mut feature = feature();
+        let experiment_id = feature.create_local_experiment(series()).unwrap();
+        let spec = crate::domain::strategy::LocalTemplate::MaTrendPullback.build("dataset");
+        let id = feature.store.save_strategy(&spec).unwrap();
+        feature
+            .store
+            .save_library_record(&champion_record(&id, &experiment_id))
+            .unwrap();
+        feature.restore_library().unwrap();
+        let iterations = 2_000;
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            let champion = feature.champion_strategy().unwrap();
+            let spec = feature
+                .store
+                .load_strategy(&champion.record.strategy_id)
+                .unwrap()
+                .unwrap();
+            std::hint::black_box(CompiledStrategy::compile(spec).unwrap());
+        }
+        let before = started.elapsed();
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(feature.compiled_champion().unwrap());
+        }
+        let after = started.elapsed();
+        eprintln!("compiled_champion: {iterations} lookups, before={before:?}, after={after:?}");
     }
 
     fn series() -> FrozenSeries {
@@ -1575,6 +1781,7 @@ mod tests {
             store: Arc::new(SqliteLabStore::open(&path).unwrap()),
             runner: Arc::new(BatchBacktestRunner::default()),
             cancellation: None,
+            compiled_library: HashMap::new(),
         };
         let pool: Vec<_> = (0..100)
             .map(|symbol| {

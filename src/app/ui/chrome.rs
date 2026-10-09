@@ -3,3 +3,6 @@
 mod navigation;
 mod settings;
 mod status;
+
+#[cfg(test)]
+mod interaction_tests;

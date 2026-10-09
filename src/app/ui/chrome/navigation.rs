@@ -1,7 +1,10 @@
-use gpui::{Context, IntoElement, ParentElement, Styled, div, prelude::FluentBuilder, px};
+use gpui::{
+    Context, InteractiveElement, IntoElement, ParentElement, Styled, Window, div,
+    prelude::FluentBuilder, px,
+};
 use gpui_component::{
     ActiveTheme, IconName, Sizable, StyledExt, TitleBar,
-    button::{Button, ButtonVariants},
+    button::{Button, ButtonVariant, ButtonVariants},
     h_flex,
 };
 
@@ -10,24 +13,41 @@ use crate::storage::WorkDensity;
 use crate::app::StockApp;
 use crate::app::state::PrimaryTask;
 
+/// Keep toolbar hit targets readable without increasing the native title bar.
+fn toolbar_button(id: &'static str) -> Button {
+    Button::new(id)
+        .small()
+        .h(px(28.))
+        .min_w(px(28.))
+        .px_2()
+        .rounded(px(6.))
+}
+
 impl StockApp {
-    pub(crate) fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_title_bar(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let work = self.work_mode;
+        let compact = window.bounds().size.width < px(960.);
+        let show_task_selection = !self.settings_open && !self.market_analysis_open;
         TitleBar::new().child(
             h_flex()
                 .w_full()
                 .items_center()
                 .justify_between()
-                .px_3()
+                .gap_2()
+                .px_2()
+                .debug_selector(|| "app-toolbar".into())
                 .child(
                     h_flex()
                         .gap_2()
                         .items_center()
                         .when(work, |row| {
                             row.child(
-                                Button::new("work-identity-map")
+                                toolbar_button("work-identity-map")
                                     .ghost()
-                                    .xsmall()
                                     .when(self.work_identity_map_latched, |b| b.primary())
                                     .when(!self.work_identity_map_latched, |b| b.ghost())
                                     .label(if self.work_identity_map_latched {
@@ -45,9 +65,8 @@ impl StockApp {
                                     })),
                             )
                             .child(
-                                Button::new("work-alias-tag")
+                                toolbar_button("work-alias-tag")
                                     .ghost()
-                                    .xsmall()
                                     .when(self.work_alias_editing, |b| b.primary())
                                     .label(if self.work_alias_editing { "Save" } else { "Tag" })
                                     .tooltip(if self.work_alias_editing {
@@ -64,9 +83,8 @@ impl StockApp {
                                     })),
                             )
                             .child(
-                                Button::new("work-density")
+                                toolbar_button("work-density")
                                     .ghost()
-                                    .xsmall()
                                     .when(self.work_density != WorkDensity::Wide, |b| b.primary())
                                     .label(self.work_density.label())
                                     .tooltip(self.work_density.tooltip())
@@ -83,14 +101,14 @@ impl StockApp {
                                     .bg(cx.theme().accent),
                             )
                         })
-                        .child(
+                        .when(!compact, |row| row.child(
                             div()
                                 .text_sm()
                                 .font_semibold()
                                 .text_color(cx.theme().foreground)
                                 .child(if work { "Workspace" } else { "ZStock" }),
-                        )
-                        .when(!work, |row| {
+                        ))
+                        .when(!work && !compact, |row| {
                             row.child(
                                 h_flex()
                                     .gap_1()
@@ -119,8 +137,8 @@ impl StockApp {
                 .when(!work, |bar| {
                     bar.child(
                         h_flex()
-                            .p_0p5()
                             .flex_shrink_0()
+                            .debug_selector(|| "primary-task-tabs".into())
                             .gap_0p5()
                             .rounded(cx.theme().radius)
                             .border_1()
@@ -148,17 +166,17 @@ impl StockApp {
                                 ),
                             ]
                             .map(|(id, label, digit, task)| {
-                                let active = self.ui_state.primary_task == task;
+                                let active = show_task_selection && self.ui_state.primary_task == task;
                                 let shortcut = if cfg!(target_os = "macos") {
                                     format!("⌘{digit}")
                                 } else {
                                     format!("Ctrl+{digit}")
                                 };
-                                Button::new(id)
-                                    .xsmall()
+                                toolbar_button(id)
                                     .when(active, |button| button.primary())
                                     .when(!active, |button| button.ghost())
                                     .label(label)
+                                    .debug_selector(move || id.into())
                                     .tooltip(format!("{label} · {shortcut}"))
                                     .on_click(cx.listener(move |this, _, _window, cx| {
                                         this.set_primary_task(task, cx);
@@ -170,14 +188,15 @@ impl StockApp {
                     h_flex()
                         .gap_1()
                         .items_center()
+                        .flex_shrink_0()
+                        .debug_selector(|| "toolbar-actions".into())
                         .child(
-                            Button::new("work-mode")
+                            toolbar_button("work-mode")
                                 .icon(IconName::Eye)
-                                .xsmall()
                                 .when(work, |b| b.primary())
                                 .when(!work, |b| b.ghost())
-                                .when(work, |b| b.label("Focus"))
-
+                                .label(if work { "Focus" } else { "专注" })
+                                .debug_selector(|| "toolbar-focus".into())
                                 .tooltip(if work {
                                     "Exit focus layout · ⌘⇧W"
                                 } else {
@@ -188,26 +207,25 @@ impl StockApp {
                                 })),
                         )
                         .child(
-                            Button::new("refresh")
+                            toolbar_button("refresh")
                                 .icon(IconName::Redo2)
                                 .ghost()
-                                .xsmall()
-                                .when(work, |b| b.label("Sync"))
-
+                                .label(if work { "Sync" } else { "刷新" })
+                                .debug_selector(|| "toolbar-refresh".into())
                                 .tooltip(if work { "Sync" } else { "刷新全部行情" })
                                 .on_click(cx.listener(|this, _, _w, cx| {
                                     this.refresh_all(cx);
                                 })),
                         )
                         .when(!work, |row| {
-                            let active = self.ui_state.primary_task == PrimaryTask::StrategyLab;
+                            let active = show_task_selection && self.ui_state.primary_task == PrimaryTask::StrategyLab;
                             row.child(
-                                Button::new("task-strategy-lab")
+                                toolbar_button("task-strategy-lab")
                                     .icon(IconName::SquareTerminal)
                                     .ghost()
-                                    .xsmall()
                                     .when(active, |button| button.primary())
                                     .label("验证")
+                                    .debug_selector(|| "toolbar-strategy-lab".into())
                                     .tooltip("策略实验室 · 回测、验证与样本外观察")
                                     .on_click(cx.listener(|this, _, _window, cx| {
                                         this.set_primary_task(PrimaryTask::StrategyLab, cx);
@@ -215,31 +233,32 @@ impl StockApp {
                             )
                         })
                         .child(
-                            Button::new("cmd-palette-btn")
+                            toolbar_button("cmd-palette-btn")
                                 .icon(IconName::Search)
                                 .ghost()
-                                .xsmall()
-                                .when(work, |button| button.label("Find"))
+                                .label(if work { "Find" } else { "搜索" })
+                                .debug_selector(|| "toolbar-search".into())
                                 .tooltip(if work { "Find" } else { "搜索股票或跳转功能 · ⌘K" })
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.toggle_palette(window, cx);
                                 })),
                         )
-                        .when(!work, |row| row.children(self.render_update_button(cx)))
+                        .when(!work, |row| row.children(self.render_update_button(cx).map(|button| button.small().h(px(28.)))))
                         .child(
-                            // When open, drop the gear icon so 「返回」is truly
-                            // centered in the primary pill (icon+label was
-                            // optically left-heavy).
-                            Button::new("settings-btn")
-                                .when(!self.settings_open, |b| b.icon(IconName::Settings2))
+                            toolbar_button("settings-btn")
+                                .icon(if self.settings_open { IconName::ArrowLeft } else { IconName::Settings2 })
                                 .ghost()
-                                .xsmall()
-                                .when(self.settings_open, |b| b.primary())
-                                .when(self.settings_open, |b| {
-                                    b.label(if work { "Back" } else { "返回" })
+                                .when(self.settings_open, |b| b.with_variant(ButtonVariant::Secondary))
+                                .label(match (self.settings_open, work) {
+                                    (true, true) => "Back",
+                                    (true, false) => "返回",
+                                    (false, true) => "Prefs",
+                                    (false, false) => "设置",
                                 })
-                                .when(!self.settings_open && work, |b| b.label("Prefs"))
-                                .tooltip(if work {
+                                .debug_selector(|| "toolbar-settings".into())
+                                .tooltip(if self.settings_open {
+                                    if work { "Return to previous page · Esc" } else { "返回上一页 · Esc" }
+                                } else if work {
                                     "Preferences · ⌘,"
                                 } else {
                                     "设置 · ⌘,"

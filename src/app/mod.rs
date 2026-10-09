@@ -1005,7 +1005,7 @@ impl Render for StockApp {
                     .h(TITLE_BAR_HEIGHT)
                     .flex_shrink_0()
                     .overflow_hidden()
-                    .child(self.render_title_bar(cx)),
+                    .child(self.render_title_bar(window, cx)),
             )
             .child(if self.settings_open {
                 // Full-page settings: no modal overlay.
@@ -1232,7 +1232,9 @@ fn apply_zstock_theme(cx: &mut App) {
 }
 
 pub fn run() {
-    let app = gpui::Application::new();
+    // IconName resolves SVG paths through the application's asset source.
+    // Embed the component icons so packaged builds work without source files.
+    let app = gpui::Application::new().with_assets(gpui_component_assets::Assets);
 
     // macOS calls this when the running app's Dock icon is clicked after
     // its last window was closed. Without it, the process stays alive but

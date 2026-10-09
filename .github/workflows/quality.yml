@@ -54,7 +54,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev
+            libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev \
+            xvfb xauth xdotool imagemagick mesa-vulkan-drivers libvulkan1 fonts-noto-cjk
       - name: Release workflow regression tests
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: node --test scripts/*release.test.cjs
@@ -70,3 +71,29 @@ jobs:
         run: cargo test --all-targets --target ${{ matrix.target }} -- --test-threads=1
       - name: Core build without Work Mode
         run: cargo check --all-targets --target ${{ matrix.target }} --no-default-features
+      - name: Visual smoke runner checks
+        if: runner.os == 'Linux'
+        run: |
+          bash -n scripts/visual-smoke.sh
+          python3 scripts/visual-smoke-check.test.py
+      - name: Build native visual smoke binary
+        if: runner.os == 'Linux'
+        run: cargo build --locked --bin stock --target ${{ matrix.target }}
+      - name: Native Linux visual smoke
+        if: runner.os == 'Linux'
+        timeout-minutes: 4
+        run: |
+          mkdir -p visual-smoke-artifacts
+          timeout --signal=TERM --kill-after=15s 180s \
+            xvfb-run --auto-servernum --error-file=visual-smoke-artifacts/xvfb.log \
+            --server-args="-screen 0 1600x1000x24 -nolisten tcp" \
+            bash scripts/visual-smoke.sh \
+            target/${{ matrix.target }}/debug/stock visual-smoke-artifacts
+      - name: Preserve native visual smoke evidence
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-native-visual-smoke
+          path: visual-smoke-artifacts/
+          if-no-files-found: warn
+          retention-days: 14
