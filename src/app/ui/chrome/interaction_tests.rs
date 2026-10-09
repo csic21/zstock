@@ -252,7 +252,8 @@ fn hovered_buttons_keep_the_variant_foreground(cx: &mut TestAppContext) {
         [
             (ButtonVariant::Primary, cx.theme().primary_foreground),
             (ButtonVariant::Secondary, cx.theme().secondary_foreground),
-            (ButtonVariant::Ghost, cx.theme().foreground),
+            // GPUI 0.5.1 shares secondary_foreground for Ghost and Secondary.
+            (ButtonVariant::Ghost, cx.theme().secondary_foreground),
             (
                 ButtonVariant::Custom(ButtonCustomVariant::new(cx).foreground(custom_foreground)),
                 custom_foreground,

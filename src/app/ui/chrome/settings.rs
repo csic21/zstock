@@ -220,7 +220,7 @@ impl StockApp {
                             QUOTE_INTERVAL_PRESETS.iter().map(|&secs| {
                                 let active = interval == secs;
                                 settings_choice(("qi", secs as u32), format!("{secs}s"), active, cx)
-                                    .debug_selector(move || format!("settings-interval-{secs}").into())
+                                    .debug_selector(move || format!("settings-interval-{secs}"))
                                     .on_click(cx.listener(move |this, _, _w, cx| {
                                         this.set_quote_interval_secs(secs, cx);
                                     }))
