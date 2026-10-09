@@ -637,7 +637,7 @@ impl StockApp {
             let codes2 = codes.clone();
             let req_code = selected.clone();
             let quotes = smol::unblock(move || market::fetch_quote_records(&codes2)).await;
-            let quote_src = Some(market::quote_source(&quotes.records));
+            let quote_src = market::quote_source(&quotes.records);
             if this
                 .update(cx, |app, cx| {
                     app.apply_quote_batch(&quote_ticket, quotes, cx);
@@ -690,7 +690,7 @@ impl StockApp {
                                 "已加载 {} · 分时 {} · 行情{} · {} · {}",
                                 req_code,
                                 name,
-                                quote_src.unwrap_or("—"),
+                                quote_src,
                                 src,
                                 chrono::Local::now().format("%H:%M:%S")
                             ));
@@ -714,7 +714,7 @@ impl StockApp {
                                 "已加载 {} · {} 根K线 · 行情{} · K线{} · {}",
                                 req_code,
                                 app.candles.len(),
-                                quote_src.unwrap_or("—"),
+                                quote_src,
                                 src,
                                 chrono::Local::now().format("%H:%M:%S")
                             ));
