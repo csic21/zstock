@@ -194,10 +194,14 @@ fn get_secret(account: &str) -> Result<Option<String>, SecretError> {
     if !path.exists() {
         return Ok(None);
     }
-    let script = "$secure = Get-Content -Raw -LiteralPath $env:ZSTOCK_CREDENTIAL_PATH | ConvertTo-SecureString; $plain = [System.Net.NetworkCredential]::new('', $secure).Password; [Console]::Out.Write($plain)";
+    let script = "$ErrorActionPreference = 'Stop'; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $secure = Get-Content -Raw -LiteralPath $env:ZSTOCK_CREDENTIAL_PATH | ConvertTo-SecureString; $plain = [System.Net.NetworkCredential]::new('', $secure).Password; [Console]::Out.Write($plain)";
     let output = run_credential_command(
         Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            // A pwsh -> native process -> powershell.exe launch otherwise
+            // inherits incompatible PowerShell 7 module paths. Let 5.1 rebuild
+            // its defaults, without changing the parent or system environment.
+            .env_remove("PSModulePath")
             .env("ZSTOCK_CREDENTIAL_PATH", &path),
         None,
     )?;
@@ -217,10 +221,11 @@ fn set_secret(account: &str, secret: &str) -> Result<(), SecretError> {
         .parent()
         .ok_or_else(|| SecretError("credential path has no parent".into()))?;
     std::fs::create_dir_all(parent).map_err(|error| SecretError(error.to_string()))?;
-    let script = "$plain = [Console]::In.ReadToEnd(); $secure = ConvertTo-SecureString $plain -AsPlainText -Force; $secure | ConvertFrom-SecureString | Set-Content -NoNewline -LiteralPath $env:ZSTOCK_CREDENTIAL_PATH";
+    let script = "$ErrorActionPreference = 'Stop'; [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); $plain = [Console]::In.ReadToEnd(); $secure = ConvertTo-SecureString $plain -AsPlainText -Force; $secure | ConvertFrom-SecureString | Set-Content -NoNewline -LiteralPath $env:ZSTOCK_CREDENTIAL_PATH";
     let output = run_credential_command(
         Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .env_remove("PSModulePath")
             .env("ZSTOCK_CREDENTIAL_PATH", &path),
         Some(secret.as_bytes()),
     )?;
@@ -425,7 +430,7 @@ mod native_tests {
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         );
-        let secret = "zstock-credential-smoke-value";
+        let secret = "zstock-credential-smoke-密钥-value\n trailing  ";
         store.delete(&account).expect("clean stale test credential");
         store
             .set(&account, secret)
