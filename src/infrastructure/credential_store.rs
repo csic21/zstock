@@ -165,11 +165,27 @@ fn delete_secret(account: &str) -> Result<(), SecretError> {
         Command::new("secret-tool").args(["clear", "service", SERVICE, "account", account]),
         None,
     )?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(SecretError("credential store delete failed".into()))
+    confirm_linux_clear_output(&output)?;
+    // clear removes unlocked matches only: exit 0 means at least one deletion,
+    // not that no locked duplicate remains. Exit 1 may also mean absence.
+    // Both require independent successful empty search, including locked items.
+    let search = run_credential_command(
+        Command::new("secret-tool")
+            .args(["search", "--all", "service", SERVICE, "account", account]),
+        None,
+    )?;
+    confirm_linux_secret_absent(&search)
+}
+
+#[cfg(target_os = "linux")]
+fn confirm_linux_clear_output(output: &std::process::Output) -> Result<(), SecretError> {
+    if !output.stderr.is_empty() || !output.stdout.is_empty() {
+        return Err(linux_output_error("delete", output));
     }
+    if matches!(output.status.code(), Some(0 | 1)) {
+        return Ok(());
+    }
+    Err(linux_output_error("delete", output))
 }
 
 #[cfg(target_os = "windows")]
@@ -458,6 +474,33 @@ mod linux_output_tests {
             parse_linux_lookup_output(&output(1, b"", b"")).unwrap(),
             LinuxLookup::CheckAbsence
         );
+        assert!(confirm_linux_secret_absent(&output(0, b"", b"")).is_ok());
+    }
+
+    #[test]
+    fn deleting_absent_secret_requires_independent_absence_confirmation() {
+        for code in [0, 1] {
+            let cleared = output(code, b"", b"");
+            assert!(confirm_linux_clear_output(&cleared).is_ok());
+            assert!(
+                confirm_linux_clear_output(&cleared)
+                    .and_then(|_| confirm_linux_secret_absent(&output(
+                        0,
+                        b"locked matching item",
+                        b""
+                    )))
+                    .is_err()
+            );
+        }
+        for result in [
+            output(1, b"", b"backend failure"),
+            output(0, b"", b"backend failure"),
+            output(2, b"", b""),
+            output(1, b"unexpected output", b""),
+        ] {
+            assert!(confirm_linux_clear_output(&result).is_err());
+        }
+        assert!(confirm_linux_secret_absent(&output(0, b"locked matching item", b"")).is_err());
         assert!(confirm_linux_secret_absent(&output(0, b"", b"")).is_ok());
     }
 
