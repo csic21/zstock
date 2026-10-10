@@ -122,7 +122,7 @@ pub fn fetch_quotes(codes: &[String]) -> Result<Vec<QuoteTick>> {
 }
 
 /// Parse `v_sh600519="1~贵州茅台~600519~…";` lines.
-fn parse_quote_body(body: &str) -> Result<Vec<QuoteTick>> {
+pub(crate) fn parse_quote_body(body: &str) -> Result<Vec<QuoteTick>> {
     let mut out = Vec::new();
     for line in body.lines() {
         let line = line.trim();
@@ -166,7 +166,11 @@ fn parse_quote_body(body: &str) -> Result<Vec<QuoteTick>> {
             last,
             volume: parse_f(6) as u64,
             amount: last * parse_f(6),
-            change_pct: parse_f(32),
+            // A missing/invalid change must not become a genuine 0.00% move.
+            change_pct: f
+                .get(32)
+                .and_then(|value| value.trim().parse::<f64>().ok())
+                .filter(|value| value.is_finite()),
             currency,
             source: "腾讯财经".into(),
             fetched_at,
@@ -578,6 +582,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quote_change_absence_is_not_a_flat_market() {
+        let mut fields = vec![""; 35];
+        fields[1] = "fixture";
+        fields[2] = "600519";
+        fields[3] = "10.5";
+        for change in ["", "-", "invalid", "NaN", "inf", "-inf", "1e999"] {
+            fields[32] = change;
+            let body = format!("v_sh600519=\"{}\";", fields.join("~"));
+            let tick = parse_quote_body(&body).unwrap().remove(0);
+            assert_eq!(tick.last, 10.5);
+            assert!(tick.change_pct.is_none(), "field {change:?}");
+        }
+        for change in ["0", "0.00", " 0.00 "] {
+            fields[32] = change;
+            let body = format!("v_sh600519=\"{}\";", fields.join("~"));
+            assert_eq!(parse_quote_body(&body).unwrap()[0].change_pct, Some(0.0));
+        }
+        fields[32] = "-1.25";
+        let body = format!("v_sh600519=\"{}\";", fields.join("~"));
+        assert_eq!(parse_quote_body(&body).unwrap()[0].change_pct, Some(-1.25));
+    }
+
+    #[test]
     fn quote_timestamp_is_preserved_and_absence_is_unknown() {
         let mut fields = vec![""; 35];
         fields[1] = "fixture";
@@ -700,6 +727,6 @@ mod tests {
         assert_eq!(ticks.len(), 1);
         assert_eq!(ticks[0].code, "600519");
         assert!((ticks[0].last - 1420.97).abs() < 1e-6);
-        assert!((ticks[0].change_pct - (-0.10)).abs() < 1e-6);
+        assert_eq!(ticks[0].change_pct, Some(-0.10));
     }
 }

@@ -18,36 +18,33 @@ impl QuoteProvider for TencentProvider {
 
     fn fetch_quotes(&self, codes: &[String]) -> Result<Vec<QuoteRecord>, ProviderError> {
         data::tencent::fetch_quotes(codes)
-            .map(|values| {
-                values
-                    .into_iter()
-                    .filter_map(|value| {
-                        let market = Market::for_code(&value.code)?;
-                        let price =
-                            (value.last.is_finite() && value.last > 0.0).then_some(value.last);
-                        Some(QuoteRecord {
-                            code: value.code,
-                            market,
-                            currency: value.currency,
-                            name: value.name,
-                            price,
-                            change_pct: value.change_pct.is_finite().then_some(value.change_pct),
-                            volume: Some(value.volume),
-                            source: PROVIDER.into(),
-                            fetched_at: value.fetched_at,
-                            market_time: value.market_time,
-                            availability: if price.is_some() {
-                                value.availability
-                            } else {
-                                Availability::Invalid
-                            },
-                            freshness: value.freshness,
-                        })
-                    })
-                    .collect()
-            })
+            .map(|values| values.into_iter().filter_map(quote_record).collect())
             .map_err(|error| provider_error(PROVIDER, error))
     }
+}
+
+/// Convert only finite supplied changes; absence must survive into canonical UI.
+fn quote_record(value: data::eastmoney::QuoteTick) -> Option<QuoteRecord> {
+    let market = Market::for_code(&value.code)?;
+    let price = (value.last.is_finite() && value.last > 0.0).then_some(value.last);
+    Some(QuoteRecord {
+        code: value.code,
+        market,
+        currency: value.currency,
+        name: value.name,
+        price,
+        change_pct: value.change_pct.filter(|change| change.is_finite()),
+        volume: Some(value.volume),
+        source: PROVIDER.into(),
+        fetched_at: value.fetched_at,
+        market_time: value.market_time,
+        availability: if price.is_some() {
+            value.availability
+        } else {
+            Availability::Invalid
+        },
+        freshness: value.freshness,
+    })
 }
 
 impl KlineProvider for TencentProvider {
@@ -109,4 +106,47 @@ fn provider_error(provider: &str, error: anyhow::Error) -> ProviderError {
         ProviderErrorKind::Transport
     };
     ProviderError::new(provider, kind, message)
+}
+
+#[cfg(test)]
+mod quote_adapter_tests {
+    use super::*;
+
+    fn assert_json_round_trip(record: &QuoteRecord) {
+        let value = serde_json::to_value(record).expect("canonical quote serializes");
+        assert_eq!(
+            value["change_pct"],
+            serde_json::to_value(record.change_pct).unwrap()
+        );
+        let decoded: QuoteRecord =
+            serde_json::from_value(value).expect("canonical quote round-trip");
+        assert_eq!(decoded.price, record.price);
+        assert_eq!(decoded.change_pct, record.change_pct);
+    }
+
+    #[test]
+    fn missing_invalid_and_zero_changes_survive_provider_to_canonical_conversion() {
+        let mut fields = vec![""; 35];
+        fields[1] = "fixture";
+        fields[2] = "600519";
+        fields[3] = "10.5";
+        for change in ["", "-", "invalid", "NaN", "inf", "-inf"] {
+            fields[32] = change;
+            let body = format!("v_sh600519=\"{}\";", fields.join("~"));
+            let record =
+                quote_record(data::tencent::parse_quote_body(&body).unwrap().remove(0)).unwrap();
+            assert_json_round_trip(&record);
+            assert_eq!(record.price, Some(10.5));
+            assert_eq!(record.availability, Availability::Available);
+            assert_eq!(record.change_pct, None, "field {change:?}");
+        }
+        for change in ["0", "0.00"] {
+            fields[32] = change;
+            let body = format!("v_sh600519=\"{}\";", fields.join("~"));
+            let record =
+                quote_record(data::tencent::parse_quote_body(&body).unwrap().remove(0)).unwrap();
+            assert_json_round_trip(&record);
+            assert_eq!(record.change_pct, Some(0.0));
+        }
+    }
 }

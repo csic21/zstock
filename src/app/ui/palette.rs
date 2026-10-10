@@ -135,6 +135,7 @@ impl StockApp {
                                     .child(L::palette_section_local(work)),
                             );
                             for (i, (_, sym)) in local.into_iter().enumerate() {
+                                let quote = self.quote_for_code(&sym.code).cloned();
                                 list = list.child(palette_row(
                                     sym,
                                     PaletteRowOptions {
@@ -144,6 +145,7 @@ impl StockApp {
                                         color_scheme: self.color_scheme,
                                         work_mode: self.work_mode,
                                         reveal_identity: self.work_identity_reveal,
+                                        quote,
                                     },
                                     cx,
                                 ));
@@ -161,6 +163,7 @@ impl StockApp {
                             );
                             for (i, sym) in remote.into_iter().enumerate() {
                                 let flat = n_local + i;
+                                let quote = self.quote_for_code(&sym.code).cloned();
                                 list = list.child(palette_row(
                                     sym,
                                     PaletteRowOptions {
@@ -170,6 +173,7 @@ impl StockApp {
                                         color_scheme: self.color_scheme,
                                         work_mode: self.work_mode,
                                         reveal_identity: self.work_identity_reveal,
+                                        quote,
                                     },
                                     cx,
                                 ));

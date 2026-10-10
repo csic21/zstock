@@ -31,6 +31,18 @@ pub(crate) fn format_candle_date(raw: &str) -> String {
     }
 }
 
+pub(crate) fn change_from_previous_close(price: f64, previous_close: f64) -> String {
+    if !price.is_finite() || price <= 0.0 || !previous_close.is_finite() || previous_close <= 0.0 {
+        return "—".into();
+    }
+    let change = (price - previous_close) / previous_close * 100.0;
+    if change.is_finite() {
+        format_pct(change)
+    } else {
+        "—".into()
+    }
+}
+
 /// Line color palette for user-drawn chart lines (cycles by `color_ix`).
 pub(crate) fn chart_line_palette(theme: &gpui_component::Theme) -> Vec<gpui::Hsla> {
     vec![
@@ -51,6 +63,58 @@ pub(crate) struct PaletteRowOptions {
     pub(crate) color_scheme: ColorScheme,
     pub(crate) work_mode: bool,
     pub(crate) reveal_identity: bool,
+    pub(crate) quote: Option<crate::domain::market::QuoteRecord>,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct PaletteQuoteText {
+    pub(crate) price: String,
+    pub(crate) change: String,
+    pub(crate) status: String,
+    pub(crate) up: Option<bool>,
+}
+
+pub(crate) fn palette_quote_text(
+    quote: Option<&crate::domain::market::QuoteRecord>,
+    work: bool,
+    now: i64,
+) -> PaletteQuoteText {
+    let usable = quote.filter(|quote| quote.usable());
+    let price = usable.and_then(|quote| quote.price);
+    let change = usable
+        .and_then(|quote| quote.change_pct)
+        .filter(|value| value.is_finite());
+    PaletteQuoteText {
+        price: price
+            .map(|value| {
+                if work {
+                    format!("{}ms", format_price(value))
+                } else {
+                    format_price(value)
+                }
+            })
+            .unwrap_or_else(|| "—".into()),
+        change: change
+            .map(|value| {
+                if work {
+                    format!("{value:+.2}")
+                } else {
+                    format_pct(value)
+                }
+            })
+            .unwrap_or_else(|| "—".into()),
+        status: quote
+            .map(|quote| quote.display_status(work, now))
+            .unwrap_or_else(|| {
+                if work {
+                    "unavailable · time unknown"
+                } else {
+                    "行情缺失 · 时间未知"
+                }
+                .into()
+            }),
+        up: change.map(|value| value >= 0.0),
+    }
 }
 
 pub(crate) fn palette_row(
@@ -66,6 +130,7 @@ pub(crate) fn palette_row(
         color_scheme,
         work_mode,
         reveal_identity,
+        quote,
     } = options;
     let code = sym.code.clone();
     let name = sym.name.to_string();
@@ -96,22 +161,15 @@ pub(crate) fn palette_row(
     } else {
         sym.board.clone()
     };
-    let last = if work_mode {
-        if sym.last > 0.0 {
-            format!("{}ms", format_price(sym.last))
-        } else {
-            "--".into()
-        }
-    } else {
-        format_price(sym.last)
-    };
-    let chg = if work_mode {
-        format!("{:+.2}", sym.change_pct)
-    } else {
-        format_pct(sym.change_pct)
-    };
-    let up = sym.is_up();
-    let chg_color = if work_mode {
+    let display = palette_quote_text(
+        quote.as_ref(),
+        work_mode,
+        chrono::Utc::now().timestamp_millis(),
+    );
+    let up = display.up.unwrap_or(false);
+    let chg_color = if display.up.is_none() {
+        cx.theme().muted_foreground
+    } else if work_mode {
         if up {
             cx.theme().muted_foreground
         } else {
@@ -146,6 +204,10 @@ pub(crate) fn palette_row(
         .items_center()
         .gap_3()
         .cursor_pointer()
+        .tooltip({
+            let status = display.status.clone();
+            move |window, cx| Tooltip::new(status.clone()).build(window, cx)
+        })
         .when(highlighted, |this| this.bg(cx.theme().accent.opacity(0.22)))
         .hover(|this| this.bg(cx.theme().accent.opacity(0.15)))
         .on_click(cx.listener(move |this, _, _window, cx| {
@@ -160,12 +222,25 @@ pub(crate) fn palette_row(
                 .child(code_show),
         )
         .child(
-            div()
+            v_flex()
                 .flex_1()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .truncate()
-                .child(name_show),
+                .min_w_0()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .truncate()
+                        .child(name_show),
+                )
+                .when(in_watchlist, |column| {
+                    column.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .truncate()
+                            .child(display.status),
+                    )
+                }),
         )
         .child(
             div()
@@ -178,7 +253,7 @@ pub(crate) fn palette_row(
                 div()
                     .text_sm()
                     .text_color(cx.theme().foreground)
-                    .child(last),
+                    .child(display.price),
             )
             .child(
                 div()
@@ -186,7 +261,7 @@ pub(crate) fn palette_row(
                     .text_right()
                     .text_xs()
                     .text_color(chg_color)
-                    .child(chg),
+                    .child(display.change),
             )
         })
         .when(!in_watchlist, |this| {

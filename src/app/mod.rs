@@ -1642,7 +1642,7 @@ mod layout_regression_tests {
                         code,
                         name: format!("个股{sector_index:02}{industry_index}{stock_index:02}"),
                         last: 10.0 + f64::from(stock_index),
-                        change_pct: f64::from(stock_index % 9 - 4) * 0.8,
+                        change_pct: Some(f64::from(stock_index % 9 - 4) * 0.8),
                         volume: 10_000,
                         amount,
                         currency: Currency::Cny,

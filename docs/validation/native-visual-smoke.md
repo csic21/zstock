@@ -12,7 +12,8 @@ logs, runner output, and anonymous navigation timings for 14 days, including on
 failure. It covers:
 
 - Today and Settings at 1320×860 and 800×860;
-- the command palette over Settings at both sizes;
+- the command palette over Settings at both sizes, with unavailable quotes shown as
+  em dashes and a visible availability/freshness label rather than zero prices;
 - Research, Opportunities, and Portfolio via their primary-toolbar shortcuts;
 - Escape dismissal and repeated Settings open/close after dismissing the palette;
 - Work Mode at both sizes, including the persistent recovery warning;
@@ -44,7 +45,11 @@ nonexistent private socket so native Secret Service cannot access real keys.
 It uses no existing config, broker data, holdings, journals, AI keys, or CLI login.
 The isolated profile is deleted, never uploaded. The app may fetch public market
 quotes on startup; success does not depend on quote availability, so screenshots
-are not deterministic market-data golden files. Credential-store unavailability
+are not deterministic market-data golden files. Deterministic quote-state tests
+separately cover missing/current/stale quotes, a genuine zero change, absent provider
+change fields and JSON round trips. Review palette row spacing and narrow Work Mode
+absence labels in the native captures; do not claim a zero-change screenshot unless
+one was actually captured. Credential-store unavailability
 may appear in the status area and is expected for this run.
 
 ## Run on a normal Linux desktop/CI host

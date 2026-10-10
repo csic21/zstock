@@ -159,7 +159,9 @@ impl StockApp {
                         }
                         if t.last > 0.0 {
                             sym.last = t.last;
-                            sym.change_pct = t.change_pct;
+                            if let Some(change) = t.change_pct {
+                                sym.change_pct = change;
+                            }
                             sym.volume = t.volume;
                         }
                     }
@@ -1155,13 +1157,13 @@ impl StockApp {
             // 优先有波动的流动性标的；涨跌都保留以便回踩/超跌策略。
             ticks.retain(|q| {
                 q.last > 0.0
-                    && q.change_pct.is_finite()
+                    && q.change_pct.is_some_and(|change| change.is_finite())
                     && !q.name.to_ascii_uppercase().contains("ST")
             });
             ticks.sort_by(|a, b| {
                 b.change_pct
-                    .abs()
-                    .partial_cmp(&a.change_pct.abs())
+                    .map(f64::abs)
+                    .partial_cmp(&a.change_pct.map(f64::abs))
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             if ticks.len() > RADAR_PROBE_N {
@@ -1188,7 +1190,9 @@ impl StockApp {
                 }
 
                 let code = tick.code.clone();
-                let day_chg = tick.change_pct;
+                let Some(day_chg) = tick.change_pct else {
+                    continue;
+                };
                 let name_hint = names
                     .get(&code)
                     .cloned()

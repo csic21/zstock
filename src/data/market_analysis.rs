@@ -205,7 +205,11 @@ pub fn fetch_market_picks(max_picks: usize) -> Result<Vec<MarketPick>> {
     let mut quotes: Vec<QuoteTick> = sourced
         .data
         .into_iter()
-        .filter(|q| q.last > 0.0 && q.change_pct.is_finite() && q.change_pct > 0.0)
+        .filter(|q| {
+            q.last > 0.0
+                && q.change_pct
+                    .is_some_and(|change| change.is_finite() && change > 0.0)
+        })
         .filter(|q| !q.name.to_ascii_uppercase().contains("ST"))
         .collect();
 
@@ -236,7 +240,9 @@ pub fn fetch_market_picks(max_picks: usize) -> Result<Vec<MarketPick>> {
         let Some(snapshot) = ai::build_snapshot(&candles, &code, &name) else {
             continue;
         };
-        picks.push(score_market_pick(&quote, &name, &snapshot));
+        if let Some(pick) = score_market_pick(&quote, &name, &snapshot) {
+            picks.push(pick);
+        }
     }
 
     picks.sort_by(|a, b| {
@@ -251,8 +257,9 @@ pub fn fetch_market_picks(max_picks: usize) -> Result<Vec<MarketPick>> {
     Ok(picks)
 }
 
-fn score_market_pick(quote: &QuoteTick, name: &str, snapshot: &AiSnapshot) -> MarketPick {
-    let daily_score = ((quote.change_pct + 1.0) / 4.0 * 100.0).clamp(0.0, 100.0);
+fn score_market_pick(quote: &QuoteTick, name: &str, snapshot: &AiSnapshot) -> Option<MarketPick> {
+    let change_pct = quote.change_pct.filter(|change| change.is_finite())?;
+    let daily_score = ((change_pct + 1.0) / 4.0 * 100.0).clamp(0.0, 100.0);
     let volume_score = snapshot
         .volume_ratio_20
         .map(|ratio| ((ratio - 0.6) / 1.4 * 100.0).clamp(0.0, 100.0))
@@ -261,8 +268,8 @@ fn score_market_pick(quote: &QuoteTick, name: &str, snapshot: &AiSnapshot) -> Ma
     let mut reasons: Vec<String> = snapshot.reasons.iter().take(3).cloned().collect();
     let mut risks = Vec::new();
 
-    if quote.change_pct >= 1.0 {
-        reasons.push(format!("当日涨幅 {:+.2}%", quote.change_pct));
+    if change_pct >= 1.0 {
+        reasons.push(format!("当日涨幅 {change_pct:+.2}%"));
     }
     if snapshot.ma_alignment == ai::MaAlignment::Bullish {
         reasons.push("均线偏多".into());
@@ -285,11 +292,11 @@ fn score_market_pick(quote: &QuoteTick, name: &str, snapshot: &AiSnapshot) -> Ma
         reasons.push("实时动量与技术快照综合".into());
     }
 
-    MarketPick {
+    Some(MarketPick {
         code: quote.code.clone(),
         name: name.to_string(),
         last: quote.last,
-        change_pct: quote.change_pct,
+        change_pct,
         score: score.clamp(0.0, 100.0),
         regime: snapshot.regime.clone(),
         rsi14: snapshot.rsi14,
@@ -297,7 +304,7 @@ fn score_market_pick(quote: &QuoteTick, name: &str, snapshot: &AiSnapshot) -> Ma
         volume_ratio_20: snapshot.volume_ratio_20,
         reasons,
         risks,
-    }
+    })
 }
 
 /// Local-first market brief. It is intentionally explicit about its source.

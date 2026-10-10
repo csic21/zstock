@@ -1312,7 +1312,11 @@ fn hydrate_symbol_from_quote(symbol: &mut Symbol, quote: &crate::domain::market:
         && let Some(price) = quote.price
     {
         symbol.last = price;
-        symbol.change_pct = quote.change_pct.unwrap_or_default();
+        // Symbol is a legacy metadata cache. Do not manufacture a zero for an
+        // absent field; current displays must use the canonical Option value.
+        if let Some(change) = quote.change_pct.filter(|change| change.is_finite()) {
+            symbol.change_pct = change;
+        }
         symbol.volume = quote.volume.unwrap_or_default();
     }
 }

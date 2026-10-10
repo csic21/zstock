@@ -12,8 +12,7 @@ use gpui_component::{
 
 use crate::chart::{ChartPaintData, chart_layout, index_from_x, paint_chart, price_from_y};
 use crate::model::{
-    MinutePeriod, QuoteSnapshot, TrendLine, board_for_code, format_pct, format_price,
-    format_volume, shared,
+    MinutePeriod, QuoteSnapshot, TrendLine, board_for_code, format_price, format_volume, shared,
 };
 
 use super::super::helpers::*;
@@ -838,7 +837,12 @@ impl StockApp {
                 self.minute.as_ref().and_then(|m| m.points.get(ix)),
             )
         {
-            let color = self.chg_color(p.price >= m.prev_close, cx);
+            let has_previous_close = m.prev_close.is_finite() && m.prev_close > 0.0;
+            let color = if has_previous_close {
+                self.chg_color(p.price >= m.prev_close, cx)
+            } else {
+                cx.theme().muted_foreground
+            };
             let vol = p.minute_volume(ix.checked_sub(1).map(|j| &m.points[j]));
             return h_flex()
                 .gap_2()
@@ -859,11 +863,7 @@ impl StockApp {
                 .child(format!("均价 {}", format_price(p.avg_price())))
                 .child(format!(
                     "涨跌 {}",
-                    format_pct(if m.prev_close > 0.0 {
-                        (p.price - m.prev_close) / m.prev_close * 100.0
-                    } else {
-                        0.0
-                    })
+                    super::super::helpers::change_from_previous_close(p.price, m.prev_close)
                 ))
                 .child(format!("量 {}", format_volume(vol)))
                 .into_any_element();
