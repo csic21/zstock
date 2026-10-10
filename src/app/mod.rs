@@ -1524,7 +1524,6 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             {
                 route_native_action(crate::mac_status_bar::StatusBarAction::Quit, cx);
-                return;
             }
             #[cfg(not(target_os = "macos"))]
             cx.quit();
