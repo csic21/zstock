@@ -502,6 +502,7 @@ impl StockApp {
             .bg(cx.theme().muted.opacity(0.28))
             .border_1()
             .border_color(cx.theme().border)
+            .child(self.render_financial_storage_status(crate::storage::Slot::Journal, cx))
             .child(
                 h_flex()
                     .items_center()

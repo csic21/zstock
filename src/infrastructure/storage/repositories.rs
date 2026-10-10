@@ -44,13 +44,15 @@ impl JsonPortfolioRepository {
 
 impl PortfolioRepository for JsonPortfolioRepository {
     fn load(&self) -> Result<Portfolio> {
-        json_store::load(&self.path, DocumentKind::Portfolio)
-            .map(|loaded| loaded.value)
-            .map_err(anyhow::Error::new)
+        let loaded = super::recovery::load(&self.path);
+        if let Some(recovery) = loaded.recovery {
+            anyhow::bail!("portfolio recovery required: {}", recovery.message);
+        }
+        Ok(loaded.value)
     }
 
     fn save(&self, value: &Portfolio) -> Result<()> {
-        json_store::save(&self.path, value)
+        super::recovery::save(&self.path, value)
     }
 }
 
@@ -66,13 +68,15 @@ impl JsonJournalRepository {
 
 impl JournalRepository for JsonJournalRepository {
     fn load(&self) -> Result<Journal> {
-        json_store::load(&self.path, DocumentKind::Journal)
-            .map(|loaded| loaded.value)
-            .map_err(anyhow::Error::new)
+        let loaded = super::recovery::load(&self.path);
+        if let Some(recovery) = loaded.recovery {
+            anyhow::bail!("journal recovery required: {}", recovery.message);
+        }
+        Ok(loaded.value)
     }
 
     fn save(&self, value: &Journal) -> Result<()> {
-        json_store::save(&self.path, value)
+        super::recovery::save(&self.path, value)
     }
 }
 

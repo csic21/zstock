@@ -177,9 +177,7 @@ impl StockApp {
                         universe: "watchlist+extended".into(),
                         hits: app.treasure_hits.clone(),
                     };
-                    if let Err(error) = storage::save_treasure_cache(&cache) {
-                        storage::record_storage_error(format!("保存机会缓存失败：{error:#}"));
-                    }
+                    storage::enqueue_treasure_cache(cache);
                 }
                 app.persist();
                 app.sync_status_bar();
@@ -465,9 +463,7 @@ impl StockApp {
                 universe: format!("{pool_src}/scan{total}/top{TREASURE_TOP_N}"),
                 hits: hits.clone(),
             };
-            if let Err(error) = storage::save_treasure_cache(&cache) {
-                storage::record_storage_error(format!("保存机会缓存失败：{error:#}"));
-            }
+            storage::enqueue_treasure_cache(cache);
 
             let _ = this.update(cx, |app, cx| {
                 if app.treasure_gen != scan_id {
@@ -851,24 +847,30 @@ impl StockApp {
     // —— 决策日记 ——
 
     pub(crate) fn review_journal_plan(&mut self, id: &str, followed: bool, cx: &mut Context<Self>) {
+        if !self.require_journal_writable(cx) {
+            return;
+        }
         if self.journal.review_plan(id, followed) {
             self.persist_journal();
             self.status = crate::model::shared(if followed {
-                "已记为按计划执行"
+                "已记为按计划执行，正在保存"
             } else {
-                "已记为未按计划"
+                "已记为未按计划，正在保存"
             });
         }
         cx.notify();
     }
 
     pub(crate) fn persist_journal(&self) {
-        if let Err(error) = storage::save_journal(&self.journal) {
-            storage::record_storage_error(format!("保存复盘记录失败：{error:#}"));
+        if self.journal_recovery.is_none() && !self.recovery_busy {
+            storage::enqueue_journal(self.journal.clone());
         }
     }
 
     pub(crate) fn add_manual_journal_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.require_journal_writable(cx) {
+            return;
+        }
         use crate::data::journal::{self, JournalEntry, JournalKind};
         let note = self.journal_note_input.read(cx).value().to_string();
         let note = note.trim().to_string();
@@ -908,13 +910,16 @@ impl StockApp {
             input.set_value("", window, cx);
         });
         self.status = shared(if self.work_mode {
-            "Journal saved"
+            "Saving journal…"
         } else {
-            "已写入决策日记"
+            "决策日记正在保存…"
         });
     }
 
     pub(crate) fn remove_journal_entry(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.require_journal_writable(cx) {
+            return;
+        }
         if self.journal_delete_confirm_id.as_deref() != Some(id) {
             self.journal_delete_confirm_id = Some(id.to_string());
             self.status = shared("再次点击“确认删除”以删除本地记录");
@@ -929,13 +934,22 @@ impl StockApp {
     }
 
     pub(crate) fn export_journal_local(&mut self, cx: &mut Context<Self>) {
-        match storage::export_journal(&self.journal) {
-            Ok(path) => self.status = shared(format!("日记已导出：{}", path.display())),
-            Err(error) => {
-                storage::record_storage_error(format!("导出日记失败：{error:#}"));
-                self.status = shared("日记导出失败，请查看数据状态");
-            }
+        if !self.require_journal_writable(cx) {
+            return;
         }
+        let journal = self.journal.clone();
+        self.status = shared("正在导出日记…");
+        cx.spawn(async move |this, cx| {
+            let result = smol::unblock(move || storage::export_journal(&journal)).await;
+            let _ = this.update(cx, |app, cx| {
+                app.status = shared(match result {
+                    Ok(path) => format!("日记已导出：{}", path.display()),
+                    Err(error) => format!("日记导出失败：{error:#}"),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -948,7 +962,11 @@ impl StockApp {
     pub(crate) fn record_alert_journal_hits(&mut self, hits: &[super::alerts::BuyAlertHit]) {
         use crate::data::alerts::AlertLeg;
         use crate::data::journal::{self, JournalKind};
-        if hits.is_empty() {
+        if hits.is_empty()
+            || self.journal_recovery.is_some()
+            || self.recovery_busy
+            || self.shutdown_pending
+        {
             return;
         }
         for hit in hits {
@@ -1235,9 +1253,7 @@ impl StockApp {
                 universe: format!("liquid/probe{total}/top{RADAR_RESULT_N}"),
                 hits: hits.clone(),
             };
-            if let Err(error) = storage::save_radar_cache(&cache) {
-                storage::record_storage_error(format!("保存扫描缓存失败：{error:#}"));
-            }
+            storage::enqueue_radar_cache(cache);
 
             let _ = this.update(cx, |app, cx| {
                 if app.radar_gen != scan_id {

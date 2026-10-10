@@ -14,7 +14,10 @@ failure. It covers:
 - Today and Settings at 1320×860 and 800×860;
 - the command palette over Settings at both sizes;
 - Research, Opportunities, and Portfolio via their primary-toolbar shortcuts;
-- Escape dismissal and repeated Settings open/close after dismissing the palette.
+- Escape dismissal and repeated Settings open/close after dismissing the palette;
+- a second `ZSTOCK_SMOKE_RECOVERY=1` pass with synthetic corrupt portfolio/journal
+  files, visible recovery controls, and byte-for-byte checks that automatic activity
+  did not overwrite either file. These fixtures are never real user records.
 
 The script discovers only the window belonging to its app PID, bounds external
 commands and window discovery, checks that the app stays alive, and terminates

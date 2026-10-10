@@ -542,6 +542,9 @@ impl StockApp {
     }
 
     pub(crate) fn record_decision_plan_from_card(&mut self, cx: &mut gpui::Context<Self>) {
+        if !self.require_journal_writable(cx) {
+            return;
+        }
         use crate::data::journal::{self, JournalEntry, JournalKind};
 
         // Re-evaluate safety evidence at the save boundary, independently of preview metadata.
@@ -629,7 +632,7 @@ impl StockApp {
             outcomes: Vec::new(),
         });
         self.persist_journal();
-        self.status = crate::model::shared("已创建计划，并保存当时证据快照");
+        self.status = crate::model::shared("已创建计划，正在保存当时证据快照");
         cx.notify();
     }
 

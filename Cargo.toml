@@ -1,6 +1,6 @@
 [package]
 name = "stock"
-version = "0.0.59"
+version = "0.0.60"
 edition = "2024"
 description = "A-share and Hong Kong stock analysis desktop app built with GPUI"
 license = "MIT"
@@ -35,6 +35,8 @@ osx_info_plist_exts = ["assets/macos/Info.plist"]
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
+ring = "0.17.14"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dirs = "6"
 encoding_rs = "0.8"
@@ -66,6 +68,7 @@ codegen-units = 1
 block = "0.1.6"
 cocoa = "0.26"
 objc = "0.2.7"
+security-framework = "3.7.0"
 
 # Scoped 0.5.1 hover foreground fix; origin and checksum in vendor/README.md.
 [patch.crates-io]

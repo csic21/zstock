@@ -53,6 +53,17 @@ trap 'exit 143' TERM
 mkdir -p "$isolated"/{home,config,cache,runtime,data}
 chmod 700 "$isolated/runtime"
 
+# Recovery fixture is synthetic and disposable. Never point this script at an
+# existing profile. Exercise automatic startup/quote activity without allowing
+# unreadable financial documents to turn into empty writable defaults.
+if [[ ${ZSTOCK_SMOKE_RECOVERY:-0} == 1 ]]; then
+  printf 'synthetic broken portfolio fixture\n' > "$isolated/data/portfolio.json"
+  printf 'synthetic broken journal fixture\n' > "$isolated/data/journal.json"
+  cp "$isolated/data/portfolio.json" "$isolated/expected-portfolio"
+  cp "$isolated/data/journal.json" "$isolated/expected-journal"
+fi
+
+
 # A brand-new data directory selects the app's built-in defaults. env -i prevents
 # inherited AI credentials/CLI configuration from entering the app. HOME/data
 # isolation alone does NOT isolate native Secret Service: use a nonexistent bus.
@@ -148,5 +159,10 @@ key ctrl+comma
 capture returned-today-800
 
 alive
+if [[ ${ZSTOCK_SMOKE_RECOVERY:-0} == 1 ]]; then
+  cmp "$isolated/data/portfolio.json" "$isolated/expected-portfolio"
+  cmp "$isolated/data/journal.json" "$isolated/expected-journal"
+  echo "PASS: unreadable financial fixture bytes remain unchanged"
+fi
 python3 "$script_dir/visual-smoke-check.py" "$artifacts" "$isolated/data/task-metrics.json"
 echo "Native smoke checks passed. Review PNGs for icon visibility and layout correctness."

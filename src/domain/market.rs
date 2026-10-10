@@ -143,6 +143,31 @@ impl QuoteRecord {
         self.market_time.as_deref().unwrap_or("行情时间未知")
     }
 
+    /// Canonical status for compact surfaces. The timestamp is provider evidence,
+    /// never the wall clock or HTTP receipt time.
+    pub fn display_status(&self, work: bool, now_millis: i64) -> String {
+        let label = if !self.usable() {
+            if work { "unavailable" } else { "缺失" }
+        } else {
+            match (work, self.effective_freshness(now_millis)) {
+                (true, Freshness::Live) => "live",
+                (true, Freshness::Delayed) => "delayed",
+                (true, Freshness::Stale) => "stale",
+                (true, Freshness::Unknown) => "time unknown",
+                (false, Freshness::Live) => "实时",
+                (false, Freshness::Delayed) => "延迟",
+                (false, Freshness::Stale) => "过期",
+                (false, Freshness::Unknown) => "时效未知",
+            }
+        };
+        let time = self.market_time.as_deref().unwrap_or(if work {
+            "time unknown"
+        } else {
+            "时间未知"
+        });
+        format!("{label} · {time}")
+    }
+
     pub fn stale(mut self) -> Self {
         self.freshness = Freshness::Stale;
         self
@@ -324,5 +349,32 @@ mod freshness_tests {
             intraday.drawing_scope_key("20261009", ["09:30", "09:31"]),
             intraday.drawing_scope_key("20261012", ["09:30", "09:31"])
         );
+    }
+    #[test]
+    fn compact_status_preserves_old_or_missing_provider_timestamp() {
+        let mut quote = QuoteRecord {
+            code: "600519".into(),
+            market: Market::AShare,
+            currency: Currency::Cny,
+            name: "fixture".into(),
+            price: Some(10.0),
+            change_pct: Some(1.0),
+            volume: Some(1),
+            source: "fixture".into(),
+            fetched_at: 9_999_999_999_999,
+            market_time: Some("2000-01-01 09:30:00".into()),
+            availability: Availability::Available,
+            freshness: Freshness::Live,
+        };
+        let now = 1_800_000_000_000;
+        let work = quote.display_status(true, now);
+        assert!(work.contains("stale"));
+        assert!(work.contains("2000-01-01 09:30:00"));
+        assert!(!work.contains("live"));
+        assert!(quote.display_status(false, now).contains("过期"));
+        quote.market_time = None;
+        assert!(quote.display_status(true, now).contains("time unknown"));
+        quote.availability = Availability::Missing;
+        assert!(quote.display_status(true, now).contains("unavailable"));
     }
 }

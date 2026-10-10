@@ -28,7 +28,7 @@ NOTES=""
 mkdir -p "$ROOT/updates"
 # Pure-bash heredoc: no jq or other external tools, so this works on any
 # GitHub-hosted runner regardless of preinstalled software.
-cat > "$ROOT/updates/stable.json" <<EOF
+cat > "$ROOT/updates/update-payload.json" <<EOF
 {
   "version": "$VERSION",
   "notes": "",
@@ -54,5 +54,15 @@ cat > "$ROOT/updates/stable.json" <<EOF
 }
 EOF
 
-echo "==> wrote $ROOT/updates/stable.json"
-cat "$ROOT/updates/stable.json"
+# Legacy clients cannot verify signatures. A platform-free sentinel makes the
+# old updater refuse automatic installation. Bootstrap must be a manual install.
+cat > "$ROOT/updates/stable.json" <<EOF
+{
+  "version": "$VERSION",
+  "notes": "安全升级需要从官方发布页手动安装，以建立签名验证信任。",
+  "release_url": "https://github.com/$REPO/releases/tag/$TAG",
+  "platforms": {}
+}
+EOF
+
+echo "==> prepared signed payload and manual-bootstrap legacy notice"

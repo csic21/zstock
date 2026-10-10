@@ -1,8 +1,5 @@
 //! Preferences, layout, work mode, status bar, AI settings, updates.
 
-#[cfg(target_os = "macos")]
-use std::time::Duration;
-
 use gpui::{App, Context, Entity, Timer, Window, px, size};
 use gpui_component::{
     ActiveTheme, Disableable, PixelsExt, Sizable,
@@ -12,7 +9,7 @@ use gpui_component::{
 
 use crate::data::ai::{self, AiCliProvider, AiKind, AiTransport};
 #[cfg(target_os = "macos")]
-use crate::model::{Symbol, format_pct, format_price};
+use crate::model::{Symbol, format_price};
 use crate::model::{disguise_label, sanitize_work_alias, shared};
 use crate::storage::{
     ColorScheme, STATUS_BAR_MAX_CODES, WatchlistSort, WorkDensity, clamp_quote_interval_secs,
@@ -451,30 +448,9 @@ impl StockApp {
             self.sync_status_bar();
             return;
         }
-        let action_rx = mac_status_bar::install();
+        mac_status_bar::install();
         self.sync_status_bar();
-        // Menu clicks are rare; 100 ms is still snappy and cuts idle wakeups in half.
-        cx.spawn(async move |this, cx| {
-            loop {
-                Timer::after(Duration::from_millis(100)).await;
-                let mut actions = Vec::new();
-                while let Ok(a) = action_rx.try_recv() {
-                    actions.push(a);
-                }
-                if actions.is_empty() {
-                    continue;
-                }
-                let ok = this.update(cx, |app, cx| {
-                    for a in actions {
-                        app.handle_status_bar_action(a, cx);
-                    }
-                });
-                if ok.is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
+        let _ = cx;
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -586,80 +562,54 @@ impl StockApp {
 
     #[cfg(target_os = "macos")]
     pub(crate) fn status_bar_title_for(&self, sym: &Symbol) -> String {
-        // Always include last price when available. Work-mode / multi compact used
-        // to show only ±% (2dp); the main window re-renders every poll with live
-        // prices, so the menu bar looked "stuck" whenever % didn't tick.
-        if self.work_mode {
-            let alias = disguise_label(&sym.code, sym.name.as_ref());
-            if sym.last > 0.0 {
-                format!("{alias} {} {:+.2}%", format_price(sym.last), sym.change_pct)
-            } else {
-                alias
-            }
-        } else {
-            let name = short_status_name(sym.name.as_ref(), &sym.code);
-            if sym.last > 0.0 {
-                format!(
-                    "{name} {} {}",
-                    format_price(sym.last),
-                    format_pct(sym.change_pct)
-                )
-            } else {
-                format!("{name} …")
-            }
-        }
+        self.status_bar_quote_label(sym, false)
     }
 
-    /// Compact segment for multi-symbol titles: `名 价±%` (price keeps it live).
     #[cfg(target_os = "macos")]
     pub(crate) fn status_bar_compact_for(&self, sym: &Symbol) -> String {
-        if self.work_mode {
-            let alias = disguise_label(&sym.code, sym.name.as_ref());
-            if sym.last > 0.0 {
-                format!("{alias} {}{:+.2}%", format_price(sym.last), sym.change_pct)
-            } else {
-                alias
-            }
-        } else {
-            let name = short_status_name(sym.name.as_ref(), &sym.code);
-            if sym.last > 0.0 {
-                format!(
-                    "{name} {}{}",
-                    format_price(sym.last),
-                    format_pct(sym.change_pct)
-                )
-            } else {
-                format!("{name}…")
-            }
-        }
+        self.status_bar_quote_label(sym, false)
     }
 
     #[cfg(target_os = "macos")]
     pub(crate) fn status_bar_menu_label_for(&self, sym: &Symbol) -> String {
-        if self.work_mode {
-            let alias = disguise_label(&sym.code, sym.name.as_ref());
-            if sym.last > 0.0 {
-                format!(
-                    "{alias}  {}  {:+.2}%",
-                    format_price(sym.last),
-                    sym.change_pct
-                )
-            } else {
-                alias
-            }
+        self.status_bar_quote_label(sym, true)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn status_bar_quote_label(&self, sym: &Symbol, include_source: bool) -> String {
+        let name = if self.work_mode {
+            disguise_label(&sym.code, sym.name.as_ref())
         } else {
-            let name = short_status_name(sym.name.as_ref(), &sym.code);
-            if sym.last > 0.0 {
-                format!(
-                    "{}  {}  {}",
-                    name,
-                    format_price(sym.last),
-                    format_pct(sym.change_pct)
-                )
-            } else {
-                format!("{name}  ({})", sym.code)
-            }
-        }
+            short_status_name(sym.name.as_ref(), &sym.code)
+        };
+        let Some(quote) = self.quote_for_code(&sym.code) else {
+            return format!(
+                "{name} · {}",
+                if self.work_mode {
+                    "unavailable · time unknown"
+                } else {
+                    "行情缺失 · 时间未知"
+                }
+            );
+        };
+        let status = quote.display_status(self.work_mode, chrono::Utc::now().timestamp_millis());
+        let values = if quote.usable() {
+            let price = quote.price.map(format_price).unwrap_or_else(|| "—".into());
+            let change = quote
+                .change_pct
+                .filter(|value| value.is_finite())
+                .map(|value| format!("{value:+.2}%"))
+                .unwrap_or_else(|| "—".into());
+            format!(" {price} {change}")
+        } else {
+            String::new()
+        };
+        let source = if include_source && !self.work_mode {
+            format!(" · {}", quote.source)
+        } else {
+            String::new()
+        };
+        format!("{name}{values} · {status}{source}")
     }
 
     #[cfg(target_os = "macos")]
@@ -684,7 +634,7 @@ impl StockApp {
                 self.activate_main_window(cx);
             }
             StatusBarAction::Quit => {
-                cx.quit();
+                self.request_safe_quit(cx);
             }
         }
     }
@@ -897,19 +847,19 @@ impl StockApp {
     }
 
     pub(crate) fn check_for_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
+        if self.update_installing
+            || self.update_relaunch.is_some()
+            || matches!(self.update_state, UpdateState::Downloading(_))
+        {
+            return;
+        }
         self.update_state = UpdateState::Checking;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let res = smol::unblock(update::check_latest).await;
             if this
                 .update(cx, |app, cx| {
-                    app.update_state = match res {
-                        Ok(Some(info)) => UpdateState::Available(info),
-                        Ok(None) => UpdateState::UpToDate,
-                        // 只有手动点“检查更新”才把错误展示出来，自动检查静默。
-                        Err(e) if manual => UpdateState::Error(e),
-                        Err(_) => UpdateState::Idle,
-                    };
+                    app.apply_update_check_result(res, manual);
                     cx.notify();
                 })
                 .is_err()
@@ -918,21 +868,54 @@ impl StockApp {
         .detach();
     }
 
+    pub(crate) fn apply_update_check_result(
+        &mut self,
+        result: Result<Option<update::UpdateInfo>, String>,
+        manual: bool,
+    ) {
+        if self.update_installing
+            || self.update_relaunch.is_some()
+            || self.shutdown_pending
+            || matches!(self.update_state, UpdateState::Downloading(_))
+        {
+            return;
+        }
+        self.update_state = match result {
+            Ok(Some(info)) => UpdateState::Available(info),
+            Ok(None) => UpdateState::UpToDate,
+            Err(error) if manual => UpdateState::Error(error),
+            Err(_) => UpdateState::Idle,
+        };
+    }
+
     pub(crate) fn start_update(&mut self, cx: &mut Context<Self>) {
+        if self.shutdown_pending
+            || self.shutdown_complete
+            || self.update_installing
+            || self.update_relaunch.is_some()
+        {
+            return;
+        }
         let info = match &self.update_state {
             UpdateState::Available(info) => info.clone(),
             _ => return,
         };
+        self.update_installing = true;
         self.update_state = UpdateState::Downloading(info.version.clone());
         cx.notify();
         cx.spawn(async move |this, cx| {
             let res = smol::unblock(move || update::download_and_install(&info)).await;
-            if let Err(e) = res {
-                let _ = this.update(cx, |app, cx| {
-                    app.update_state = UpdateState::Error(e);
-                    cx.notify();
-                });
-            }
+            let _ = this.update(cx, |app, cx| {
+                app.update_installing = false;
+                match res {
+                    Ok(installed) => {
+                        app.update_relaunch = Some(installed);
+                        app.request_safe_quit(cx);
+                    }
+                    Err(error) => app.update_state = UpdateState::Error(error),
+                }
+                cx.notify();
+            });
         })
         .detach();
     }
@@ -972,7 +955,13 @@ impl StockApp {
 
     pub(crate) fn update_status_line(&self, work: bool) -> String {
         match &self.update_state {
-            UpdateState::Idle | UpdateState::Checking => (if work {
+            UpdateState::Idle => (if work {
+                "Automatic check unavailable · use Check or official downloads"
+            } else {
+                "自动检查暂不可用，可手动检查或从官方发布页下载"
+            })
+            .to_string(),
+            UpdateState::Checking => (if work {
                 "Checking…"
             } else {
                 "正在检查更新…"

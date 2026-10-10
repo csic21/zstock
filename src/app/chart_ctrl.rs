@@ -363,11 +363,14 @@ impl StockApp {
         if self.treasure_scanning {
             return format!("job {}/{}", self.treasure_done, self.treasure_total);
         }
-        let t = chrono::Local::now().format("%H:%M:%S");
+        let Some(quote) = self.quote_for_code(self.selected.as_ref()) else {
+            return "sync unavailable · time unknown".into();
+        };
+        let status = quote.display_status(true, chrono::Utc::now().timestamp_millis());
         if self.quote_fail_streak > 0 {
-            return format!("sync retry · {t}");
+            return format!("sync retry · {status}");
         }
-        format!("sync ok · src-a · {t}")
+        format!("sync · {status}")
     }
 
     pub(crate) fn max_watchlist_volume(&self) -> u64 {

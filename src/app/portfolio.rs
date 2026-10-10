@@ -148,7 +148,7 @@ impl StockApp {
         cx.notify();
     }
 
-    /// Write config.json immediately (structural changes: add/remove symbol, trades).
+    /// Queue the latest config snapshot without disk or credential IO on GPUI.
     pub(crate) fn persist(&mut self) {
         let mut dock = self.dock.clone();
         dock.window = self.window_bounds;
@@ -195,31 +195,29 @@ impl StockApp {
             watch_filter: self.watch_filter.id().into(),
         };
         if self.ai_api_key_dirty.get() {
-            match storage::save_ai_api_key(&self.ai_config.api_key) {
-                Ok(()) => {
+            let states = storage::persistence_worker().status();
+            let pending_state = self.ai_api_key_pending.and_then(|(revision, generation)| {
+                (generation == self.ai_api_key_edit_gen)
+                    .then(|| (revision, states.get(&storage::Slot::Credential)))
+            });
+            match pending_state {
+                Some((revision, Some(storage::SaveState::Saved(current))))
+                    if revision == *current =>
+                {
                     self.ai_api_key_dirty.set(false);
                     self.ai_api_key_save_error = None;
-                    self.status = shared(if self.ai_config.api_key.trim().is_empty() {
-                        "API Key 已从系统凭据库删除"
-                    } else {
-                        "API Key 已安全保存到系统凭据库"
-                    });
+                    self.ai_api_key_pending = None;
                 }
-                Err(error) => {
-                    let message = format!("API Key 尚未保存：{error:#}");
-                    self.ai_api_key_save_error = Some(shared(message.clone()));
-                    storage::record_storage_error(message);
+                Some((revision, Some(storage::SaveState::Pending(current))))
+                    if revision == *current => {}
+                _ => {
+                    let revision = storage::enqueue_api_key(self.ai_config.api_key.clone());
+                    self.ai_api_key_pending = Some((revision, self.ai_api_key_edit_gen));
+                    self.ai_api_key_save_error = None;
                 }
             }
         }
-        // Non-secret preferences still save if an explicit credential edit
-        // fails. Keep that edit pending so a later persistence attempt retries.
-        if let Err(error) = storage::save_config(&cfg) {
-            storage::record_storage_error(format!("保存配置失败：{error:#}"));
-        }
-        if let Some(error) = storage::take_storage_error() {
-            self.status = shared(error);
-        }
+        storage::enqueue_config(cfg);
     }
 
     /// Debounced config write — collapses rapid UI thrash (resize, typing, tab flips).
@@ -239,8 +237,134 @@ impl StockApp {
     }
 
     pub(crate) fn persist_portfolio(&self) {
-        if let Err(error) = storage::save_portfolio(&self.portfolio) {
-            storage::record_storage_error(format!("保存持仓失败：{error:#}"));
+        if self.portfolio_recovery.is_none() && !self.recovery_busy {
+            storage::enqueue_portfolio(self.portfolio.clone());
+        }
+    }
+
+    pub(crate) fn require_portfolio_writable(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.shutdown_pending {
+            self.status = shared("正在保存并退出，暂时不能修改持仓");
+            cx.notify();
+            return false;
+        }
+        if self.portfolio_recovery.is_some() || self.recovery_busy {
+            self.status = shared("持仓处于只读恢复模式，请先到设置 → 通用恢复数据");
+            self.trade_feedback = Some(self.status.clone());
+            cx.notify();
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn require_journal_writable(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.shutdown_pending {
+            self.status = shared("正在保存并退出，暂时不能修改日记");
+            cx.notify();
+            return false;
+        }
+        if self.journal_recovery.is_some() || self.recovery_busy {
+            self.status = shared("日记处于只读恢复模式，请先到设置 → 通用恢复数据");
+            cx.notify();
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn start_persistence_observer(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                Timer::after(std::time::Duration::from_millis(150)).await;
+                if this
+                    .update(cx, |app, cx| {
+                        app.observe_persistence(cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    pub(crate) fn observe_persistence(&mut self, cx: &mut Context<Self>) {
+        let status = storage::persistence_worker().status();
+        if self.persistence_status == status {
+            return;
+        }
+        let previous = std::mem::replace(&mut self.persistence_status, status.clone());
+        for (slot, state) in &status {
+            if previous.get(slot) == Some(state) {
+                continue;
+            }
+            match state {
+                storage::SaveState::Failed(_, error) => {
+                    let message = format!("{}尚未保存：{error}", persistence_label(*slot));
+                    self.status = shared(message.clone());
+                    if *slot == storage::Slot::Credential {
+                        self.ai_api_key_save_error = Some(shared(message));
+                    }
+                    if *slot == storage::Slot::Portfolio {
+                        self.portfolio_recovery = crate::infrastructure::storage::recovery::state(
+                            &storage::portfolio_path(),
+                        );
+                        self.trade_feedback = Some(self.status.clone());
+                    }
+                    if *slot == storage::Slot::Journal {
+                        self.journal_recovery = crate::infrastructure::storage::recovery::state(
+                            &storage::journal_path(),
+                        );
+                    }
+                }
+                storage::SaveState::Saved(revision) => {
+                    if *slot == storage::Slot::Credential {
+                        if self.ai_api_key_pending == Some((*revision, self.ai_api_key_edit_gen)) {
+                            self.ai_api_key_dirty.set(false);
+                            self.ai_api_key_save_error = None;
+                            self.ai_api_key_pending = None;
+                            self.status = shared("API Key 更改已安全写入系统凭据库");
+                        }
+                    } else if matches!(slot, storage::Slot::Portfolio | storage::Slot::Journal) {
+                        self.status = shared(format!("{}已保存到本地", persistence_label(*slot)));
+                        if *slot == storage::Slot::Portfolio {
+                            self.trade_feedback = Some(self.status.clone());
+                        }
+                    }
+                }
+                storage::SaveState::Pending(_) => {}
+            }
+        }
+        // Errors remain visible even when an unrelated save completes.
+        if let Some((slot, storage::SaveState::Failed(_, error))) = status
+            .iter()
+            .find(|(_, state)| matches!(state, storage::SaveState::Failed(_, _)))
+        {
+            self.status = shared(format!("{}尚未保存：{error}", persistence_label(*slot)));
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn persistence_summary(&self) -> String {
+        if self.portfolio_recovery.is_some() || self.journal_recovery.is_some() {
+            return "本地数据只读恢复模式".into();
+        }
+        if let Some((slot, storage::SaveState::Failed(_, error))) = self
+            .persistence_status
+            .iter()
+            .find(|(_, state)| matches!(state, storage::SaveState::Failed(_, _)))
+        {
+            return format!("{}未保存：{error}", persistence_label(*slot));
+        }
+        if self.ai_api_key_dirty.get()
+            || storage::persistence_worker()
+                .status()
+                .values()
+                .any(|state| matches!(state, storage::SaveState::Pending(_)))
+        {
+            "正在保存更改…".into()
+        } else {
+            "更改已保存".into()
         }
     }
 
@@ -385,6 +509,9 @@ impl StockApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if !self.require_portfolio_writable(cx) {
+            return false;
+        }
         if let Some(form) = &self.trade_form {
             self.trade_feedback = Some(shared(format!(
                 "{} {} {} · 请先完成或取消当前本地记录",
@@ -485,6 +612,9 @@ impl StockApp {
     }
 
     pub(crate) fn submit_trade(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.require_portfolio_writable(cx) {
+            return;
+        }
         let Some(form) = self.trade_form.clone() else {
             return;
         };
@@ -499,7 +629,7 @@ impl StockApp {
                 self.trade_form = None;
                 self.app_focus_pending = true;
                 let message = shared(format!(
-                    "已保存本地{}记录：{} {} · {} · {} 股 @ {} · 费用 {:.2} · 合计 {:.2}（未连接券商）",
+                    "本地{}记录待保存：{} {} · {} · {} 股 @ {} · 费用 {:.2} · 合计 {:.2}（未连接券商）",
                     form.side.label(),
                     form.name,
                     form.code,
@@ -556,6 +686,9 @@ impl StockApp {
     }
 
     pub(crate) fn undo_last_trade_for_code(&mut self, code: &str, cx: &mut Context<Self>) {
+        if !self.require_portfolio_writable(cx) {
+            return;
+        }
         let id = self
             .portfolio
             .trades
@@ -576,9 +709,9 @@ impl StockApp {
         if self.portfolio.remove_trade(&id) {
             self.persist_portfolio();
             self.status = shared(if self.work_mode {
-                "Trade undone"
+                "Trade undo pending save"
             } else {
-                "已撤销最近一笔成交"
+                "已撤销最近一笔成交，正在保存"
             });
         } else {
             self.status = shared(if self.work_mode {
@@ -592,6 +725,9 @@ impl StockApp {
     }
 
     pub(crate) fn apply_portfolio_cash(&mut self, cx: &mut Context<Self>) {
+        if !self.require_portfolio_writable(cx) {
+            return;
+        }
         let raw = self.portfolio_cash_input.read(cx).value();
         let Some(v) = parse_f64(&raw) else {
             self.status = shared(if self.work_mode {
@@ -619,14 +755,17 @@ impl StockApp {
         }
         self.persist_portfolio();
         self.status = shared(if self.work_mode {
-            format!("Cash = {v:.2} {}", currency.symbol())
+            format!("Saving cash = {v:.2} {}", currency.symbol())
         } else {
-            format!("现金已设为 {v:.2} {}", currency.symbol())
+            format!("现金设为 {v:.2} {}，正在保存", currency.symbol())
         });
         cx.notify();
     }
 
     pub(crate) fn toggle_track_cash(&mut self, cx: &mut Context<Self>) {
+        if !self.require_portfolio_writable(cx) {
+            return;
+        }
         self.portfolio.track_cash = !self.portfolio.track_cash;
         self.persist_portfolio();
         cx.notify();
@@ -805,6 +944,216 @@ impl StockApp {
         })
         .detach();
         cx.notify();
+    }
+}
+
+fn persistence_label(slot: storage::Slot) -> &'static str {
+    match slot {
+        storage::Slot::Config => "配置",
+        storage::Slot::Credential => "API Key",
+        storage::Slot::Portfolio => "持仓",
+        storage::Slot::Journal => "日记",
+        storage::Slot::Treasure => "机会缓存",
+        storage::Slot::Radar => "扫描缓存",
+        storage::Slot::Recovery => "数据恢复",
+    }
+}
+
+impl StockApp {
+    pub(crate) fn confirm_financial_recovery(
+        &mut self,
+        slot: storage::Slot,
+        backup: Option<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.recovery_busy {
+            return;
+        }
+        if !matches!(slot, storage::Slot::Portfolio | storage::Slot::Journal) {
+            return;
+        }
+        let selection = (slot, backup.clone());
+        if self.recovery_confirm.as_ref() != Some(&selection) {
+            self.recovery_confirm = Some(selection);
+            self.status =
+                shared("请再次点击确认：将先永久保留原文件副本，再恢复所选备份或重置为空");
+            cx.notify();
+            return;
+        }
+        self.recovery_confirm = None;
+        self.recovery_busy = true;
+        self.status = shared("正在校验和恢复本地数据；完成前保持只读…");
+        let path = if slot == storage::Slot::Portfolio {
+            storage::portfolio_path()
+        } else {
+            storage::journal_path()
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        storage::persistence_worker().submit(storage::Slot::Recovery, move || {
+            use crate::infrastructure::storage::recovery;
+            let result = if slot == storage::Slot::Portfolio {
+                match backup {
+                    Some(backup) => {
+                        recovery::restore::<crate::data::portfolio::Portfolio>(&path, &backup)
+                    }
+                    None => recovery::reset::<crate::data::portfolio::Portfolio>(&path),
+                }
+                .map(RecoveredDocument::Portfolio)
+            } else {
+                match backup {
+                    Some(backup) => {
+                        recovery::restore::<crate::data::journal::Journal>(&path, &backup)
+                    }
+                    None => recovery::reset::<crate::data::journal::Journal>(&path),
+                }
+                .map(RecoveredDocument::Journal)
+            };
+            let error = result.as_ref().err().map(|error| format!("{error:#}"));
+            let _ = sender.send(result.map_err(|error| format!("{error:#}")));
+            match error {
+                Some(error) => Err(anyhow::anyhow!(error)),
+                None => Ok(()),
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = smol::unblock(move || receiver.recv()).await;
+            let _ = this.update(cx, |app, cx| {
+                app.recovery_busy = false;
+                match result {
+                    Ok(Ok(RecoveredDocument::Portfolio(value))) => {
+                        storage::persistence_worker()
+                            .clear_recovered_error(storage::Slot::Portfolio);
+                        app.portfolio = value;
+                        app.portfolio_recovery = None;
+                        app.trade_form = None;
+                        app.trade_feedback = None;
+                        app.status = shared("持仓恢复完成；恢复前原文件已保留为独立副本");
+                    }
+                    Ok(Ok(RecoveredDocument::Journal(value))) => {
+                        storage::persistence_worker().clear_recovered_error(storage::Slot::Journal);
+                        app.journal = value;
+                        app.journal_recovery = None;
+                        app.status = shared("日记恢复完成；恢复前原文件已保留为独立副本");
+                    }
+                    Ok(Err(error)) => app.status = shared(format!("恢复失败，仍保持只读：{error}")),
+                    Err(_) => app.status = shared("恢复任务未完成，仍保持只读"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+}
+
+enum RecoveredDocument {
+    Portfolio(crate::data::portfolio::Portfolio),
+    Journal(crate::data::journal::Journal),
+}
+
+impl StockApp {
+    pub(crate) fn retry_persistence(&mut self) {
+        let states = storage::persistence_worker().status();
+        self.persist();
+        if matches!(
+            states.get(&storage::Slot::Portfolio),
+            Some(storage::SaveState::Failed(_, _))
+        ) {
+            self.persist_portfolio();
+        }
+        if matches!(
+            states.get(&storage::Slot::Journal),
+            Some(storage::SaveState::Failed(_, _))
+        ) {
+            self.persist_journal();
+        }
+    }
+
+    pub(crate) fn request_safe_quit(&mut self, cx: &mut Context<Self>) {
+        self.request_safe_close(None, cx);
+    }
+
+    pub(crate) fn request_safe_close(
+        &mut self,
+        window: Option<gpui::AnyWindowHandle>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.update_installing
+            || (matches!(
+                self.update_state,
+                crate::update::UpdateState::Downloading(_)
+            ) && self.update_relaunch.is_none())
+        {
+            self.status = shared("安全更新正在执行，请等待安装完成后再退出");
+            cx.notify();
+            return;
+        }
+        if self.shutdown_pending {
+            return;
+        }
+        self.shutdown_pending = true;
+        self.retry_persistence();
+        let generation = self.persist_gen;
+        self.status = shared("正在保存更改，完成后退出…");
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let (result, completed) = smol::unblock(|| {
+                let result = storage::persistence_worker().flush();
+                (result, storage::persistence_worker().status())
+            })
+            .await;
+            let _ = this.update(cx, |app, cx| {
+                app.shutdown_pending = false;
+                match result {
+                    Err(error) => {
+                        app.observe_persistence(cx);
+                        app.status = shared(format!(
+                            "尚有更改未保存，已取消退出：{error:#}。请检查磁盘/凭据库后重试。"
+                        ));
+                        cx.notify();
+                    }
+                    Ok(()) => {
+                        if app.update_installing
+                            || (matches!(
+                                app.update_state,
+                                crate::update::UpdateState::Downloading(_)
+                            ) && app.update_relaunch.is_none())
+                        {
+                            app.status = shared("安全更新正在执行，已暂停退出，等待安装完成");
+                            cx.notify();
+                            return;
+                        }
+                        if app.persist_gen != generation
+                            || completed
+                                .values()
+                                .any(|state| matches!(state, storage::SaveState::Pending(_)))
+                            || storage::persistence_worker().status() != completed
+                        {
+                            app.request_safe_close(window, cx);
+                            return;
+                        }
+                        if let Some(path) = app.update_relaunch.as_ref()
+                            && let Err(error) = crate::update::relaunch(path)
+                        {
+                            app.status = shared(format!(
+                                "更新已安装，但重新启动失败：{error}。当前窗口仍保持打开。"
+                            ));
+                            cx.notify();
+                            return;
+                        }
+                        app.shutdown_complete = true;
+                        if let Some(window) = window {
+                            let _ = window.update(cx, |_, window, _cx| window.remove_window());
+                        } else {
+                            #[cfg(target_os = "macos")]
+                            crate::mac_status_bar::allow_termination();
+                            cx.quit();
+                        }
+                    }
+                }
+            });
+        })
+        .detach();
     }
 }
 

@@ -24,7 +24,11 @@ impl StockApp {
         let form_open = self.trade_form.is_some();
         let currency_groups: Vec<_> = summary.by_currency.values().cloned().collect();
 
-        let mut root = v_flex().flex_1().min_h_0().w_full();
+        let mut root = v_flex()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(self.render_financial_storage_status(crate::storage::Slot::Portfolio, cx));
 
         // 分币种组合汇总；没有 FX 时绝不显示伪精确总计。
         root = root.child(

@@ -224,6 +224,7 @@ pub struct AppState {
     settings_section: SettingsSection,
     /// Auto-update state (GitHub Releases).
     update_state: UpdateState,
+    update_installing: bool,
     /// Quote poll interval (seconds), from config.
     quote_interval_secs: u64,
     palette_query: Entity<InputState>,
@@ -353,6 +354,14 @@ pub struct AppState {
     backtest_active_rule: BacktestRule,
     /// 决策日记（本地 journal.json）。
     journal: Journal,
+    journal_recovery: Option<storage::RecoveryState>,
+    portfolio_recovery: Option<storage::RecoveryState>,
+    recovery_confirm: Option<(storage::Slot, Option<std::path::PathBuf>)>,
+    recovery_busy: bool,
+    shutdown_pending: bool,
+    shutdown_complete: bool,
+    update_relaunch: Option<std::path::PathBuf>,
+    persistence_status: std::collections::BTreeMap<storage::Slot, storage::SaveState>,
     /// 日记手写输入。
     journal_note_input: Entity<InputState>,
     /// 概览只看当前标的日记。
@@ -368,6 +377,8 @@ pub struct AppState {
     ai_config: AiConfig,
     /// Set only by an actual API-key input edit; never inferred from load failure.
     ai_api_key_dirty: Cell<bool>,
+    ai_api_key_edit_gen: u64,
+    ai_api_key_pending: Option<(u64, u64)>,
     /// Keep failed key writes visible in settings even after other status updates.
     ai_api_key_save_error: Option<SharedString>,
     /// 底部「AI 点评」状态。
@@ -431,9 +442,41 @@ impl std::ops::DerefMut for StockApp {
     }
 }
 
+/// Load disk and credential data once, off GPUI, before building input models.
+struct StartupData {
+    config: storage::AppConfig,
+    portfolio: storage::FinancialLoad<Portfolio>,
+    journal: storage::FinancialLoad<Journal>,
+    treasure: crate::data::treasure::TreasureCache,
+    radar: crate::data::radar::RadarCache,
+}
+
+impl StartupData {
+    fn load() -> Self {
+        Self {
+            config: storage::load_config(),
+            portfolio: storage::load_portfolio(),
+            journal: storage::load_journal(),
+            treasure: storage::load_treasure_cache(),
+            radar: storage::load_radar_cache(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct WindowOpening(bool);
+impl gpui::Global for WindowOpening {}
+struct MainView(gpui::WeakEntity<StockApp>);
+impl gpui::Global for MainView {}
+
 impl StockApp {
+    #[cfg(test)]
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let cfg = storage::load_config();
+        Self::from_startup(window, cx, StartupData::load())
+    }
+
+    fn from_startup(window: &mut Window, cx: &mut Context<Self>, startup: StartupData) -> Self {
+        let cfg = startup.config;
         let range = ChartRange::from_label(&cfg.range);
 
         // Bootstrap symbols offline first, then hydrate from network.
@@ -500,13 +543,15 @@ impl StockApp {
             state.set_value(ai_cfg.cli_bin.clone(), window, cx);
         });
 
-        let portfolio = storage::load_portfolio();
-        let mut journal = storage::load_journal();
+        let loaded_portfolio = startup.portfolio;
+        let portfolio = loaded_portfolio.value;
+        let portfolio_recovery = loaded_portfolio.recovery;
+        let loaded_journal = startup.journal;
+        let mut journal = loaded_journal.value;
+        let journal_recovery = loaded_journal.recovery;
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        if journal.mark_due(&today) > 0
-            && let Err(error) = storage::save_journal(&journal)
-        {
-            storage::record_storage_error(format!("更新待复盘计划失败：{error:#}"));
+        if journal_recovery.is_none() && journal.mark_due(&today) > 0 {
+            storage::enqueue_journal(journal.clone());
         }
         let trade_shares_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("股数，如 100"));
@@ -580,6 +625,7 @@ impl StockApp {
                         if this.ai_config.api_key != api_key {
                             this.ai_config.api_key = api_key;
                             this.ai_api_key_dirty.set(true);
+                            this.ai_api_key_edit_gen = this.ai_api_key_edit_gen.wrapping_add(1);
                             this.schedule_persist(cx);
                             cx.notify();
                         }
@@ -618,7 +664,7 @@ impl StockApp {
             }),
         ];
 
-        let treasure_cache = storage::load_treasure_cache();
+        let treasure_cache = startup.treasure;
         let treasure_hits = treasure_cache.hits;
         let treasure_updated_at = treasure_cache.updated_at.clone();
         let treasure_status = if treasure_hits.is_empty() {
@@ -634,7 +680,7 @@ impl StockApp {
                 }
             ))
         };
-        let radar_cache = storage::load_radar_cache();
+        let radar_cache = startup.radar;
         let radar_hits = radar_cache.hits;
         let radar_updated_at = radar_cache.updated_at.clone();
         let radar_status = if radar_hits.is_empty() {
@@ -748,6 +794,7 @@ impl StockApp {
                 market_ai_gen: 0,
                 settings_section: SettingsSection::General,
                 update_state: UpdateState::Idle,
+                update_installing: false,
                 quote_interval_secs: clamp_quote_interval_secs(cfg.quote_interval_secs),
                 palette_query,
                 palette_focus,
@@ -839,6 +886,8 @@ impl StockApp {
                 index_cyb: None,
                 ai_config: ai_cfg,
                 ai_api_key_dirty: Cell::new(false),
+                ai_api_key_edit_gen: 0,
+                ai_api_key_pending: None,
                 ai_api_key_save_error: None,
                 ai_panel: AiPanelState::Idle,
                 ai_key: None,
@@ -853,6 +902,14 @@ impl StockApp {
                 position_risk_pct_input,
                 buy_alerts: cfg.buy_alerts.clone(),
                 portfolio,
+                portfolio_recovery,
+                journal_recovery,
+                recovery_confirm: None,
+                recovery_busy: false,
+                shutdown_pending: false,
+                shutdown_complete: false,
+                update_relaunch: None,
+                persistence_status: std::collections::BTreeMap::new(),
                 trade_form: None,
                 trade_feedback: None,
                 trade_shares_input,
@@ -889,6 +946,22 @@ impl StockApp {
             app.status = shared(error);
         }
 
+        if app.portfolio_recovery.is_some() || app.journal_recovery.is_some() {
+            app.status = shared("本地数据只读恢复模式：请到设置 → 通用检查备份；原文件不会被覆盖");
+        }
+        app.start_persistence_observer(cx);
+        // GPUI grants quit futures only 100 ms. A shutdown-only barrier is
+        // necessary to drain a credential operation or durable fsync in flight.
+        app._subscriptions.push(cx.on_app_quit(|app, _cx| {
+            if !app.shutdown_complete {
+                app.persist();
+            }
+            if let Err(error) = storage::persistence_worker().flush() {
+                eprintln!("ZStock exit persistence failed: {error:#}");
+            }
+            async {}
+        }));
+
         // X11 window activation does not select a GPUI dispatch node. Without
         // this, shortcuts have no path through the app until an input is clicked.
         window.focus(&app.palette_focus);
@@ -898,6 +971,20 @@ impl StockApp {
         // 盘后 / 缓存过期：静默预扫长线，打开就能用。
         app.maybe_background_rescan(cx);
         app
+    }
+}
+
+impl Drop for StockApp {
+    fn drop(&mut self) {
+        // Capture the last resize/typing snapshot even when the debounce timer
+        // is canceled by closing the window. Never write default financial data.
+        if self.shutdown_complete {
+            return;
+        }
+        self.persist();
+        if let Err(error) = storage::persistence_worker().flush() {
+            eprintln!("ZStock window-close persistence failed: {error:#}");
+        }
     }
 }
 
@@ -1152,7 +1239,24 @@ impl Render for StockApp {
 /// "reopen" event create the same window instead of leaving the app with only
 /// a running Dock icon.
 fn open_main_window(cx: &mut App) {
-    let cfg = storage::load_config();
+    // Dock reopen can arrive while the initial credential read is still in
+    // flight. Keep one loader/window rather than racing migrations and saves.
+    if cx.default_global::<WindowOpening>().0 {
+        return;
+    }
+    cx.default_global::<WindowOpening>().0 = true;
+    cx.spawn(async move |cx| {
+        let startup = smol::unblock(StartupData::load).await;
+        let _ = cx.update(move |cx| {
+            cx.default_global::<WindowOpening>().0 = false;
+            open_loaded_window(cx, startup);
+        });
+    })
+    .detach();
+}
+
+fn open_loaded_window(cx: &mut App, startup: StartupData) {
+    let cfg = &startup.config;
     let window_bounds = match cfg.dock.window {
         // Allow Mini focus footprint (~720×440) to restore across restarts.
         Some((x, y, w, h)) if w >= 640.0 && h >= 400.0 => WindowBounds::Windowed(Bounds {
@@ -1173,10 +1277,22 @@ fn open_main_window(cx: &mut App) {
         apply_zstock_theme(cx);
         window.refresh();
         // Title is set inside StockApp::new (respects persisted work_mode).
-        let view = cx.new(|cx| StockApp::new(window, cx));
+        let view = cx.new(|cx| StockApp::from_startup(window, cx, startup));
+        let weak = view.downgrade();
+        cx.set_global(MainView(weak.clone()));
+        window.on_window_should_close(cx, move |window, cx| {
+            weak.update(cx, |app, cx| {
+                app.request_safe_close(Some(window.window_handle()), cx);
+            })
+            .is_err()
+        });
         cx.new(|cx| Root::new(view, window, cx))
     })
     .expect("Failed to open window");
+    #[cfg(target_os = "macos")]
+    if let Some(action) = cx.default_global::<PendingNativeAction>().0.take() {
+        route_native_action(action, cx);
+    }
 }
 
 /// A calmer, higher-contrast visual system for dense market information.
@@ -1302,6 +1418,72 @@ fn bind_app_keys(cx: &mut App) {
     ]);
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct PendingNativeAction(Option<crate::mac_status_bar::StatusBarAction>);
+#[cfg(target_os = "macos")]
+impl gpui::Global for PendingNativeAction {}
+
+#[cfg(target_os = "macos")]
+fn route_native_action(action: crate::mac_status_bar::StatusBarAction, cx: &mut App) {
+    use crate::mac_status_bar::StatusBarAction;
+    let view = cx.try_global::<MainView>().map(|view| view.0.clone());
+    if view.is_some_and(|view| {
+        view.update(cx, |app, cx| {
+            app.handle_status_bar_action(action.clone(), cx)
+        })
+        .is_ok()
+    }) {
+        return;
+    }
+    if matches!(action, StatusBarAction::Quit) && !cx.default_global::<WindowOpening>().0 {
+        // No window means its close preflight already drained accepted edits.
+        // Still drain late accepted jobs, and reopen on failure to show recovery.
+        cx.spawn(async |cx| {
+            let result = smol::unblock(|| storage::persistence_worker().flush()).await;
+            let _ = cx.update(|cx| match result {
+                Ok(()) if cx.windows().is_empty() && !cx.default_global::<WindowOpening>().0 => {
+                    crate::mac_status_bar::allow_termination();
+                    cx.quit();
+                }
+                Ok(()) => route_native_action(StatusBarAction::Quit, cx),
+                Err(error) => {
+                    storage::record_storage_error(format!("保存失败，退出已取消：{error:#}"));
+                    open_main_window(cx);
+                }
+            });
+        })
+        .detach();
+        return;
+    }
+    cx.default_global::<PendingNativeAction>().0 = Some(action);
+    open_main_window(cx);
+}
+
+#[cfg(target_os = "macos")]
+fn start_native_actions(cx: &mut App) {
+    let receiver = crate::mac_status_bar::initialize_actions();
+    // This task is attached to App, never to a disposable StockApp entity.
+    cx.spawn(async move |cx| {
+        loop {
+            gpui::Timer::after(std::time::Duration::from_millis(100)).await;
+            let actions: Vec<_> = receiver.try_iter().collect();
+            if !actions.is_empty()
+                && cx
+                    .update(|cx| {
+                        for action in actions {
+                            route_native_action(action, cx);
+                        }
+                    })
+                    .is_err()
+            {
+                break;
+            }
+        }
+    })
+    .detach();
+}
+
 pub fn run() {
     // IconName resolves SVG paths through the application's asset source.
     // Embed the component icons so packaged builds work without source files.
@@ -1330,8 +1512,21 @@ pub fn run() {
         gpui_component::init(cx);
 
         bind_app_keys(cx);
+        #[cfg(target_os = "macos")]
+        start_native_actions(cx);
 
         cx.on_action(|_: &Quit, cx: &mut App| {
+            let view = cx.try_global::<MainView>().map(|view| view.0.clone());
+            if view.is_some_and(|view| view.update(cx, |app, cx| app.request_safe_quit(cx)).is_ok())
+            {
+                return;
+            }
+            #[cfg(target_os = "macos")]
+            {
+                route_native_action(crate::mac_status_bar::StatusBarAction::Quit, cx);
+                return;
+            }
+            #[cfg(not(target_os = "macos"))]
             cx.quit();
         });
 
@@ -2002,3 +2197,6 @@ mod ux_regression_tests;
 
 #[cfg(test)]
 mod focus_regression_tests;
+
+#[cfg(test)]
+mod quote_freshness_tests;

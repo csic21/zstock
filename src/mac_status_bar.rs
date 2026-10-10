@@ -20,7 +20,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 
-use cocoa::appkit::{NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength};
+use cocoa::appkit::{
+    NSApplication, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+};
 use cocoa::base::{NO, YES, id, nil};
 use cocoa::foundation::{NSData, NSSize, NSString};
 use objc::declare::ClassDecl;
@@ -91,15 +93,58 @@ static STATE: Mutex<Option<StatusBarState>> = Mutex::new(None);
 
 const TARGET_CLASS: &str = "ZStockStatusBarTarget";
 
-/// Install the status item and return a receiver for menu actions.
-/// Safe to call once; subsequent calls return a disconnected empty receiver.
-pub fn install() -> Receiver<StatusBarAction> {
+static TERMINATION_ALLOWED: AtomicBool = AtomicBool::new(false);
+
+/// Install process-lifetime action routing, including the native Dock Quit veto.
+/// Called once on GPUI's main thread, independently of status-bar visibility.
+pub fn initialize_actions() -> Receiver<StatusBarAction> {
     let (tx, rx) = mpsc::channel();
-    if ACTION_TX.set(tx).is_err() {
-        // Already installed — return a dead receiver so callers can still spawn
-        // a poll loop that immediately ends.
-        let (_t, r) = mpsc::channel();
-        return r;
+    assert!(ACTION_TX.set(tx).is_ok(), "native actions initialized once");
+    unsafe {
+        let app = NSApplication::sharedApplication(nil);
+        let delegate: id = msg_send![app, delegate];
+        assert!(!delegate.is_null(), "GPUI application delegate exists");
+        install_quit_preflight((&*delegate).class());
+    }
+    rx
+}
+
+fn install_quit_preflight(class: &objc::runtime::Class) {
+    unsafe {
+        let callback: extern "C" fn(&Object, Sel, id) -> usize = application_should_terminate;
+        let added = objc::runtime::class_addMethod(
+            class as *const objc::runtime::Class as *mut objc::runtime::Class,
+            sel!(applicationShouldTerminate:),
+            std::mem::transmute::<extern "C" fn(&Object, Sel, id) -> usize, objc::runtime::Imp>(
+                callback,
+            ),
+            c"Q@:@".as_ptr(),
+        );
+        assert!(
+            added != NO,
+            "native quit preflight must be installed before opening user data"
+        );
+    }
+}
+
+/// A successful, stable durable-save drain is the only path to native termination.
+pub fn allow_termination() {
+    TERMINATION_ALLOWED.store(true, Ordering::SeqCst);
+}
+
+extern "C" fn application_should_terminate(_this: &Object, _sel: Sel, _sender: id) -> usize {
+    if TERMINATION_ALLOWED.load(Ordering::SeqCst) {
+        1 // NSTerminateNow
+    } else {
+        send_action(StatusBarAction::Quit);
+        0 // NSTerminateCancel; route back through asynchronous save preflight.
+    }
+}
+
+/// Install the status item once; action routing belongs to the application.
+pub fn install() {
+    if is_installed() {
+        return;
     }
     unsafe {
         register_target_class();
@@ -136,7 +181,6 @@ pub fn install() -> Receiver<StatusBarAction> {
     INSTALLED.store(true, Ordering::SeqCst);
     // Start hidden; app enables via config.
     set_visible(false);
-    rx
 }
 
 pub fn is_installed() -> bool {
@@ -616,16 +660,9 @@ extern "C" fn show_window(_this: &Object, _sel: Sel, _sender: id) {
 }
 
 extern "C" fn quit_app(_this: &Object, _sel: Sel, _sender: id) {
-    // Terminate immediately on the AppKit menu-action thread. Going through the
-    // 50ms GPUI poll + async `cx.quit()` made "退出" feel dead, especially when
-    // the main thread was busy applying quote ticks.
+    // Route through the app's durable-save preflight; direct AppKit termination
+    // would abandon queued financial records or hide a failed disk write.
     send_action(StatusBarAction::Quit);
-    unsafe {
-        let app: id = msg_send![class!(NSApplication), sharedApplication];
-        if app != nil {
-            let _: () = msg_send![app, terminate: nil];
-        }
-    }
 }
 
 extern "C" fn noop(_this: &Object, _sel: Sel, _sender: id) {}
@@ -648,5 +685,31 @@ extern "C" fn menu_did_close(_this: &Object, _sel: Sel, _menu: id) {
     };
     if let Some(pending) = pending {
         apply_pending_menu(pending);
+    }
+}
+
+#[cfg(test)]
+mod termination_tests {
+    use super::*;
+
+    #[test]
+    fn native_termination_selector_vetoes_until_save_preflight_allows() {
+        // Exercise actual Objective-C dispatch/ABI on both macOS CI targets,
+        // without creating NSApplication, opening user files, or terminating it.
+        let class = ClassDecl::new("ZStockTerminationRegressionFixture", class!(NSObject))
+            .expect("unique fixture class")
+            .register();
+        install_quit_preflight(class);
+        unsafe {
+            let object: id = msg_send![class, new];
+            TERMINATION_ALLOWED.store(false, Ordering::SeqCst);
+            let reply: usize = msg_send![object, applicationShouldTerminate: nil];
+            assert_eq!(reply, 0, "native Quit must be vetoed before durable save");
+            allow_termination();
+            let reply: usize = msg_send![object, applicationShouldTerminate: nil];
+            assert_eq!(reply, 1, "successful preflight allows native termination");
+            TERMINATION_ALLOWED.store(false, Ordering::SeqCst);
+            let _: () = msg_send![object, release];
+        }
     }
 }

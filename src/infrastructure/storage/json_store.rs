@@ -3,6 +3,7 @@ use std::fs::File;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -43,8 +44,29 @@ pub fn load<T: DeserializeOwned>(path: &Path, kind: DocumentKind) -> Result<Load
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(LoadError::NotFound),
         Err(error) => return Err(LoadError::Io(error)),
     };
-    let raw: Value = serde_json::from_slice(&bytes)
+    decode(&bytes, kind)
+}
+
+/// Validate the document identity before permissive serde defaults can make a
+/// different document look like an empty portfolio or journal.
+pub fn decode<T: DeserializeOwned>(
+    bytes: &[u8],
+    kind: DocumentKind,
+) -> Result<Loaded<T>, LoadError> {
+    let raw: Value = serde_json::from_slice(bytes)
         .map_err(|error| LoadError::Invalid(anyhow::Error::new(error).context("parse JSON")))?;
+    let required = match kind {
+        DocumentKind::Portfolio => Some(("trades", "entries")),
+        DocumentKind::Journal => Some(("entries", "trades")),
+        DocumentKind::Config => None,
+    };
+    if let Some((expected, other)) = required
+        && (!raw.get(expected).is_some_and(Value::is_array) || raw.get(other).is_some())
+    {
+        return Err(LoadError::Invalid(anyhow::anyhow!(
+            "wrong document shape: expected {expected} array"
+        )));
+    }
     let migration = migrate(kind, raw).map_err(LoadError::Invalid)?;
     let value = serde_json::from_value(migration.value.clone()).map_err(|error| {
         LoadError::Invalid(anyhow::Error::new(error).context("decode document"))
@@ -114,33 +136,59 @@ fn backup_before_migration_with_bytes(
     if !path.exists() {
         return Ok(None);
     }
+    let bytes = match redacted {
+        Some(bytes) => bytes.to_vec(),
+        None => fs::read(path).with_context(|| format!("read {} before backup", path.display()))?,
+    };
+    let backup = preserve_bytes(path, &format!("bak.v{from_version}"), &bytes)?;
+    retain_latest_backups(path, 3)?;
+    Ok(Some(backup))
+}
+
+/// Immutable, uniquely named backup. Never pruned by migration retention. The
+/// directory entry is durable before any recovery is allowed to replace data.
+pub fn preserve_original(path: &Path) -> Result<Option<PathBuf>> {
+    match fs::read(path) {
+        Ok(bytes) => preserve_bytes(path, "recovery", &bytes).map(Some),
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound && fs::symlink_metadata(path).is_err() =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error).with_context(|| format!("preserve original {}", path.display())),
+    }
+}
+
+fn preserve_bytes(path: &Path, category: &str, bytes: &[u8]) -> Result<PathBuf> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
+    let name = path
         .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("data.json");
+        .context("backup target has no file name")?
+        .to_string_lossy();
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis();
-    let backup = parent.join(format!("{file_name}.bak.v{from_version}.{stamp}"));
-    if let Some(bytes) = redacted {
-        atomic_write(&backup, bytes)?;
-    } else {
-        fs::copy(path, &backup).with_context(|| format!("backup {}", path.display()))?;
+        .as_nanos();
+    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+    let backup = parent.join(format!(
+        "{name}.{category}.{stamp}-{}-{sequence}",
+        std::process::id()
+    ));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    #[cfg(windows)]
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
+    let mut file = options
         .open(&backup)
-        .with_context(|| format!("open {}", backup.display()))?;
-    #[cfg(not(windows))]
-    let file = fs::File::open(&backup).with_context(|| format!("open {}", backup.display()))?;
-    file.sync_all()
-        .with_context(|| format!("sync {}", backup.display()))?;
-    retain_latest_backups(path, 3)?;
-    Ok(Some(backup))
+        .with_context(|| format!("create {}", backup.display()))?;
+    file.write_all(bytes).context("write immutable backup")?;
+    file.sync_all().context("sync immutable backup")?;
+    sync_directory(parent)?;
+    Ok(backup)
 }
 
 pub fn latest_backups(path: &Path) -> Result<Vec<PathBuf>> {
@@ -156,19 +204,61 @@ pub fn latest_backups(path: &Path) -> Result<Vec<PathBuf>> {
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|candidate| {
-            candidate
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(&prefix))
+            fs::symlink_metadata(candidate).is_ok_and(|metadata| metadata.is_file())
+                && candidate
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
         })
         .collect();
-    backups.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
+    backups.sort_by_key(|path| {
+        std::cmp::Reverse(
+            fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .ok(),
+        )
+    });
     Ok(backups)
 }
 
-pub fn restore_backup(path: &Path, backup: &Path) -> Result<()> {
+/// A backup must belong to this exact target and fully decode as its schema.
+/// Parsing JSON alone is insufficient because financial documents use defaults.
+pub fn read_backup<T: DeserializeOwned>(
+    path: &Path,
+    backup: &Path,
+    kind: DocumentKind,
+) -> Result<(Loaded<T>, Vec<u8>)> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let backup_parent = backup.parent().unwrap_or_else(|| Path::new("."));
+    let prefix = format!(
+        "{}.bak.",
+        path.file_name()
+            .context("missing target name")?
+            .to_string_lossy()
+    );
+    anyhow::ensure!(
+        fs::canonicalize(parent)? == fs::canonicalize(backup_parent)?
+            && backup
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+            && fs::symlink_metadata(backup)?.is_file(),
+        "backup does not belong to the selected document"
+    );
     let bytes = fs::read(backup).with_context(|| format!("read {}", backup.display()))?;
-    let _: Value = serde_json::from_slice(&bytes).context("backup is not valid JSON")?;
+    let loaded = decode::<T>(&bytes, kind)
+        .map_err(anyhow::Error::new)
+        .context("validate backup schema")?;
+    Ok((loaded, bytes))
+}
+
+#[cfg(test)]
+pub fn restore_backup<T: DeserializeOwned>(
+    path: &Path,
+    backup: &Path,
+    kind: DocumentKind,
+) -> Result<()> {
+    let (_, bytes) = read_backup::<T>(path, backup, kind)?;
+    preserve_original(path)?;
     atomic_write(path, &bytes)
 }
 
@@ -245,7 +335,7 @@ mod tests {
         }
         let backups = latest_backups(&path).unwrap();
         assert_eq!(backups.len(), 3);
-        restore_backup(&path, &backups[0]).unwrap();
+        restore_backup::<Value>(&path, &backups[0], DocumentKind::Config).unwrap();
         let _: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         for backup in backups {
             fs::remove_file(backup).unwrap();

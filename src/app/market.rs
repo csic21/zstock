@@ -114,12 +114,11 @@ impl StockApp {
         self.market_state.last_applied_at = Some(now);
         self.analysis_state.decision_card =
             (!self.current_daily_candles().is_empty()).then(|| self.decision_card_view_model());
-        self.quote_fail_streak =
-            if usable_count == 0 || (stale_count == batch.records.len() && !errors.is_empty()) {
-                self.quote_fail_streak.saturating_add(1)
-            } else {
-                0
-            };
+        self.quote_fail_streak = if usable_count == 0 || stale_count == batch.records.len() {
+            self.quote_fail_streak.saturating_add(1)
+        } else {
+            0
+        };
         let mut transitions = Vec::new();
         for record in &batch.records {
             if record.usable()
@@ -245,7 +244,10 @@ impl StockApp {
                         app.chart_state.daily.error = None;
                         app.chart_state.daily.request.apply(&ticket, ());
                         let candles = app.current_daily_candles().to_vec();
-                        if app.journal.update_outcomes_for_series(&req_code, &candles) > 0 {
+                        if app.journal_recovery.is_none()
+                            && !app.shutdown_pending
+                            && app.journal.update_outcomes_for_series(&req_code, &candles) > 0
+                        {
                             app.persist_journal();
                         }
                         app.refresh_analysis_cache();
@@ -357,10 +359,13 @@ impl StockApp {
                 if this
                     .update(cx, |app, cx| {
                         // Never clobber an in-flight install or visible error.
-                        if matches!(
-                            app.update_state,
-                            UpdateState::Downloading(_) | UpdateState::Error(_)
-                        ) {
+                        if app.update_installing
+                            || app.update_relaunch.is_some()
+                            || matches!(
+                                app.update_state,
+                                UpdateState::Downloading(_) | UpdateState::Error(_)
+                            )
+                        {
                             return;
                         }
                         app.update_state = match res {
@@ -449,6 +454,7 @@ impl StockApp {
                             app.analysis_state.decision_card =
                                 (!app.current_daily_candles().is_empty())
                                     .then(|| app.decision_card_view_model());
+                            app.sync_status_bar();
                             cx.notify();
                         }
                     })

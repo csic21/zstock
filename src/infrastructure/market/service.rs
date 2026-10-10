@@ -154,6 +154,7 @@ impl MarketDataService {
         if codes.is_empty() {
             return;
         }
+        let now = chrono::Utc::now().timestamp_millis();
         let requested: HashSet<_> = codes.iter().cloned().collect();
         match primary.fetch_quotes(codes) {
             Ok(records) => {
@@ -168,7 +169,15 @@ impl MarketDataService {
 
         let missing: Vec<_> = codes
             .iter()
-            .filter(|code| !by_code.get(*code).is_some_and(QuoteRecord::usable))
+            .filter(|code| {
+                !by_code.get(*code).is_some_and(|record| {
+                    record.usable()
+                        && matches!(
+                            record.effective_freshness(now),
+                            Freshness::Live | Freshness::Delayed
+                        )
+                })
+            })
             .cloned()
             .collect();
         if missing.is_empty() {
@@ -217,9 +226,34 @@ fn merge_usable(
 ) {
     for record in records {
         if requested.contains(&record.code) && record.usable() {
-            output.insert(record.code.clone(), record);
+            let now = chrono::Utc::now().timestamp_millis();
+            if output
+                .get(&record.code)
+                .is_none_or(|existing| quote_quality(&record, now) > quote_quality(existing, now))
+            {
+                output.insert(record.code.clone(), record);
+            }
         }
     }
+}
+
+/// Prefer usable, exchange-timestamped evidence; a fallback must not replace a
+/// better primary with older/unknown data just because its HTTP request succeeded.
+fn quote_quality(record: &QuoteRecord, now: i64) -> (u8, i64) {
+    let rank = match record.effective_freshness(now) {
+        Freshness::Live => 3,
+        Freshness::Delayed => 2,
+        Freshness::Stale => 1,
+        Freshness::Unknown => 0,
+    };
+    (
+        rank,
+        record
+            .market_time
+            .as_deref()
+            .and_then(crate::domain::market::parse_market_timestamp)
+            .unwrap_or(i64::MIN),
+    )
 }
 
 #[cfg(test)]
@@ -284,8 +318,8 @@ mod tests {
             change_pct: Some(1.0),
             volume: Some(1),
             source: source.into(),
-            fetched_at: 1,
-            market_time: Some("fixture".into()),
+            fetched_at: chrono::Utc::now().timestamp_millis(),
+            market_time: Some(chrono::Utc::now().to_rfc3339()),
             availability: Availability::Available,
             freshness: Freshness::Live,
         }
@@ -376,6 +410,41 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_millis(50),
             "100-quote apply took {elapsed:?}"
+        );
+    }
+    #[test]
+    fn stale_and_unknown_primary_quotes_request_fresher_fallback() {
+        for stale in [false, true] {
+            let mut row = quote("600519", "primary", 88.0);
+            row.market_time = if stale {
+                Some("2000-01-01 09:30:00".into())
+            } else {
+                None
+            };
+            let primary = MockProvider::rows("primary", vec![row]);
+            let fallback = MockProvider::rows("fallback", vec![quote("600519", "fallback", 90.0)]);
+            let empty = MockProvider::rows("empty", vec![]);
+            let mut service =
+                MarketDataService::new(primary, fallback.clone(), empty.clone(), empty);
+            let batch = service.fetch_quotes(&["600519".into()]);
+            assert_eq!(batch.records[0].source, "fallback");
+            assert_eq!(fallback.calls.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn worse_fallback_never_overwrites_timestamped_primary() {
+        let mut primary_row = quote("600519", "primary", 88.0);
+        primary_row.market_time = Some("2000-01-02 09:30:00".into());
+        let mut fallback_row = quote("600519", "fallback", 90.0);
+        fallback_row.market_time = Some("2000-01-01 09:30:00".into());
+        let primary = MockProvider::rows("primary", vec![primary_row]);
+        let fallback = MockProvider::rows("fallback", vec![fallback_row]);
+        let empty = MockProvider::rows("empty", vec![]);
+        let mut service = MarketDataService::new(primary, fallback, empty.clone(), empty);
+        assert_eq!(
+            service.fetch_quotes(&["600519".into()]).records[0].source,
+            "primary"
         );
     }
 }

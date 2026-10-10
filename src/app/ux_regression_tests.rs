@@ -178,6 +178,7 @@ fn removing_last_membership_retains_research_data_and_undo(cx: &mut TestAppConte
         let fixture_dir = crate::infrastructure::storage::paths::app_data_dir();
         assert!(fixture_dir.starts_with(std::env::temp_dir()));
         app.persist();
+        crate::storage::persistence_worker().flush().unwrap();
         let saved = crate::storage::load_config();
         assert!(saved.watchlist.is_empty());
         assert_eq!(serde_json::to_value(saved.buy_alerts).unwrap(), alerts);
@@ -329,6 +330,8 @@ fn only_explicit_credential_edits_persist_through_the_test_secret_store(cx: &mut
         // Ordinary test builds inject an in-memory store. This cannot touch the
         // developer's native keychain, and the config remains fixture-only.
         app.persist();
+        crate::storage::persistence_worker().flush().unwrap();
+        app.observe_persistence(cx);
         assert!(!app.ai_api_key_dirty.get());
         assert_eq!(
             crate::storage::load_config().ai_api.api_key,
@@ -337,9 +340,11 @@ fn only_explicit_credential_edits_persist_through_the_test_secret_store(cx: &mut
         app.ai_api_key_input
             .update(cx, |input, cx| input.set_value("", window, cx));
     });
-    update_app(&mut window, |app, _window, _cx| {
+    update_app(&mut window, |app, _window, cx| {
         assert!(app.ai_api_key_dirty.get(), "explicit clear must be tracked");
         app.persist();
+        crate::storage::persistence_worker().flush().unwrap();
+        app.observe_persistence(cx);
         assert!(!app.ai_api_key_dirty.get());
         assert!(crate::storage::load_config().ai_api.api_key.is_empty());
     });
@@ -361,17 +366,19 @@ fn credential_save_failure_is_visible_and_recovers_without_losing_config(cx: &mu
         });
         (path, original)
     });
-    update_app(&mut window, |app, _window, _cx| {
+    update_app(&mut window, |app, _window, cx| {
         assert!(app.ai_api_key_dirty.get());
         app.persist();
+        assert!(crate::storage::persistence_worker().flush().is_err());
+        app.observe_persistence(cx);
         assert!(app.ai_api_key_dirty.get(), "failed key write stays pending");
         assert!(
             app.ai_api_key_save_error
                 .as_ref()
-                .is_some_and(|error| error.contains("API Key 尚未保存"))
+                .is_some_and(|error| error.contains("API Key尚未保存"))
         );
         assert!(
-            app.status.contains("保存配置失败"),
+            app.status.contains("配置尚未保存"),
             "failure must be visible during the session"
         );
         assert_eq!(
@@ -384,6 +391,8 @@ fn credential_save_failure_is_visible_and_recovers_without_losing_config(cx: &mu
     std::fs::write(&path, original).expect("restore valid fixture config");
     update_app(&mut window, |app, window, cx| {
         app.persist();
+        crate::storage::persistence_worker().flush().unwrap();
+        app.observe_persistence(cx);
         assert!(!app.ai_api_key_dirty.get());
         assert!(app.ai_api_key_save_error.is_none());
         assert_eq!(
@@ -393,8 +402,10 @@ fn credential_save_failure_is_visible_and_recovers_without_losing_config(cx: &mu
         app.ai_api_key_input
             .update(cx, |input, cx| input.set_value("", window, cx));
     });
-    update_app(&mut window, |app, _window, _cx| {
+    update_app(&mut window, |app, _window, cx| {
         app.persist();
+        crate::storage::persistence_worker().flush().unwrap();
+        app.observe_persistence(cx);
         assert!(!app.ai_api_key_dirty.get());
         assert!(app.ai_api_key_save_error.is_none());
         assert!(crate::storage::load_config().ai_api.api_key.is_empty());
@@ -486,4 +497,130 @@ fn limitup_fixture() -> LimitUpHit {
         risks: vec![],
         headline: "fixture".into(),
     }
+}
+
+#[gpui::test]
+fn older_credential_completion_cannot_clear_a_newer_edit(cx: &mut TestAppContext) {
+    let mut window = test_window(cx, 920.0, 580.0);
+    update_app(&mut window, |app, _window, cx| {
+        let revision = crate::storage::persistence_worker()
+            .submit(crate::storage::Slot::Credential, || Ok(()));
+        app.ai_api_key_edit_gen = 10;
+        app.ai_api_key_pending = Some((revision, 10));
+        app.ai_api_key_dirty.set(true);
+        // A second edit has happened but its debounce has not submitted yet.
+        app.ai_api_key_edit_gen = 11;
+        app.ai_config.api_key = "fixture-newer-edit".into();
+        crate::storage::persistence_worker().flush().unwrap();
+        app.observe_persistence(cx);
+        assert!(app.ai_api_key_dirty.get());
+        app.persist();
+        crate::storage::persistence_worker().flush().unwrap();
+        app.observe_persistence(cx);
+        assert!(!app.ai_api_key_dirty.get());
+        assert_eq!(
+            crate::storage::load_config().ai_api.api_key,
+            "fixture-newer-edit"
+        );
+        app.ai_api_key_edit_gen += 1;
+        app.ai_api_key_dirty.set(true);
+        app.ai_config.api_key.clear();
+        app.persist();
+        crate::storage::persistence_worker().flush().unwrap();
+        app.observe_persistence(cx);
+    });
+}
+
+#[gpui::test]
+fn recovery_mode_blocks_financial_mutations_and_never_reports_saved(cx: &mut TestAppContext) {
+    let mut window = test_window(cx, 920.0, 580.0);
+    update_app(&mut window, |app, window, cx| {
+        let fixture_dir = crate::infrastructure::storage::paths::app_data_dir();
+        assert!(fixture_dir.starts_with(std::env::temp_dir()));
+        let portfolio_path = fixture_dir.join("portfolio.json");
+        let journal_path = fixture_dir.join("journal.json");
+        let original = b"interrupted fixture bytes";
+        std::fs::write(&portfolio_path, original).unwrap();
+        std::fs::write(&journal_path, original).unwrap();
+        app.portfolio_recovery = crate::storage::load_portfolio().recovery;
+        app.journal_recovery = crate::storage::load_journal().recovery;
+        assert!(app.portfolio_recovery.is_some() && app.journal_recovery.is_some());
+        let portfolio = serde_json::to_value(&app.portfolio).unwrap();
+        let journal = serde_json::to_value(&app.journal).unwrap();
+        assert!(!app.open_trade_form(crate::data::portfolio::TradeSide::Buy, window, cx));
+        app.toggle_track_cash(cx);
+        app.apply_portfolio_cash(cx);
+        app.undo_last_trade_for_code("600519", cx);
+        app.add_manual_journal_note(window, cx);
+        app.record_decision_plan_from_card(cx);
+        app.review_journal_plan("fixture", true, cx);
+        app.remove_journal_entry("fixture", cx);
+        app.persist_portfolio();
+        app.persist_journal();
+        crate::storage::persistence_worker().flush().unwrap();
+        assert_eq!(serde_json::to_value(&app.portfolio).unwrap(), portfolio);
+        assert_eq!(serde_json::to_value(&app.journal).unwrap(), journal);
+        assert_eq!(std::fs::read(&portfolio_path).unwrap(), original);
+        assert_eq!(std::fs::read(&journal_path).unwrap(), original);
+        assert!(app.status.contains("只读恢复模式"));
+    });
+}
+
+#[gpui::test]
+fn close_and_quit_cannot_discard_an_active_update(cx: &mut TestAppContext) {
+    let mut window = test_window(cx, 1320.0, 860.0);
+    let handle = window.window_handle();
+    update_app(&mut window, |app, _, cx| {
+        app.update_state = crate::update::UpdateState::Downloading("99.0.0".into());
+        app.update_relaunch = None;
+        app.request_safe_close(Some(handle), cx);
+        assert!(!app.shutdown_pending);
+        assert!(!app.shutdown_complete);
+        assert!(app.status.contains("更新正在执行"));
+        app.request_safe_quit(cx);
+        assert!(!app.shutdown_pending);
+        assert!(!app.shutdown_complete);
+        app.check_for_updates(true, cx);
+        assert!(matches!(
+            app.update_state,
+            crate::update::UpdateState::Downloading(_)
+        ));
+        app.update_state = crate::update::UpdateState::Error("fixture failure".into());
+    });
+}
+
+#[gpui::test]
+fn pending_shutdown_blocks_update_and_late_checks_cannot_hide_installation(
+    cx: &mut TestAppContext,
+) {
+    let mut window = test_window(cx, 1320.0, 860.0);
+    update_app(&mut window, |app, _, cx| {
+        app.update_state = crate::update::UpdateState::Available(crate::update::test_update_info());
+        app.shutdown_pending = true;
+        app.start_update(cx);
+        assert!(!app.update_installing);
+        assert!(matches!(
+            app.update_state,
+            crate::update::UpdateState::Available(_)
+        ));
+        app.shutdown_pending = false;
+        app.shutdown_complete = true;
+        app.start_update(cx);
+        assert!(!app.update_installing);
+        app.shutdown_complete = false;
+        app.update_installing = true;
+        app.update_state = crate::update::UpdateState::Downloading("99.0.0".into());
+        app.apply_update_check_result(Ok(Some(crate::update::test_update_info())), true);
+        assert!(matches!(
+            app.update_state,
+            crate::update::UpdateState::Downloading(_)
+        ));
+        app.apply_update_check_result(Err("late fixture failure".into()), true);
+        assert!(matches!(
+            app.update_state,
+            crate::update::UpdateState::Downloading(_)
+        ));
+        app.update_installing = false;
+        app.update_state = crate::update::UpdateState::Idle;
+    });
 }
