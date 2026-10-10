@@ -30,7 +30,9 @@ pub struct QuoteTick {
     pub code: String,
     pub name: String,
     pub last: f64,
-    pub change_pct: f64,
+    /// Missing/invalid provider changes remain unavailable. An explicit finite
+    /// zero stays Some(0.0); no NaN/Infinity sentinel crosses this boundary.
+    pub change_pct: Option<f64>,
     pub volume: u64,
     /// Turnover amount when supplied by the quote backend.
     pub amount: f64,
@@ -1307,7 +1309,7 @@ fn parse_classified_quote_diff(v: Value) -> Result<Vec<(String, QuoteTick)>> {
         .collect())
 }
 
-fn parse_quote_item(item: &Value) -> Option<QuoteTick> {
+pub(crate) fn parse_quote_item(item: &Value) -> Option<QuoteTick> {
     let code = item
         .get("f12")
         .and_then(|x| x.as_str())
@@ -1334,7 +1336,7 @@ fn parse_quote_item(item: &Value) -> Option<QuoteTick> {
             .unwrap_or("--")
             .to_string(),
         last,
-        change_pct: num_f64(item.get("f3")),
+        change_pct: quote_change_pct(item.get("f3")),
         volume: num_f64(item.get("f5")) as u64,
         amount: num_f64(item.get("f6")),
         currency,
@@ -1697,6 +1699,18 @@ fn pad_hk_code(raw: &str) -> Option<String> {
         return None;
     }
     Some(format!("{digits:0>5}"))
+}
+
+/// Preserve absence specifically for quote changes. Other provider fields keep
+/// their established parsing/arithmetic contracts.
+fn quote_change_pct(value: Option<&Value>) -> Option<f64> {
+    value
+        .and_then(|value| match value {
+            Value::Number(number) => number.as_f64(),
+            Value::String(text) => text.trim().parse::<f64>().ok(),
+            _ => None,
+        })
+        .filter(|value| value.is_finite())
 }
 
 fn num_f64(v: Option<&Value>) -> f64 {
@@ -2134,6 +2148,37 @@ mod fundamental_tests {
 #[cfg(test)]
 mod quote_timestamp_tests {
     use super::*;
+
+    #[test]
+    fn quote_change_absence_is_not_a_flat_market() {
+        let mut item = serde_json::json!({"f12":"600519","f2":10.5});
+        assert!(parse_quote_item(&item).unwrap().change_pct.is_none());
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!(""),
+            serde_json::json!("-"),
+            serde_json::json!("invalid"),
+            serde_json::json!("NaN"),
+            serde_json::json!("inf"),
+            serde_json::json!("1e999"),
+        ] {
+            item["f3"] = value;
+            let tick = parse_quote_item(&item).unwrap();
+            assert_eq!(tick.last, 10.5);
+            assert!(tick.change_pct.is_none(), "field {:?}", item["f3"]);
+        }
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(0.0),
+            serde_json::json!("0"),
+            serde_json::json!(" 0.00 "),
+        ] {
+            item["f3"] = value;
+            assert_eq!(parse_quote_item(&item).unwrap().change_pct, Some(0.0));
+        }
+        item["f3"] = serde_json::json!(-1.25);
+        assert_eq!(parse_quote_item(&item).unwrap().change_pct, Some(-1.25));
+    }
 
     #[test]
     fn provider_time_is_distinct_from_http_fetch_time() {

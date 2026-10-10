@@ -120,19 +120,27 @@ impl StockApp {
         };
 
         let climate = self.market_climate_report();
-        let climate_step = DecisionStep {
-            title: "市场气候".into(),
-            state: match climate.stance {
-                NewEntryStance::Open => DecisionStepState::Passed,
-                NewEntryStance::Selective => DecisionStepState::Attention,
-                NewEntryStance::Freeze => DecisionStepState::Blocked,
-            },
-            summary: format!(
-                "{} · {} · 新开仓风险 {:.0}%",
-                climate.headline,
-                climate.stance.label(),
-                climate.risk_scale * 100.0
-            ),
+        let climate_step = if self.financial_recovery_required() {
+            DecisionStep {
+                title: "市场气候".into(),
+                state: DecisionStepState::Blocked,
+                summary: "行情研究仍可用；本地数据待恢复，组合风控与新仓额度暂不可用".into(),
+            }
+        } else {
+            DecisionStep {
+                title: "市场气候".into(),
+                state: match climate.stance {
+                    NewEntryStance::Open => DecisionStepState::Passed,
+                    NewEntryStance::Selective => DecisionStepState::Attention,
+                    NewEntryStance::Freeze => DecisionStepState::Blocked,
+                },
+                summary: format!(
+                    "{} · {} · 新开仓风险 {:.0}%",
+                    climate.headline,
+                    climate.stance.label(),
+                    climate.risk_scale * 100.0
+                ),
+            }
         };
 
         let levels_step = match self.current_levels() {
@@ -174,61 +182,76 @@ impl StockApp {
             },
         };
 
-        let final_step = match (card.status, climate.stance, sizing_result.as_ref()) {
-            (
-                crate::domain::decision::DecisionStatus::MatchesStrategy,
-                NewEntryStance::Freeze,
-                _,
-            ) => DecisionStep {
-                title: "最终动作".into(),
-                state: DecisionStepState::Attention,
-                summary: "个股符合策略，但今日市场观望，不预填买入".into(),
-            },
-            (crate::domain::decision::DecisionStatus::MatchesStrategy, _, Err(error)) => {
-                DecisionStep {
-                    title: "最终动作".into(),
-                    state: DecisionStepState::Attention,
-                    summary: format!("策略条件符合，但暂不新增仓位：{}", error.user_message()),
-                }
-            }
-            (crate::domain::decision::DecisionStatus::MatchesStrategy, _, Ok(_)) => DecisionStep {
-                title: "最终动作".into(),
-                state: DecisionStepState::Passed,
-                summary: "可制定计划；等待进入观察区，不代表立即追价买入".into(),
-            },
-            (crate::domain::decision::DecisionStatus::Waiting, _, _) => DecisionStep {
-                title: "最终动作".into(),
-                state: DecisionStepState::Attention,
-                summary: "继续观察，不预填买入；可设置价位提醒".into(),
-            },
-            (crate::domain::decision::DecisionStatus::NotEligible, _, _) => DecisionStep {
+        let final_step = if self.financial_recovery_required() {
+            DecisionStep {
                 title: "最终动作".into(),
                 state: DecisionStepState::Blocked,
-                summary: format!(
-                    "不操作：{}",
-                    card.risks
-                        .first()
-                        .map(String::as_str)
-                        .unwrap_or("资格门槛未通过")
-                ),
-            },
-            (crate::domain::decision::DecisionStatus::InsufficientEvidence, _, _) => DecisionStep {
-                title: "最终动作".into(),
-                state: if matches!(
-                    self.analysis_state.fundamentals.state,
-                    RequestState::Idle | RequestState::Loading
-                ) || self.loading
-                {
-                    DecisionStepState::Running
-                } else {
-                    DecisionStepState::Blocked
+                summary: PositionSizingError::FinancialDataUnavailable
+                    .user_message()
+                    .into(),
+            }
+        } else {
+            match (card.status, climate.stance, sizing_result.as_ref()) {
+                (
+                    crate::domain::decision::DecisionStatus::MatchesStrategy,
+                    NewEntryStance::Freeze,
+                    _,
+                ) => DecisionStep {
+                    title: "最终动作".into(),
+                    state: DecisionStepState::Attention,
+                    summary: "个股符合策略，但今日市场观望，不预填买入".into(),
                 },
-                summary: "证据不足，不做买入动作".into(),
-            },
+                (crate::domain::decision::DecisionStatus::MatchesStrategy, _, Err(error)) => {
+                    DecisionStep {
+                        title: "最终动作".into(),
+                        state: DecisionStepState::Attention,
+                        summary: format!("策略条件符合，但暂不新增仓位：{}", error.user_message()),
+                    }
+                }
+                (crate::domain::decision::DecisionStatus::MatchesStrategy, _, Ok(_)) => {
+                    DecisionStep {
+                        title: "最终动作".into(),
+                        state: DecisionStepState::Passed,
+                        summary: "可制定计划；等待进入观察区，不代表立即追价买入".into(),
+                    }
+                }
+                (crate::domain::decision::DecisionStatus::Waiting, _, _) => DecisionStep {
+                    title: "最终动作".into(),
+                    state: DecisionStepState::Attention,
+                    summary: "继续观察，不预填买入；可设置价位提醒".into(),
+                },
+                (crate::domain::decision::DecisionStatus::NotEligible, _, _) => DecisionStep {
+                    title: "最终动作".into(),
+                    state: DecisionStepState::Blocked,
+                    summary: format!(
+                        "不操作：{}",
+                        card.risks
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or("资格门槛未通过")
+                    ),
+                },
+                (crate::domain::decision::DecisionStatus::InsufficientEvidence, _, _) => {
+                    DecisionStep {
+                        title: "最终动作".into(),
+                        state: if matches!(
+                            self.analysis_state.fundamentals.state,
+                            RequestState::Idle | RequestState::Loading
+                        ) || self.loading
+                        {
+                            DecisionStepState::Running
+                        } else {
+                            DecisionStepState::Blocked
+                        },
+                        summary: "证据不足，不做买入动作".into(),
+                    }
+                }
+            }
         };
 
-        let trace_status = if card.status
-            == crate::domain::decision::DecisionStatus::MatchesStrategy
+        let trace_status = if self.financial_recovery_required() {
+            crate::domain::decision::DecisionStatus::InsufficientEvidence
+        } else if card.status == crate::domain::decision::DecisionStatus::MatchesStrategy
             && (sizing_result.is_err() || climate.stance == NewEntryStance::Freeze)
         {
             crate::domain::decision::DecisionStatus::Waiting
@@ -255,6 +278,9 @@ impl StockApp {
         &self,
         cx: &gpui::Context<Self>,
     ) -> Result<PositionPlan, PositionSizingError> {
+        if self.financial_recovery_required() {
+            return Err(PositionSizingError::FinancialDataUnavailable);
+        }
         let capital = super::helpers::parse_f64(&self.position_capital_input.read(cx).value())
             .unwrap_or_default();
         let climate = self.market_climate_report();
@@ -542,6 +568,9 @@ impl StockApp {
     }
 
     pub(crate) fn record_decision_plan_from_card(&mut self, cx: &mut gpui::Context<Self>) {
+        if !self.require_journal_writable(cx) {
+            return;
+        }
         use crate::data::journal::{self, JournalEntry, JournalKind};
 
         // Re-evaluate safety evidence at the save boundary, independently of preview metadata.
@@ -629,7 +658,7 @@ impl StockApp {
             outcomes: Vec::new(),
         });
         self.persist_journal();
-        self.status = crate::model::shared("已创建计划，并保存当时证据快照");
+        self.status = crate::model::shared("已创建计划，正在保存当时证据快照");
         cx.notify();
     }
 
@@ -637,6 +666,9 @@ impl StockApp {
     /// deterministic; missing quotes or K-lines only mark those dimensions
     /// unknown instead of inventing a stance.
     pub(crate) fn position_review_view_model(&self) -> Option<PositionReview> {
+        if self.financial_recovery_required() {
+            return None;
+        }
         let code = self.selected.to_string();
         let position = self.portfolio.position_of(&code)?;
         let quote = self.quote_for_code(&code)?;

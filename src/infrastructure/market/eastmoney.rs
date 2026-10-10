@@ -24,36 +24,33 @@ impl QuoteProvider for EastmoneyProvider {
 
     fn fetch_quotes(&self, codes: &[String]) -> Result<Vec<QuoteRecord>, ProviderError> {
         data::eastmoney::fetch_quotes(codes)
-            .map(|values| {
-                values
-                    .into_iter()
-                    .filter_map(|value| {
-                        let market = Market::for_code(&value.code)?;
-                        let price =
-                            (value.last.is_finite() && value.last > 0.0).then_some(value.last);
-                        Some(QuoteRecord {
-                            code: value.code,
-                            market,
-                            currency: value.currency,
-                            name: value.name,
-                            price,
-                            change_pct: value.change_pct.is_finite().then_some(value.change_pct),
-                            volume: Some(value.volume),
-                            source: PROVIDER.into(),
-                            fetched_at: value.fetched_at,
-                            market_time: value.market_time,
-                            availability: if price.is_some() {
-                                value.availability
-                            } else {
-                                Availability::Invalid
-                            },
-                            freshness: value.freshness,
-                        })
-                    })
-                    .collect()
-            })
+            .map(|values| values.into_iter().filter_map(quote_record).collect())
             .map_err(|error| provider_error(PROVIDER, error))
     }
+}
+
+/// Convert only finite supplied changes; absence must survive into canonical UI.
+fn quote_record(value: data::eastmoney::QuoteTick) -> Option<QuoteRecord> {
+    let market = Market::for_code(&value.code)?;
+    let price = (value.last.is_finite() && value.last > 0.0).then_some(value.last);
+    Some(QuoteRecord {
+        code: value.code,
+        market,
+        currency: value.currency,
+        name: value.name,
+        price,
+        change_pct: value.change_pct.filter(|change| change.is_finite()),
+        volume: Some(value.volume),
+        source: PROVIDER.into(),
+        fetched_at: value.fetched_at,
+        market_time: value.market_time,
+        availability: if price.is_some() {
+            value.availability
+        } else {
+            Availability::Invalid
+        },
+        freshness: value.freshness,
+    })
 }
 
 impl KlineProvider for EastmoneyProvider {
@@ -405,5 +402,52 @@ mod fundamental_provider_tests {
         let today = chrono::Utc::now().date_naive().to_string();
         let gate = quality_gate(&snapshot.metrics, &today);
         assert!(gate.unknown.iter().any(|item| item.contains("审计")));
+    }
+}
+
+#[cfg(test)]
+mod quote_adapter_tests {
+    use super::*;
+
+    fn assert_json_round_trip(record: &QuoteRecord) {
+        let value = serde_json::to_value(record).expect("canonical quote serializes");
+        assert_eq!(
+            value["change_pct"],
+            serde_json::to_value(record.change_pct).unwrap()
+        );
+        let decoded: QuoteRecord =
+            serde_json::from_value(value).expect("canonical quote round-trip");
+        assert_eq!(decoded.price, record.price);
+        assert_eq!(decoded.change_pct, record.change_pct);
+    }
+
+    #[test]
+    fn missing_invalid_and_zero_changes_survive_provider_to_canonical_conversion() {
+        let mut item = serde_json::json!({"f12":"600519","f2":10.5});
+        let record = quote_record(data::eastmoney::parse_quote_item(&item).unwrap()).unwrap();
+        assert_json_round_trip(&record);
+        assert_eq!(record.price, Some(10.5));
+        assert_eq!(record.change_pct, None);
+        for change in [
+            serde_json::json!(null),
+            serde_json::json!(""),
+            serde_json::json!("-"),
+            serde_json::json!("invalid"),
+            serde_json::json!("NaN"),
+            serde_json::json!("inf"),
+        ] {
+            item["f3"] = change;
+            let record = quote_record(data::eastmoney::parse_quote_item(&item).unwrap()).unwrap();
+            assert_json_round_trip(&record);
+            assert_eq!(record.price, Some(10.5));
+            assert_eq!(record.availability, Availability::Available);
+            assert_eq!(record.change_pct, None, "field {:?}", item["f3"]);
+        }
+        for change in [serde_json::json!(0), serde_json::json!("0.00")] {
+            item["f3"] = change;
+            let record = quote_record(data::eastmoney::parse_quote_item(&item).unwrap()).unwrap();
+            assert_json_round_trip(&record);
+            assert_eq!(record.change_pct, Some(0.0));
+        }
     }
 }

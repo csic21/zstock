@@ -15,7 +15,7 @@ use gpui_component::{
 };
 
 use crate::chart::paint_sparkline;
-use crate::model::{IndexSnap, Symbol, format_price, shared};
+use crate::model::{IndexSnap, Symbol, shared};
 use crate::storage::WorkDensity;
 
 use super::super::helpers::*;
@@ -107,19 +107,25 @@ impl StockApp {
         let spark = self.spark_closes();
         let sel_alias = self.display_code(selected.as_ref());
         let sel_sym = self.current_symbol();
-        let p50 = sel_sym
-            .filter(|s| s.last > 0.0)
-            .map(|s| format!("{}ms", format_price(s.last)))
-            .unwrap_or_else(|| "--".into());
+        let now = chrono::Utc::now().timestamp_millis();
+        let sel_quote = self.quote_for_code(selected.as_ref());
+        let display = palette_quote_text(sel_quote, true, now);
+        let p50 = display.price;
+        let delta = display.change;
+        let real_display = palette_quote_text(sel_quote, false, now);
         let sel_identity = sel_sym
-            .map(|s| format!("{} · {} · 现价 {}", s.code, s.name, format_price(s.last)))
+            .map(|s| {
+                format!(
+                    "{} · {} · {} · {}",
+                    s.code, s.name, real_display.price, real_display.status
+                )
+            })
             .unwrap_or_else(|| "identity unavailable".into());
-        let delta = sel_sym
-            .map(|s| format!("{:+.2}%", s.change_pct))
-            .unwrap_or_else(|| "--".into());
-        let load = sel_sym
-            .map(|s| format!("{:.2}", Self::load_factor(s.volume, max_vol)))
-            .unwrap_or_else(|| "--".into());
+        let load = sel_quote
+            .filter(|quote| quote.usable())
+            .and_then(|quote| quote.volume)
+            .map(|volume| format!("{:.2}", Self::load_factor(volume, max_vol)))
+            .unwrap_or_else(|| "—".into());
         let status = self.work_status_line();
         let range_label = self.range.label();
         let pts = if spark.is_empty() {
@@ -239,29 +245,16 @@ impl StockApp {
                                                             let is_selected =
                                                                 sym.code == selected.as_ref();
                                                             let code = shared(sym.code.clone());
-                                                            let alias = self.display_code(&sym.code);
-                                                            let p50 = if sym.last > 0.0 {
-                                                                format!(
-                                                                    "{}ms",
-                                                                    format_price(sym.last)
-                                                                )
-                                                            } else {
-                                                                "--".into()
-                                                            };
-                                                            let delta =
-                                                                format!("{:+.2}%", sym.change_pct);
-                                                            let load = format!(
-                                                                "{:.2}",
-                                                                Self::load_factor(
-                                                                    sym.volume, max_vol
-                                                                )
-                                                            );
-                                                            let identity = format!(
-                                                                "{} · {} · 现价 {}",
-                                                                sym.code,
-                                                                sym.name,
-                                                                format_price(sym.last)
-                                                            );
+                                                            let quote = self.quote_for_code(&sym.code);
+                                                            let display = palette_quote_text(quote, true, now);
+                                                            let alias = format!("{} · {}", display.status.split(" · ").next().unwrap_or("unavailable"), self.display_code(&sym.code));
+                                                            let p50 = display.price;
+                                                            let delta = display.change;
+                                                            let load = quote.filter(|quote| quote.usable()).and_then(|quote| quote.volume)
+                                                                .map(|volume| format!("{:.2}", Self::load_factor(volume, max_vol)))
+                                                                .unwrap_or_else(|| "—".into());
+                                                            let real_display = palette_quote_text(quote, false, now);
+                                                            let identity = format!("{} · {} · {} · {}", sym.code, sym.name, real_display.price, real_display.status);
                                                             let dense = m.compact_footer;
 
                                                             div()
@@ -579,14 +572,21 @@ impl StockApp {
         let host_name = sel
             .map(|s| self.display_code(&s.code))
             .unwrap_or_else(|| "host".into());
-        let (net_in, net_out) = if let Some(s) = sel {
-            (
-                Self::sys_net_mbs(s.volume, max_vol),
-                Self::sys_net_mbs(s.volume.saturating_mul(3) / 4, max_vol),
-            )
-        } else {
-            (1.2, 0.8)
-        };
+        let selected_volume = self
+            .quote_for_code(self.selected.as_ref())
+            .filter(|quote| quote.usable())
+            .and_then(|quote| quote.volume);
+        let net_in = selected_volume
+            .map(|volume| format!("{:.1}", Self::sys_net_mbs(volume, max_vol)))
+            .unwrap_or_else(|| "—".into());
+        let net_out = selected_volume
+            .map(|volume| {
+                format!(
+                    "{:.1}",
+                    Self::sys_net_mbs(volume.saturating_mul(3) / 4, max_vol)
+                )
+            })
+            .unwrap_or_else(|| "—".into());
         let m = self.work_density.metrics();
         let proc_limit = match self.work_density {
             WorkDensity::Wide => 12,
@@ -601,14 +601,24 @@ impl StockApp {
         let telemetry = |pct: f64| (50.0 + pct * 12.0).clamp(5.0, 95.0);
 
         // Sort processes by abs change for top talkers.
-        let mut procs: Vec<&Symbol> = self.symbols.iter().collect();
+        let mut procs: Vec<(&Symbol, &crate::domain::market::QuoteRecord)> = self
+            .symbols
+            .iter()
+            .filter_map(|symbol| {
+                let quote = self
+                    .quote_for_code(&symbol.code)
+                    .filter(|quote| quote.usable())?;
+                quote.change_pct.filter(|value| value.is_finite())?;
+                Some((symbol, quote))
+            })
+            .collect();
         procs.sort_by(|a, b| {
-            b.change_pct
+            b.1.change_pct
+                .unwrap()
                 .abs()
-                .partial_cmp(&a.change_pct.abs())
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .total_cmp(&a.1.change_pct.unwrap().abs())
         });
-        let top_procs: Vec<&Symbol> = procs.into_iter().take(proc_limit).collect();
+        let top_procs = procs.into_iter().take(proc_limit).collect::<Vec<_>>();
 
         let t = chrono::Local::now().format("%H:%M:%S").to_string();
         let sh_load = sh.map(|s| telemetry(s.change_pct));
@@ -647,7 +657,7 @@ impl StockApp {
         let journal = [
             format!("{t}  scheduler tick · node={host_name}"),
             format!("{t}  sample cpu={sh_pct} mem={hs300_pct} disk={cyb_pct}"),
-            format!("{t}  net rx={net_in:.1} tx={net_out:.1} MB/s"),
+            format!("{t}  net rx={net_in} tx={net_out} MB/s"),
             format!("{t}  cluster nodes={}", self.symbols.len()),
             format!("{t}  gc pause ok · heap stable"),
             format!("{t}  worker pool active"),
@@ -712,7 +722,7 @@ impl StockApp {
                             "cpu"
                         },
                         gauge_value(sh, "MHz"),
-                        sh_load.unwrap_or(20.0),
+                        sh_load.unwrap_or(0.0),
                         gauge_tip("上证综指", sh),
                         cx,
                     ))
@@ -724,7 +734,7 @@ impl StockApp {
                             "mem"
                         },
                         gauge_value(hs300, "MB"),
-                        hs300_load.unwrap_or(20.0),
+                        hs300_load.unwrap_or(0.0),
                         gauge_tip("沪深300", hs300),
                         cx,
                     ))
@@ -736,7 +746,7 @@ impl StockApp {
                             "disk"
                         },
                         gauge_value(cyb, "IOPS"),
-                        cyb_load.unwrap_or(20.0),
+                        cyb_load.unwrap_or(0.0),
                         gauge_tip("创业板指", cyb),
                         cx,
                     ))
@@ -761,7 +771,7 @@ impl StockApp {
                                         .map(|v| format!("平均 {v:+.2}%"))
                                         .unwrap_or_else(|| "--".into())
                                 } else {
-                                    format!("↓{net_in:.1}  ↑{net_out:.1} MB/s")
+                                    format!("↓{net_in}  ↑{net_out} MB/s")
                                 },
                             )),
                     ),
@@ -803,12 +813,27 @@ impl StockApp {
                     .min_h_0()
                     .w_full()
                     .overflow_y_scroll()
-                    .children(top_procs.into_iter().enumerate().map(|(ix, sym)| {
+                    .children(top_procs.into_iter().enumerate().map(|(ix, (sym, quote))| {
                         let is_selected = sym.code == self.selected.as_ref();
                         let code = shared(sym.code.clone());
-                        let name = self.display_code(&sym.code);
-                        let proc_cpu = Self::sys_cpu_pct(sym.change_pct);
-                        let rss = Self::sys_rss_mb(&sym.code, sym.volume, max_vol);
+                        let display = palette_quote_text(
+                            Some(quote),
+                            true,
+                            chrono::Utc::now().timestamp_millis(),
+                        );
+                        let name = format!(
+                            "{} · {}",
+                            display.status.split(" · ").next().unwrap_or("unavailable"),
+                            self.display_code(&sym.code)
+                        );
+                        let proc_cpu =
+                            Self::sys_cpu_pct(quote.change_pct.expect("finite change filtered"));
+                        let rss = quote
+                            .volume
+                            .map(|volume| {
+                                format!("{}M", Self::sys_rss_mb(&sym.code, volume, max_vol))
+                            })
+                            .unwrap_or_else(|| "—".into());
 
                         div()
                             .id(("work-proc", ix))
@@ -847,7 +872,7 @@ impl StockApp {
                                     .flex_1()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(format!("{rss}M")),
+                                    .child(rss),
                             )
                     })),
             )

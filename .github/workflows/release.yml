@@ -299,6 +299,11 @@ jobs:
             "$(sha macos-arm64)" "$(sha macos-x64)" \
             "$(sha windows-x64)" "$(sha linux-x64)"
 
+      - name: Sign update manifest with owner-controlled release key
+        env:
+          ZSTOCK_UPDATE_SIGNING_KEY: ${{ secrets.ZSTOCK_UPDATE_SIGNING_KEY }}
+        run: node scripts/sign-update.cjs
+
       # The helper validates every uploaded asset before making the draft public.
       # Only then is stable.json advanced, with a non-force main ref update.
       - name: Publish verified release and commit manifest

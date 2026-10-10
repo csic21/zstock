@@ -278,13 +278,19 @@ impl StockApp {
     }
 
     /// Apply index quotes; returns true if any displayed index value changed.
-    pub(crate) fn apply_index_ticks(&mut self, ticks: &[(String, String, f64, f64)]) -> bool {
+    pub(crate) fn apply_index_ticks(
+        &mut self,
+        ticks: &[(String, String, f64, Option<f64>)],
+    ) -> bool {
         let mut changed = false;
         for (code, name, last, change_pct) in ticks {
-            let snap = IndexSnap {
-                last: *last,
-                change_pct: *change_pct,
-            };
+            let snap = change_pct
+                .filter(|change| change.is_finite())
+                .filter(|_| last.is_finite() && *last > 0.0)
+                .map(|change_pct| IndexSnap {
+                    last: *last,
+                    change_pct,
+                });
             let n = name.as_str();
             let slot = if n.contains("上证") || (*code == "000001" && n.contains("指数")) {
                 Some(&mut self.index_sh)
@@ -299,15 +305,16 @@ impl StockApp {
                 None
             };
             if let Some(slot) = slot {
-                let dirty = match slot.as_ref() {
-                    Some(old) => {
-                        (old.last - snap.last).abs() > 1e-6
-                            || (old.change_pct - snap.change_pct).abs() > 1e-6
+                let dirty = match (slot.as_ref(), snap.as_ref()) {
+                    (Some(old), Some(new)) => {
+                        (old.last - new.last).abs() > 1e-6
+                            || (old.change_pct - new.change_pct).abs() > 1e-6
                     }
-                    None => true,
+                    (None, None) => false,
+                    _ => true,
                 };
                 if dirty {
-                    *slot = Some(snap);
+                    *slot = snap;
                     changed = true;
                 }
             }
@@ -357,21 +364,40 @@ impl StockApp {
 
     /// Work-mode status never mentions quotes / vendors / Chinese stock jargon.
     pub(crate) fn work_status_line(&self) -> String {
+        let recovery = if self.financial_recovery_required() {
+            "data recovery required · "
+        } else {
+            ""
+        };
         if self.loading {
-            return "loading series…".into();
+            return format!("{recovery}loading series…");
         }
         if self.treasure_scanning {
-            return format!("job {}/{}", self.treasure_done, self.treasure_total);
+            return format!(
+                "{recovery}job {}/{}",
+                self.treasure_done, self.treasure_total
+            );
         }
-        let t = chrono::Local::now().format("%H:%M:%S");
+        let Some(quote) = self.quote_for_code(self.selected.as_ref()) else {
+            return format!("{recovery}sync unavailable · time unknown");
+        };
+        let status = quote.display_status(true, chrono::Utc::now().timestamp_millis());
         if self.quote_fail_streak > 0 {
-            return format!("sync retry · {t}");
+            return format!("{recovery}sync retry · {status}");
         }
-        format!("sync ok · src-a · {t}")
+        format!("{recovery}sync · {status}")
     }
 
     pub(crate) fn max_watchlist_volume(&self) -> u64 {
-        self.symbols.iter().map(|s| s.volume).max().unwrap_or(0)
+        self.symbols
+            .iter()
+            .filter_map(|symbol| {
+                self.quote_for_code(&symbol.code)
+                    .filter(|quote| quote.usable())
+                    .and_then(|quote| quote.volume)
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     /// 0..1 volume share vs busiest row (looks like load, not 手/万).

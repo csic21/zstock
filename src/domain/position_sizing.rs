@@ -50,6 +50,7 @@ pub struct PositionPlan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PositionSizingError {
+    FinancialDataUnavailable,
     InvalidCapital,
     InvalidRiskPercent,
     InvalidPositionCap,
@@ -64,6 +65,9 @@ pub enum PositionSizingError {
 impl PositionSizingError {
     pub fn user_message(self) -> &'static str {
         match self {
+            Self::FinancialDataUnavailable => {
+                "本地持仓或日记处于恢复模式，无法确认现有仓位与计划；请先恢复数据"
+            }
             Self::InvalidCapital => "请输入大于 0 的计划本金",
             Self::InvalidRiskPercent => "单笔亏损上限须在 0–100% 之间",
             Self::InvalidPositionCap => "单票仓位上限须在 0–100% 之间",

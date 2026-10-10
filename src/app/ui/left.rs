@@ -18,7 +18,9 @@ impl StockApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let work = self.work_mode;
-        let avail_h = (window.bounds().size.height - TITLE_BAR_HEIGHT).max(px(0.));
+        let avail_h =
+            (window.bounds().size.height - TITLE_BAR_HEIGHT - self.recovery_banner_height())
+                .max(px(0.));
         let (title, subtitle, badge) = match self.left_tab {
             LeftTab::Watchlist => (
                 if work { "Services" } else { "自选研究" },
@@ -60,6 +62,9 @@ impl StockApp {
                         .count();
                     format!("{n}/{}", self.symbols.len())
                 }
+            }
+            LeftTab::Portfolio if self.portfolio_recovery.is_some() || self.recovery_busy => {
+                "—".into()
             }
             LeftTab::Portfolio => format!("{}", self.portfolio_summary().open_count),
             LeftTab::Treasure => match self.find_mode {

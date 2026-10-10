@@ -104,7 +104,18 @@ fn migrate_portfolio_v0(object: &mut Map<String, Value>) -> Result<()> {
             }
         }
     }
-    let legacy_cash = object.remove("cash").and_then(|value| value.as_f64());
+    let legacy_cash = object
+        .remove("cash")
+        .map(|value| {
+            let cash = value
+                .as_f64()
+                .context("legacy cash must be a finite number")?;
+            if !cash.is_finite() || cash.abs() > i64::MAX as f64 / 100.0 {
+                bail!("legacy cash exceeds the supported money range");
+            }
+            Ok(cash)
+        })
+        .transpose()?;
     if !object.contains_key("cash_balances") {
         let mut balances = Map::new();
         if let Some(cash) = legacy_cash {
@@ -170,6 +181,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rejects_invalid_or_out_of_range_legacy_cash_without_zeroing_it() {
+        for cash in [
+            serde_json::json!("not money"),
+            serde_json::json!(1e30),
+            serde_json::json!(null),
+        ] {
+            assert!(
+                migrate(
+                    DocumentKind::Portfolio,
+                    serde_json::json!({"trades": [], "cash": cash})
+                )
+                .is_err()
+            );
+        }
+    }
     #[test]
     fn rejects_future_schema() {
         let error = migrate(

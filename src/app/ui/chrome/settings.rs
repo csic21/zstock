@@ -101,17 +101,7 @@ impl StockApp {
                         div()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
-                            .child(if self.ai_api_key_dirty.get() {
-                                if work {
-                                    "API key not saved · Esc to leave"
-                                } else {
-                                    "API Key 尚未保存 · Esc 返回"
-                                }
-                            } else if work {
-                                "Auto-save · Esc to leave"
-                            } else {
-                                "自动保存 · Esc 返回"
-                            }),
+                            .child(self.persistence_summary()),
                     ),
             )
             .child(
@@ -188,6 +178,7 @@ impl StockApp {
         v_flex()
             .gap_5()
             .w_full().max_w(px(880.))
+            .child(self.render_storage_recovery(cx))
             .child(
                 div()
                     .text_sm()
@@ -689,6 +680,20 @@ impl StockApp {
                                 this.check_for_updates(true, cx);
                             })),
                     )
+                    .child(
+                        Button::new("official-manual-download")
+                            .small()
+                            .h(px(32.))
+                            .outline()
+                            .label(if work {
+                                "Official downloads"
+                            } else {
+                                "官方手动下载"
+                            })
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.open_url("https://github.com/csic21/zstock/releases");
+                            })),
+                    )
                     .children(match &self.update_state {
                         UpdateState::Available(_) => Some(
                             Button::new("settings-update-now")
@@ -1073,5 +1078,180 @@ impl StockApp {
                         "设置会写入本地配置，立即生效。"
                     }),
             )
+    }
+}
+
+impl StockApp {
+    fn render_storage_recovery(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut panel = settings_group(cx)
+            .child(div().font_semibold().child("本地数据保存与恢复"))
+            .child(div().text_sm().child(self.persistence_summary()))
+            .child(Button::new("retry-persistence").small().outline().label("重试保存")
+                .on_click(cx.listener(|app, _, _, cx| { app.retry_persistence(); cx.notify(); })))
+            .child(div().text_sm().text_color(cx.theme().muted_foreground)
+                .child("恢复模式下受影响数据暂停修改。恢复或重置都会先保留原文件的独立副本；无法读取或备份原文件时会停止。"));
+        for (slot, label, recovery) in [
+            (
+                crate::storage::Slot::Portfolio,
+                "持仓",
+                self.portfolio_recovery.as_ref(),
+            ),
+            (
+                crate::storage::Slot::Journal,
+                "日记",
+                self.journal_recovery.as_ref(),
+            ),
+        ] {
+            let Some(recovery) = recovery else {
+                continue;
+            };
+            panel = panel.child(
+                div()
+                    .text_sm()
+                    .child(format!("{label}只读：{}", recovery.message)),
+            );
+            for (index, backup) in recovery.backups.iter().take(3).enumerate() {
+                let backup = backup.clone();
+                let selected =
+                    self.recovery_confirm.as_ref() == Some(&(slot, Some(backup.clone())));
+                let file_name = backup
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                panel = panel.child(
+                    Button::new(("restore-financial", (slot as usize) * 10 + index))
+                        .small()
+                        .outline()
+                        .disabled(self.recovery_busy)
+                        .label(format!(
+                            "{} {label} · {file_name}",
+                            if selected {
+                                "确认恢复"
+                            } else {
+                                "恢复备份"
+                            }
+                        ))
+                        .on_click(cx.listener(move |app, _, _, cx| {
+                            app.confirm_financial_recovery(slot, Some(backup.clone()), cx);
+                        })),
+                );
+            }
+            let selected = self.recovery_confirm.as_ref() == Some(&(slot, None));
+            panel = panel.child(
+                Button::new(("reset-financial", slot as usize))
+                    .small()
+                    .outline()
+                    .disabled(self.recovery_busy)
+                    .label(format!(
+                        "{}{label}为空（保留原文件副本）",
+                        if selected { "确认重置" } else { "重置" }
+                    ))
+                    .on_click(cx.listener(move |app, _, _, cx| {
+                        app.confirm_financial_recovery(slot, None, cx);
+                    })),
+            );
+        }
+        panel
+    }
+}
+
+impl StockApp {
+    pub(crate) fn render_financial_recovery_banner(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        h_flex()
+            .id("financial-recovery-banner")
+            .debug_selector(|| "financial-recovery-banner".into())
+            .w_full()
+            .h(self.recovery_banner_height())
+            .flex_shrink_0()
+            .px_3()
+            .gap_3()
+            .items_center()
+            .border_b_1()
+            .border_color(cx.theme().warning)
+            .bg(cx.theme().warning.opacity(0.12))
+            .child(
+                div().flex_1().min_w_0().text_xs().child(if self.work_mode {
+                    "Local data recovery required. Summaries may be incomplete; affected edits are paused."
+                } else {
+                    "本地数据只读恢复模式：原文件已保留，受影响数据暂停修改。持仓、日记和风险汇总可能不完整，不代表没有持仓或风险。"
+                }),
+            )
+            .child(
+                Button::new("global-financial-recovery-settings")
+                    .small()
+                    .outline()
+                    .label(if self.work_mode { "Recover data" } else { "检查与恢复数据" })
+                    .on_click(cx.listener(|app, _, _, cx| {
+                        if !app.settings_open {
+                            app.toggle_settings(cx);
+                        }
+                        app.set_settings_section(crate::app::SettingsSection::General, cx);
+                    })),
+            )
+    }
+
+    pub(crate) fn render_financial_storage_status(
+        &self,
+        slot: crate::storage::Slot,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let recovery = if slot == crate::storage::Slot::Portfolio {
+            self.portfolio_recovery.as_ref()
+        } else {
+            self.journal_recovery.as_ref()
+        };
+        let label = if slot == crate::storage::Slot::Portfolio {
+            "持仓"
+        } else {
+            "日记"
+        };
+        let states = crate::storage::persistence_worker().status();
+        let (message, needs_attention) = if recovery.is_some() {
+            (
+                format!("{label}只读恢复模式：原文件已保留，暂停修改。当前显示内容可能不完整。"),
+                true,
+            )
+        } else {
+            match states.get(&slot) {
+                Some(crate::storage::SaveState::Pending(_)) => {
+                    (format!("{label}正在保存，请勿强制退出…"), false)
+                }
+                Some(crate::storage::SaveState::Failed(_, error)) => {
+                    (format!("{label}未保存：{error}"), true)
+                }
+                Some(crate::storage::SaveState::Saved(_)) => {
+                    (format!("{label}已保存到本地"), false)
+                }
+                None => (String::new(), false),
+            }
+        };
+        v_flex()
+            .w_full()
+            .gap_1()
+            .when(!message.is_empty(), |panel| {
+                panel
+                    .p_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(div().text_xs().child(message))
+            })
+            .when(needs_attention, |panel| {
+                panel.child(
+                    Button::new(("financial-recovery-settings", slot as usize))
+                        .small()
+                        .outline()
+                        .label("检查本地数据 / 重试保存")
+                        .on_click(cx.listener(|app, _, _, cx| {
+                            if !app.settings_open {
+                                app.toggle_settings(cx);
+                            }
+                            app.set_settings_section(crate::app::SettingsSection::General, cx);
+                        })),
+                )
+            })
     }
 }

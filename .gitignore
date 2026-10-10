@@ -3,3 +3,6 @@
 **/*.rs.bk
 .DS_Store
 screenshot.png
+
+# Ephemeral release payload; signed envelope is the published trust contract.
+updates/update-payload.json

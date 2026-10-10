@@ -118,12 +118,6 @@ pub struct Symbol {
     pub board: SharedString,
 }
 
-impl Symbol {
-    pub fn is_up(&self) -> bool {
-        self.change_pct >= 0.0
-    }
-}
-
 /// Daily (or bar) OHLCV candle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Candle {

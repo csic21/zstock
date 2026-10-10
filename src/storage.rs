@@ -592,10 +592,6 @@ fn finish_config_migration(path: &Path, loaded: &json_store::Loaded<AppConfig>) 
 
 /// Save only ordinary preferences. An empty in-memory key may mean that the
 /// credential store could not be read; it must never imply credential deletion.
-pub fn save_config(cfg: &AppConfig) -> Result<()> {
-    save_config_at(&config_path(), cfg)
-}
-
 fn save_config_at(path: &Path, cfg: &AppConfig) -> Result<()> {
     match json_store::load::<AppConfig>(path, DocumentKind::Config) {
         Ok(loaded) if loaded.migration.legacy_api_key.is_some() => {
@@ -610,10 +606,6 @@ fn save_config_at(path: &Path, cfg: &AppConfig) -> Result<()> {
 
 /// Called only after an actual edit of the API-key input. Empty text explicitly
 /// clears the stored credential; routine preferences never call this function.
-pub fn save_ai_api_key(api_key: &str) -> Result<()> {
-    save_ai_api_key_with_store(&config_path(), api_key, config_secret_store())
-}
-
 fn save_ai_api_key_with_store(path: &Path, api_key: &str, secrets: &dyn SecretStore) -> Result<()> {
     // Scrub legacy plaintext before applying an explicit edit so clearing a
     // key cannot resurrect it at the next launch. Preserve any existing native
@@ -660,8 +652,9 @@ pub fn load_treasure_cache() -> TreasureCache {
     }
 }
 
-pub fn save_treasure_cache(cache: &TreasureCache) -> Result<()> {
-    json_store::save(&treasure_cache_path(), cache)
+pub fn enqueue_treasure_cache(cache: TreasureCache) -> u64 {
+    let path = treasure_cache_path();
+    persistence_worker().submit(Slot::Treasure, move || json_store::save(&path, &cache))
 }
 
 pub fn load_radar_cache() -> RadarCache {
@@ -672,64 +665,58 @@ pub fn load_radar_cache() -> RadarCache {
     }
 }
 
-pub fn save_radar_cache(cache: &RadarCache) -> Result<()> {
-    json_store::save(&radar_cache_path(), cache)
+pub fn enqueue_radar_cache(cache: RadarCache) -> u64 {
+    let path = radar_cache_path();
+    persistence_worker().submit(Slot::Radar, move || json_store::save(&path, &cache))
 }
 
-pub fn load_portfolio() -> Portfolio {
+pub use crate::infrastructure::storage::recovery::{FinancialLoad, RecoveryState};
+pub use crate::infrastructure::storage::worker::{PersistenceWorker, SaveState, Slot};
+
+pub fn persistence_worker() -> &'static PersistenceWorker {
+    static WORKER: OnceLock<PersistenceWorker> = OnceLock::new();
+    WORKER.get_or_init(PersistenceWorker::new)
+}
+
+pub fn load_portfolio() -> FinancialLoad<Portfolio> {
+    crate::infrastructure::storage::recovery::load(&portfolio_path())
+}
+
+pub fn load_journal() -> FinancialLoad<Journal> {
+    crate::infrastructure::storage::recovery::load(&journal_path())
+}
+
+/// Capture destinations on the calling thread so a later environment change
+/// cannot redirect an already queued snapshot (also isolates fixture tests).
+pub fn enqueue_config(mut config: AppConfig) -> u64 {
+    config.ai_api.api_key.clear();
+    let path = config_path();
+    persistence_worker().submit(Slot::Config, move || save_config_at(&path, &config))
+}
+
+pub fn enqueue_api_key(api_key: String) -> u64 {
+    let path = config_path();
+    persistence_worker().submit(Slot::Credential, move || {
+        save_ai_api_key_with_store(&path, &api_key, config_secret_store())
+    })
+}
+
+pub fn enqueue_portfolio(portfolio: Portfolio) -> u64 {
     let path = portfolio_path();
-    match json_store::load::<Portfolio>(&path, DocumentKind::Portfolio) {
-        Ok(loaded) => {
-            if loaded.migration.migrated {
-                let result =
-                    json_store::backup_before_migration(&path, loaded.migration.from_version)
-                        .and_then(|_| json_store::save(&path, &loaded.value));
-                if let Err(error) = result {
-                    record_storage_error(format!("持仓迁移未落盘，原文件保持不变：{error:#}"));
-                }
-            }
-            loaded.value
-        }
-        Err(LoadError::NotFound) => Portfolio::default(),
-        Err(error) => {
-            record_storage_error(format!("持仓进入恢复模式：{error}"));
-            Portfolio::default()
-        }
-    }
+    persistence_worker().submit(Slot::Portfolio, move || {
+        crate::infrastructure::storage::recovery::save(&path, &portfolio)
+    })
 }
 
-pub fn save_portfolio(portfolio: &Portfolio) -> Result<()> {
-    json_store::save(&portfolio_path(), portfolio)
-}
-
-pub fn load_journal() -> Journal {
+pub fn enqueue_journal(journal: Journal) -> u64 {
     let path = journal_path();
-    match json_store::load::<Journal>(&path, DocumentKind::Journal) {
-        Ok(loaded) => {
-            if loaded.migration.migrated {
-                let result =
-                    json_store::backup_before_migration(&path, loaded.migration.from_version)
-                        .and_then(|_| json_store::save(&path, &loaded.value));
-                if let Err(error) = result {
-                    record_storage_error(format!("日记迁移未落盘，原文件保持不变：{error:#}"));
-                }
-            }
-            loaded.value
-        }
-        Err(LoadError::NotFound) => Journal::default(),
-        Err(error) => {
-            record_storage_error(format!("日记进入恢复模式：{error}"));
-            Journal::default()
-        }
-    }
-}
-
-pub fn save_journal(journal: &Journal) -> Result<()> {
-    json_store::save(&journal_path(), journal)
+    persistence_worker().submit(Slot::Journal, move || {
+        crate::infrastructure::storage::recovery::save(&path, &journal)
+    })
 }
 
 pub fn export_journal(journal: &Journal) -> Result<PathBuf> {
-    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S-%f");
     let path = app_data_dir().join(format!("journal-export-{stamp}.json"));
     json_store::save(&path, journal)?;
     Ok(path)
@@ -989,7 +976,7 @@ mod credential_persistence_tests {
         fixture.assert_redacted();
         // Restoring the sanitized migration backup cannot restore the removed key.
         let backup = json_store::latest_backups(&fixture.0).unwrap().remove(0);
-        json_store::restore_backup(&fixture.0, &backup).unwrap();
+        json_store::restore_backup::<AppConfig>(&fixture.0, &backup, DocumentKind::Config).unwrap();
         assert!(
             load_config_with_store(&fixture.0, &secrets)
                 .ai_api

@@ -4,7 +4,11 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { createHash } = require('node:crypto');
+const { createHash, createPrivateKey } = require('node:crypto');
+const { signManifest, verifyManifest } = require('./sign-update.cjs');
+// Public RFC 8032 test vector only. NEVER a real release credential.
+const TEST_PUBLIC = 'd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a';
+const TEST_KEY = createPrivateKey({ key: Buffer.from('302e020100300506032b6570042204209d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60', 'hex'), format: 'der', type: 'pkcs8' }).export({ type: 'pkcs8', format: 'pem' });
 const { ASSET_NAMES, commitIdentity, validateManifest, verifyAsset, publishRelease } = require('./publish-release.cjs');
 const overrides = require('../.github/release-commit-dates.json');
 const SOURCE = 'a'.repeat(40);
@@ -50,8 +54,15 @@ function fixture(t, { tag = 'v0.0.58', existing = '', published = false } = {}) 
     const asset = packages.find((p) => p.name === `zstock-${platform}.zip`);
     manifest.platforms[platform] = { url: `https://github.com/csic21/zstock/releases/download/${tag}/${asset.name}`, sha256: asset.digest.slice(7) };
   }
-  const content = JSON.stringify(manifest);
+  const payload = JSON.stringify(manifest);
+  const signedContent = signManifest(payload, TEST_KEY, TEST_PUBLIC);
+  const content = JSON.stringify({ ...manifest, platforms: {} });
   fs.writeFileSync(path.join(root, 'updates/stable.json'), content);
+  fs.writeFileSync(path.join(root, 'updates/stable-v2.json'), signedContent);
+  fs.writeFileSync(path.join(root, 'updates/signing-public-key.hex'), TEST_PUBLIC);
+  fs.writeFileSync(path.join(root, 'release-assets/zstock-update-manifest.json'), signedContent);
+  packages.push({ name: 'zstock-update-manifest.json', size: Buffer.byteLength(signedContent), state: 'uploaded',
+    digest: `sha256:${createHash('sha256').update(signedContent).digest('hex')}` });
   const calls = [];
   const assets = published ? [...packages] : [];
   const github = { rest: { git: {
@@ -61,7 +72,7 @@ function fixture(t, { tag = 'v0.0.58', existing = '', published = false } = {}) 
     createCommit: async (args) => { calls.push(['commit', args]); return { data: { sha: 'new-commit' } }; },
     updateRef: async (args) => { calls.push(['ref', args]); },
   }, repos: {
-    getContent: async () => ({ data: { content: Buffer.from(existing === 'same' ? content : existing).toString('base64') } }),
+    getContent: async ({ path: filename }) => ({ data: { content: Buffer.from(existing === 'same' ? (filename === 'updates/stable-v2.json' ? signedContent : content) : existing).toString('base64') } }),
     getReleaseByTag: async () => {
       if (published) return { data: { id: 1, draft: false } };
       throw Object.assign(new Error('not found'), { status: 404 });
@@ -77,17 +88,17 @@ function fixture(t, { tag = 'v0.0.58', existing = '', published = false } = {}) 
     updateRelease: async (args) => { calls.push(['publish', args]); },
   } }, paginate: async () => [...assets] };
   return { root, github, context: { repo: { owner: 'csic21', repo: 'zstock' } }, core: { info: () => {} },
-    tag, sourceSha: SOURCE, publicationHead: HEAD, packages, manifest, content, calls, assets };
+    tag, sourceSha: SOURCE, publicationHead: HEAD, packages, manifest, content, payload, signedContent, calls, assets };
 }
 
-test('all nine packages are verified before publication, then manifest advances without force', async (t) => {
+test('all nine packages and signed envelope are verified before publication, then manifest advances without force', async (t) => {
   const f = fixture(t);
   await publishRelease(f);
-  assert.equal(f.calls.filter(([name]) => name === 'upload').length, 9);
+  assert.equal(f.calls.filter(([name]) => name === 'upload').length, 10);
   assert.equal(f.calls[0][0], 'create-release');
   assert.equal(f.calls[0][1].draft, true);
   assert.equal(f.calls[0][1].body, 'Reviewed release notes');
-  assert.equal(f.calls[10][0], 'publish');
+  assert.equal(f.calls[11][0], 'publish');
   const commit = f.calls.find(([name]) => name === 'commit')[1];
   assert.deepEqual(commit.parents, [HEAD]);
   assert.equal(commit.author.date, '2026-10-09T08:59:00+08:00');
@@ -106,14 +117,14 @@ test('future releases do not inherit a historical author or committer', async (t
 
 test('manifest validates version, package URL and exact real hash', (t) => {
   const f = fixture(t);
-  validateManifest(f.content, f.tag, 'csic21/zstock', f.packages);
+  validateManifest(f.payload, f.tag, 'csic21/zstock', f.packages);
   for (const change of [
     (m) => { m.version = '0.0.57'; },
     (m) => { m.platforms['linux-x64'].sha256 = '0'.repeat(64); },
     (m) => { m.platforms['windows-x64'].url = 'https://invalid.test/package'; },
     (m) => { delete m.platforms['macos-arm64']; },
   ]) {
-    const value = JSON.parse(f.content); change(value);
+    const value = JSON.parse(f.payload); change(value);
     assert.throws(() => validateManifest(JSON.stringify(value), f.tag, 'csic21/zstock', f.packages));
   }
 });
@@ -169,7 +180,7 @@ test('matching published release and manifest are idempotent', async (t) => {
 test('unexpected assets prevent public release', async (t) => {
   const f = fixture(t);
   f.assets.push({ name: 'unexpected.txt' });
-  await assert.rejects(publishRelease(f), /exactly the nine/);
+  await assert.rejects(publishRelease(f), /exactly nine/);
   assert.equal(f.calls.some(([name]) => name === 'publish'), false);
 });
 
@@ -193,7 +204,7 @@ test('real manifest generator produces hashes and URLs accepted by publisher', (
     env: { ...process.env, GITHUB_REPOSITORY: 'csic21/zstock', ASSET_PREFIX: 'zstock' }, encoding: 'utf8',
   });
   assert.equal(result.status, 0, result.stderr);
-  validateManifest(fs.readFileSync(path.join(f.root, 'updates/stable.json'), 'utf8'), f.tag, 'csic21/zstock', f.packages);
+  validateManifest(fs.readFileSync(path.join(f.root, 'updates/update-payload.json'), 'utf8'), f.tag, 'csic21/zstock', f.packages);
 });
 
 test('tag retargeted after resolution prevents all publication mutations', async (t) => {
@@ -215,3 +226,41 @@ for (const scenario of [
     assert.equal(f.calls.length, 0);
   });
 }
+
+
+test('signer rejects missing, invalid and mismatched owner key without publication', () => {
+  assert.throws(() => signManifest('{}', '', TEST_PUBLIC), /missing/);
+  assert.throws(() => signManifest('{}', 'not a private key', TEST_PUBLIC), /Invalid/);
+  assert.throws(() => signManifest('{}', TEST_KEY, '0'.repeat(64)), /does not match/);
+  assert.throws(() => verifyManifest(signManifest('{}', TEST_KEY, TEST_PUBLIC), ''), /owner-provided/);
+});
+
+test('signed envelope binds exact payload bytes, signature and pinned public key', () => {
+  const signed = signManifest('{"version":"99.0.0"}', TEST_KEY, TEST_PUBLIC);
+  assert.equal(verifyManifest(signed, TEST_PUBLIC).version, '99.0.0');
+  for (const mutate of [
+    (s) => { s.payload = '{"version":"99.0.1"}'; },
+    (s) => { s.signature = 'A'.repeat(86) + '=='; },
+    (s) => { s.schema = 2; },
+    (s) => { s.publicKey = TEST_PUBLIC; },
+  ]) {
+    const tampered = JSON.parse(signed); mutate(tampered);
+    assert.throws(() => verifyManifest(JSON.stringify(tampered), TEST_PUBLIC));
+  }
+  assert.throws(() => verifyManifest(signed, '0'.repeat(64)), /verification failed/);
+});
+
+test('unsigned or tampered release metadata blocks every remote mutation', async (t) => {
+  const f = fixture(t);
+  const altered = JSON.parse(f.signedContent); altered.payload += ' ';
+  fs.writeFileSync(path.join(f.root, 'updates/stable-v2.json'), JSON.stringify(altered));
+  await assert.rejects(publishRelease(f), /signature verification failed/);
+  assert.equal(f.calls.length, 0);
+});
+
+test('legacy automatic update URL cannot be reintroduced', async (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.root, 'updates/stable.json'), f.payload);
+  await assert.rejects(publishRelease(f), /manual-install-only/);
+  assert.equal(f.calls.length, 0);
+});

@@ -1,3 +1,4 @@
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::process::Command;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::process::Stdio;
@@ -24,74 +25,58 @@ impl SecretStore for NativeSecretStore {
     }
 }
 
+// Security.framework preserves the same service/account identity as the legacy
+// `security` tool but never places passwords in a process argument or environment.
 #[cfg(target_os = "macos")]
 fn get_secret(account: &str) -> Result<Option<String>, SecretError> {
-    let output = Command::new("security")
-        .args(["find-generic-password", "-s", SERVICE, "-a", account, "-w"])
-        .output()
-        .map_err(command_error)?;
-    if output.status.success() {
-        return String::from_utf8(output.stdout)
-            .map(|value| Some(value.trim_end().to_string()))
-            .map_err(|error| SecretError(error.to_string()));
+    use security_framework::passwords::{PasswordOptions, generic_password};
+    match generic_password(PasswordOptions::new_generic_password(SERVICE, account)) {
+        Ok(bytes) => String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| SecretError("credential store returned a non-UTF-8 password".into())),
+        Err(error) if error.code() == -25300 => Ok(None), // errSecItemNotFound
+        Err(error) => Err(SecretError(format!(
+            "credential store read failed ({})",
+            error.code()
+        ))),
     }
-    if output.status.code() == Some(44) {
-        return Ok(None);
-    }
-    Err(status_error("read", &output.stderr))
 }
 
 #[cfg(target_os = "macos")]
 fn set_secret(account: &str, secret: &str) -> Result<(), SecretError> {
-    let output = Command::new("security")
-        .args([
-            "add-generic-password",
-            "-U",
-            "-s",
-            SERVICE,
-            "-a",
-            account,
-            "-w",
-            secret,
-        ])
-        .output()
-        .map_err(command_error)?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(status_error("write", &output.stderr))
-    }
+    security_framework::passwords::set_generic_password(SERVICE, account, secret.as_bytes())
+        .map_err(|error| SecretError(format!("credential store write failed ({})", error.code())))
 }
 
 #[cfg(target_os = "macos")]
 fn delete_secret(account: &str) -> Result<(), SecretError> {
-    let output = Command::new("security")
-        .args(["delete-generic-password", "-s", SERVICE, "-a", account])
-        .output()
-        .map_err(command_error)?;
-    if output.status.success() || output.status.code() == Some(44) {
-        Ok(())
-    } else {
-        Err(status_error("delete", &output.stderr))
+    match security_framework::passwords::delete_generic_password(SERVICE, account) {
+        Ok(()) => Ok(()),
+        Err(error) if error.code() == -25300 => Ok(()),
+        Err(error) => Err(SecretError(format!(
+            "credential store delete failed ({})",
+            error.code()
+        ))),
     }
 }
 
 #[cfg(target_os = "linux")]
 fn get_secret(account: &str) -> Result<Option<String>, SecretError> {
-    let output = Command::new("secret-tool")
-        .args(["lookup", "service", SERVICE, "account", account])
-        .output()
-        .map_err(command_error)?;
+    let output = run_credential_command(
+        Command::new("secret-tool").args(["lookup", "service", SERVICE, "account", account]),
+        None,
+    )?;
     match parse_linux_lookup_output(&output)? {
         LinuxLookup::Found(value) => Ok(Some(value)),
         LinuxLookup::CheckAbsence => {
             // A cancelled unlock can look exactly like a missing key to lookup.
             // Search without --unlock also includes locked matches. Only a
             // successful, completely empty search proves absence.
-            let search = Command::new("secret-tool")
-                .args(["search", "--all", "service", SERVICE, "account", account])
-                .output()
-                .map_err(command_error)?;
+            let search = run_credential_command(
+                Command::new("secret-tool")
+                    .args(["search", "--all", "service", SERVICE, "account", account]),
+                None,
+            )?;
             confirm_linux_secret_absent(&search)?;
             Ok(None)
         }
@@ -146,20 +131,17 @@ fn confirm_linux_secret_absent(output: &std::process::Output) -> Result<(), Secr
 
 #[cfg(target_os = "linux")]
 fn linux_output_error(operation: &str, output: &std::process::Output) -> SecretError {
-    let detail = String::from_utf8_lossy(&output.stderr);
+    // A backend diagnostic may echo input; never include it in user/log errors.
     SecretError(format!(
-        "credential store {operation} failed ({}): {}",
-        output.status,
-        detail.trim()
+        "credential store {operation} failed ({})",
+        output.status
     ))
 }
 
 #[cfg(target_os = "linux")]
 fn set_secret(account: &str, secret: &str) -> Result<(), SecretError> {
-    use std::io::Write;
-
-    let mut child = Command::new("secret-tool")
-        .args([
+    let output = run_credential_command(
+        Command::new("secret-tool").args([
             "store",
             "--label",
             "ZStock API key",
@@ -167,19 +149,10 @@ fn set_secret(account: &str, secret: &str) -> Result<(), SecretError> {
             SERVICE,
             "account",
             account,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .map_err(command_error)?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| SecretError("credential store stdin unavailable".into()))?
-        .write_all(secret.as_bytes())
-        .map_err(|error| SecretError(error.to_string()))?;
-    let status = child.wait().map_err(command_error)?;
-    if status.success() {
+        ]),
+        Some(secret.as_bytes()),
+    )?;
+    if output.status.success() {
         Ok(())
     } else {
         Err(SecretError("credential store rejected the secret".into()))
@@ -188,15 +161,31 @@ fn set_secret(account: &str, secret: &str) -> Result<(), SecretError> {
 
 #[cfg(target_os = "linux")]
 fn delete_secret(account: &str) -> Result<(), SecretError> {
-    let status = Command::new("secret-tool")
-        .args(["clear", "service", SERVICE, "account", account])
-        .status()
-        .map_err(command_error)?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(SecretError("credential store delete failed".into()))
+    let output = run_credential_command(
+        Command::new("secret-tool").args(["clear", "service", SERVICE, "account", account]),
+        None,
+    )?;
+    confirm_linux_clear_output(&output)?;
+    // clear removes unlocked matches only: exit 0 means at least one deletion,
+    // not that no locked duplicate remains. Exit 1 may also mean absence.
+    // Both require independent successful empty search, including locked items.
+    let search = run_credential_command(
+        Command::new("secret-tool")
+            .args(["search", "--all", "service", SERVICE, "account", account]),
+        None,
+    )?;
+    confirm_linux_secret_absent(&search)
+}
+
+#[cfg(target_os = "linux")]
+fn confirm_linux_clear_output(output: &std::process::Output) -> Result<(), SecretError> {
+    if !output.stderr.is_empty() || !output.stdout.is_empty() {
+        return Err(linux_output_error("delete", output));
     }
+    if matches!(output.status.code(), Some(0 | 1)) {
+        return Ok(());
+    }
+    Err(linux_output_error("delete", output))
 }
 
 #[cfg(target_os = "windows")]
@@ -205,12 +194,17 @@ fn get_secret(account: &str) -> Result<Option<String>, SecretError> {
     if !path.exists() {
         return Ok(None);
     }
-    let script = "$secure = Get-Content -Raw -LiteralPath $env:ZSTOCK_CREDENTIAL_PATH | ConvertTo-SecureString; $plain = [System.Net.NetworkCredential]::new('', $secure).Password; [Console]::Out.Write($plain)";
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .env("ZSTOCK_CREDENTIAL_PATH", &path)
-        .output()
-        .map_err(command_error)?;
+    let script = "$ErrorActionPreference = 'Stop'; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $secure = Get-Content -Raw -LiteralPath $env:ZSTOCK_CREDENTIAL_PATH | ConvertTo-SecureString; $plain = [System.Net.NetworkCredential]::new('', $secure).Password; [Console]::Out.Write($plain)";
+    let output = run_credential_command(
+        Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            // A pwsh -> native process -> powershell.exe launch otherwise
+            // inherits incompatible PowerShell 7 module paths. Let 5.1 rebuild
+            // its defaults, without changing the parent or system environment.
+            .env_remove("PSModulePath")
+            .env("ZSTOCK_CREDENTIAL_PATH", &path),
+        None,
+    )?;
     if output.status.success() {
         String::from_utf8(output.stdout)
             .map(Some)
@@ -222,29 +216,20 @@ fn get_secret(account: &str) -> Result<Option<String>, SecretError> {
 
 #[cfg(target_os = "windows")]
 fn set_secret(account: &str, secret: &str) -> Result<(), SecretError> {
-    use std::io::Write;
-
     let path = windows_secret_path(account)?;
     let parent = path
         .parent()
         .ok_or_else(|| SecretError("credential path has no parent".into()))?;
     std::fs::create_dir_all(parent).map_err(|error| SecretError(error.to_string()))?;
-    let script = "$plain = [Console]::In.ReadToEnd(); $secure = ConvertTo-SecureString $plain -AsPlainText -Force; $secure | ConvertFrom-SecureString | Set-Content -NoNewline -LiteralPath $env:ZSTOCK_CREDENTIAL_PATH";
-    let mut child = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .env("ZSTOCK_CREDENTIAL_PATH", &path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .map_err(command_error)?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| SecretError("credential store stdin unavailable".into()))?
-        .write_all(secret.as_bytes())
-        .map_err(|error| SecretError(error.to_string()))?;
-    let status = child.wait().map_err(command_error)?;
-    if status.success() {
+    let script = "$ErrorActionPreference = 'Stop'; [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); $plain = [Console]::In.ReadToEnd(); $secure = ConvertTo-SecureString $plain -AsPlainText -Force; $secure | ConvertFrom-SecureString | Set-Content -NoNewline -LiteralPath $env:ZSTOCK_CREDENTIAL_PATH";
+    let output = run_credential_command(
+        Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .env_remove("PSModulePath")
+            .env("ZSTOCK_CREDENTIAL_PATH", &path),
+        Some(secret.as_bytes()),
+    )?;
+    if output.status.success() {
         Ok(())
     } else {
         Err(SecretError("Windows DPAPI rejected the secret".into()))
@@ -278,17 +263,137 @@ fn windows_secret_path(account: &str) -> Result<std::path::PathBuf, SecretError>
         .join(format!("{name}.dpapi")))
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn command_error(error: std::io::Error) -> SecretError {
     SecretError(format!("credential store unavailable: {error}"))
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-fn status_error(operation: &str, stderr: &[u8]) -> SecretError {
-    let detail = String::from_utf8_lossy(stderr);
-    SecretError(format!(
-        "credential store {operation} failed: {}",
-        detail.trim()
-    ))
+#[cfg(target_os = "windows")]
+fn status_error(operation: &str, _stderr: &[u8]) -> SecretError {
+    SecretError(format!("credential store {operation} failed"))
+}
+
+/// Bound external credential tools, including a dismissed/locked keyring prompt.
+/// Concurrent pipe drains prevent large stderr/stdout from deadlocking the child.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn run_credential_command(
+    command: &mut Command,
+    input: Option<&[u8]>,
+) -> Result<std::process::Output, SecretError> {
+    run_credential_command_with_timeout(command, input, std::time::Duration::from_secs(20))
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn run_credential_command_with_timeout(
+    command: &mut Command,
+    input: Option<&[u8]>,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, SecretError> {
+    use std::io::{Read, Write};
+    const MAX_BYTES: usize = 64 * 1024;
+    if input.is_some_and(|bytes| bytes.len() > MAX_BYTES) {
+        return Err(SecretError("credential exceeds size limit".into()));
+    }
+    let started = std::time::Instant::now();
+    let mut child = command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(command_error)?;
+    let (send, receive) = std::sync::mpsc::channel();
+    for (is_stdout, pipe) in [
+        (
+            true,
+            child
+                .stdout
+                .take()
+                .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+        ),
+        (
+            false,
+            child
+                .stderr
+                .take()
+                .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+        ),
+    ] {
+        let send = send.clone();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let mut bytes = Vec::new();
+                pipe.ok_or_else(|| std::io::Error::other("pipe unavailable"))?
+                    .take(MAX_BYTES as u64 + 1)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() > MAX_BYTES {
+                    return Err(std::io::Error::other("credential output too large"));
+                }
+                Ok(bytes)
+            })();
+            let _ = send.send((is_stdout, result));
+        });
+    }
+    let (input_send, input_receive) = std::sync::mpsc::channel();
+    if let Some(input) = input {
+        let input = input.to_vec();
+        let pipe = child.stdin.take();
+        std::thread::spawn(move || {
+            let result = pipe
+                .ok_or_else(|| std::io::Error::other("stdin unavailable"))
+                .and_then(|mut pipe| pipe.write_all(&input));
+            let _ = input_send.send(result);
+        });
+    } else {
+        let _ = input_send.send(Ok(()));
+    }
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            result => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SecretError(
+                    if result.is_err() {
+                        "credential tool failed"
+                    } else {
+                        "credential tool timed out; unlock the store and retry"
+                    }
+                    .into(),
+                ));
+            }
+        }
+    };
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    for _ in 0..2 {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let (is_stdout, bytes) = receive
+            .recv_timeout(remaining)
+            .map_err(|_| SecretError("credential output timed out".into()))?;
+        let bytes =
+            bytes.map_err(|_| SecretError("credential output failed or exceeded limit".into()))?;
+        if is_stdout {
+            stdout = bytes;
+        } else {
+            stderr = bytes;
+        }
+    }
+    input_receive
+        .recv_timeout(timeout.saturating_sub(started.elapsed()))
+        .map_err(|_| SecretError("credential input timed out".into()))?
+        .map_err(|_| SecretError("credential input failed".into()))?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 #[cfg(test)]
@@ -325,7 +430,7 @@ mod native_tests {
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         );
-        let secret = "zstock-credential-smoke-value";
+        let secret = "zstock-credential-smoke-密钥-value\n trailing  ";
         store.delete(&account).expect("clean stale test credential");
         store
             .set(&account, secret)
@@ -374,6 +479,33 @@ mod linux_output_tests {
             parse_linux_lookup_output(&output(1, b"", b"")).unwrap(),
             LinuxLookup::CheckAbsence
         );
+        assert!(confirm_linux_secret_absent(&output(0, b"", b"")).is_ok());
+    }
+
+    #[test]
+    fn deleting_absent_secret_requires_independent_absence_confirmation() {
+        for code in [0, 1] {
+            let cleared = output(code, b"", b"");
+            assert!(confirm_linux_clear_output(&cleared).is_ok());
+            assert!(
+                confirm_linux_clear_output(&cleared)
+                    .and_then(|_| confirm_linux_secret_absent(&output(
+                        0,
+                        b"locked matching item",
+                        b""
+                    )))
+                    .is_err()
+            );
+        }
+        for result in [
+            output(1, b"", b"backend failure"),
+            output(0, b"", b"backend failure"),
+            output(2, b"", b""),
+            output(1, b"unexpected output", b""),
+        ] {
+            assert!(confirm_linux_clear_output(&result).is_err());
+        }
+        assert!(confirm_linux_secret_absent(&output(0, b"locked matching item", b"")).is_err());
         assert!(confirm_linux_secret_absent(&output(0, b"", b"")).is_ok());
     }
 
@@ -440,5 +572,28 @@ mod linux_output_tests {
             );
         }
         assert!(confirm_linux_secret_absent(&output(1, b"", b"")).is_err());
+    }
+    #[test]
+    fn credential_subprocess_timeout_kills_and_reaps_without_secret_output() {
+        let started = std::time::Instant::now();
+        let error = run_credential_command_with_timeout(
+            Command::new("sh").args(["-c", "exec sleep 5"]),
+            None,
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn credential_pipe_preserves_dummy_bytes_without_arguments() {
+        let output = run_credential_command(
+            Command::new("cat").args([] as [&str; 0]),
+            Some(b"dummy fixture only\n"),
+        )
+        .unwrap();
+        assert_eq!(output.stdout, b"dummy fixture only\n");
+        assert!(output.status.success());
     }
 }

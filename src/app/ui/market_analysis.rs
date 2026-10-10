@@ -56,7 +56,7 @@ enum HeatmapAction {
 struct HeatmapTile {
     name: String,
     code: String,
-    change_pct: f64,
+    change_pct: Option<f64>,
     amount: f64,
     tooltip: String,
     action: HeatmapAction,
@@ -1155,6 +1155,7 @@ impl StockApp {
             advances,
             declines,
             unchanged,
+            unknown,
         ) = {
             let mut list_tiles = self
                 .sector_drill_quotes
@@ -1169,13 +1170,20 @@ impl StockApp {
             });
             let advances = list_tiles
                 .iter()
-                .filter(|tile| tile.change_pct > 0.0)
+                .filter(|tile| tile.change_pct.is_some_and(|change| change > 0.0))
                 .count();
             let declines = list_tiles
                 .iter()
-                .filter(|tile| tile.change_pct < 0.0)
+                .filter(|tile| tile.change_pct.is_some_and(|change| change < 0.0))
                 .count();
-            let unchanged = list_tiles.len().saturating_sub(advances + declines);
+            let unchanged = list_tiles
+                .iter()
+                .filter(|tile| tile.change_pct == Some(0.0))
+                .count();
+            let unknown = list_tiles
+                .iter()
+                .filter(|tile| tile.change_pct.is_none())
+                .count();
             let treemap_tiles = list_tiles.clone();
             (
                 format!("行业热力图 / {drill_name}"),
@@ -1190,6 +1198,7 @@ impl StockApp {
                 advances,
                 declines,
                 unchanged,
+                unknown,
             )
         };
         let has_data = !list_tiles.is_empty();
@@ -1247,6 +1256,13 @@ impl StockApp {
                                             .text_color(cx.theme().muted_foreground)
                                             .child(format!("平 {unchanged}")),
                                     )
+                            })
+                            .when(unknown > 0, |counts| {
+                                counts.child(
+                                    div()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!("· 未知 {unknown}")),
+                                )
                             }),
                     )
                     .child(div().flex_1())
@@ -1347,15 +1363,26 @@ impl StockApp {
             .iter()
             .flat_map(|group| &group.industries)
             .flat_map(|industry| &industry.stocks)
-            .filter(|stock| stock.change_pct > 0.0)
+            .filter(|stock| stock.change_pct.is_some_and(|change| change > 0.0))
             .count();
         let declines = sectors
             .iter()
             .flat_map(|group| &group.industries)
             .flat_map(|industry| &industry.stocks)
-            .filter(|stock| stock.change_pct < 0.0)
+            .filter(|stock| stock.change_pct.is_some_and(|change| change < 0.0))
             .count();
-        let unchanged = stock_count.saturating_sub(advances + declines);
+        let unchanged = sectors
+            .iter()
+            .flat_map(|group| &group.industries)
+            .flat_map(|industry| &industry.stocks)
+            .filter(|stock| stock.change_pct == Some(0.0))
+            .count();
+        let unknown = sectors
+            .iter()
+            .flat_map(|group| &group.industries)
+            .flat_map(|industry| &industry.stocks)
+            .filter(|stock| stock.change_pct.is_none())
+            .count();
         let has_data = stock_count > 0;
         let down_color = self.chg_color(false, cx);
         let up_color = self.chg_color(true, cx);
@@ -1406,6 +1433,9 @@ impl StockApp {
                                             .text_color(cx.theme().muted_foreground)
                                             .child(format!("平 {unchanged}")),
                                     )
+                            })
+                            .when(unknown > 0, |counts| {
+                                counts.child(div().text_color(cx.theme().muted_foreground).child(format!("· 未知 {unknown}")))
                             }),
                     )
                     .child(div().flex_1())
@@ -1816,18 +1846,17 @@ impl StockApp {
         let estimated_width = rect.width * surface_width;
         let estimated_height = rect.height * surface_height;
         let labels = tile_label_plan(estimated_width, estimated_height, tile.emphasize);
-        let move_color = self.chg_color(tile.change_pct >= 0.0, cx);
-        let opacity = heatmap_opacity(tile.change_pct, self.work_mode);
-        let fill = if tile.change_pct.abs() < 0.05 {
-            cx.theme().muted
-        } else {
-            move_color.opacity(opacity)
+        let fill = match tile.change_pct {
+            Some(change) if change.abs() >= 0.05 => self
+                .chg_color(change >= 0.0, cx)
+                .opacity(heatmap_opacity(change, self.work_mode)),
+            _ => cx.theme().muted,
         };
         let tooltip = tile.tooltip.clone();
         let action = tile.action.clone();
         let compact = !labels.show_amount && estimated_height < 36.0;
         let name_label = tile.name.clone();
-        let change_label = format!("{:+.2}%", tile.change_pct);
+        let change_label = heatmap_change_label(tile.change_pct);
         let amount_label = format_sector_amount(tile.amount);
 
         div()
@@ -1974,7 +2003,10 @@ impl StockApp {
             })
             .children(tiles.into_iter().enumerate().map(|(index, tile)| {
                 let action = tile.action.clone();
-                let color = self.chg_color(tile.change_pct >= 0.0, cx);
+                let color = tile
+                    .change_pct
+                    .map(|change| self.chg_color(change >= 0.0, cx))
+                    .unwrap_or(cx.theme().muted_foreground);
                 div()
                     .id(("market-heatmap-list-row", index as u32))
                     .h(px(40.))
@@ -2030,7 +2062,7 @@ impl StockApp {
                             .font_semibold()
                             .text_right()
                             .text_color(color)
-                            .child(format!("{:+.2}%", tile.change_pct)),
+                            .child(heatmap_change_label(tile.change_pct)),
                     )
             }))
             .into_any_element()
@@ -2262,6 +2294,27 @@ impl StockApp {
     }
 }
 
+fn heatmap_change_label(change: Option<f64>) -> String {
+    change
+        .filter(|change| change.is_finite())
+        .map(|change| format!("{change:+.2}%"))
+        .unwrap_or_else(|| "—".into())
+}
+
+/// Unknown rows contribute neither weight nor a synthetic zero to an aggregate.
+/// An entirely unknown group remains unavailable rather than becoming flat.
+fn known_weighted_change(items: impl IntoIterator<Item = (f64, Option<f64>)>) -> Option<f64> {
+    let known: Vec<_> = items
+        .into_iter()
+        .filter_map(|(amount, change)| Some((amount, change.filter(|change| change.is_finite())?)))
+        .collect();
+    if known.is_empty() {
+        return None;
+    }
+    let change = weighted_change_pct(known);
+    change.is_finite().then_some(change)
+}
+
 fn present_industry_tiles(
     industry: &IndustryStockGroup,
     sector: &SectorTick,
@@ -2284,7 +2337,8 @@ fn present_industry_tiles(
         .collect();
     if let Some(others) = visible.others {
         let tail = &industry.stocks[keep..];
-        let change = weighted_change_pct(tail.iter().map(|stock| (stock.amount, stock.change_pct)));
+        let change =
+            known_weighted_change(tail.iter().map(|stock| (stock.amount, stock.change_pct)));
         tiles.push(others_heatmap_tile(
             others.count,
             others.amount,
@@ -2312,7 +2366,7 @@ fn select_heatmap_tiles(tiles: &[HeatmapTile], area_px: f32) -> Vec<HeatmapTile>
     let mut out = tiles[..keep].to_vec();
     if let Some(others) = visible.others {
         let tail = &tiles[keep..];
-        let change = weighted_change_pct(tail.iter().map(|tile| (tile.amount, tile.change_pct)));
+        let change = known_weighted_change(tail.iter().map(|tile| (tile.amount, tile.change_pct)));
         out.push(others_heatmap_tile(
             others.count,
             others.amount,
@@ -2324,7 +2378,7 @@ fn select_heatmap_tiles(tiles: &[HeatmapTile], area_px: f32) -> Vec<HeatmapTile>
 }
 
 fn industry_heatmap_tile(industry: &IndustryStockGroup, sector: &SectorTick) -> HeatmapTile {
-    let change = weighted_change_pct(
+    let change = known_weighted_change(
         industry
             .stocks
             .iter()
@@ -2345,10 +2399,10 @@ fn industry_heatmap_tile(industry: &IndustryStockGroup, sector: &SectorTick) -> 
         change_pct: change,
         amount,
         tooltip: format!(
-            "{} · {} 只个股\n加权涨跌 {:+.2}%\n成交 {}\n点击查看该行业全部个股",
+            "{} · {} 只个股\n已知数据加权涨跌 {}\n成交 {}\n点击查看该行业全部个股",
             industry.name,
             industry.stocks.len(),
-            change,
+            heatmap_change_label(change),
             format_sector_amount(amount)
         ),
         action: HeatmapAction::Industry {
@@ -2363,7 +2417,7 @@ fn industry_heatmap_tile(industry: &IndustryStockGroup, sector: &SectorTick) -> 
 fn others_heatmap_tile(
     count: usize,
     amount: f64,
-    change_pct: f64,
+    change_pct: Option<f64>,
     action: HeatmapAction,
 ) -> HeatmapTile {
     let click_hint = match action {
@@ -2376,7 +2430,8 @@ fn others_heatmap_tile(
         change_pct,
         amount,
         tooltip: format!(
-            "其余 {count} 只已按成交额合并\n加权涨跌 {change_pct:+.2}%\n成交 {}{click_hint}",
+            "其余 {count} 只已按成交额合并\n已知数据加权涨跌 {}\n成交 {}{click_hint}",
+            heatmap_change_label(change_pct),
             format_sector_amount(amount)
         ),
         action,
@@ -2385,6 +2440,18 @@ fn others_heatmap_tile(
 }
 
 fn stock_heatmap_tile(quote: &QuoteTick) -> HeatmapTile {
+    let price_available = quote.last.is_finite()
+        && quote.last > 0.0
+        && matches!(
+            quote.availability,
+            crate::domain::market::Availability::Available
+                | crate::domain::market::Availability::Suspended
+        );
+    let price_label = if price_available {
+        format!("{:.2}", quote.last)
+    } else {
+        "—".into()
+    };
     let amount = if quote.amount > 0.0 {
         quote.amount
     } else {
@@ -2396,11 +2463,11 @@ fn stock_heatmap_tile(quote: &QuoteTick) -> HeatmapTile {
         change_pct: quote.change_pct,
         amount,
         tooltip: format!(
-            "{} · {}\n现价 {:.2} · 涨跌 {:+.2}%\n成交 {} · 成交量 {}\n点击打开个股图表",
+            "{} · {}\n现价 {} · 涨跌 {}\n成交 {} · 成交量 {}\n点击打开个股图表",
             quote.name,
             quote.code,
-            quote.last,
-            quote.change_pct,
+            price_label,
+            heatmap_change_label(quote.change_pct),
             format_sector_amount(amount),
             quote.volume
         ),
@@ -2445,5 +2512,60 @@ fn heatmap_opacity(change_pct: f64, work_mode: bool) -> f32 {
         0.08 + normalized * 0.20
     } else {
         0.24 + normalized * 0.64
+    }
+}
+
+#[cfg(test)]
+mod quote_change_availability_tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_change_never_formats_as_flat() {
+        assert_eq!(heatmap_change_label(None), "—");
+        assert_eq!(heatmap_change_label(Some(0.0)), "+0.00%");
+        assert_eq!(heatmap_change_label(Some(-1.25)), "-1.25%");
+    }
+
+    #[test]
+    fn weighted_changes_skip_unknown_rows_and_preserve_all_unknown() {
+        assert_eq!(known_weighted_change([(100.0, None), (500.0, None)]), None);
+        assert_eq!(
+            known_weighted_change([(100.0, Some(0.0)), (500.0, None)]),
+            Some(0.0)
+        );
+        assert_eq!(
+            known_weighted_change([(100.0, Some(2.0)), (900.0, None)]),
+            Some(2.0)
+        );
+        assert_eq!(
+            known_weighted_change([(0.0, Some(2.0)), (0.0, Some(4.0))]),
+            Some(3.0)
+        );
+    }
+
+    #[test]
+    fn raw_quote_tile_preserves_unknown_change_and_valid_price() {
+        let unknown = crate::data::eastmoney::parse_quote_item(
+            &serde_json::json!({"f12":"600519","f14":"fixture","f2":10.5,"f3":"-"}),
+        )
+        .unwrap();
+        let tile = stock_heatmap_tile(&unknown);
+        assert_eq!(tile.change_pct, None);
+        assert!(tile.tooltip.contains("现价 10.50"));
+        assert!(tile.tooltip.contains("涨跌 —"));
+        assert!(!tile.tooltip.contains("0.00%"));
+        let flat = crate::data::eastmoney::parse_quote_item(
+            &serde_json::json!({"f12":"600519","f14":"fixture","f2":10.5,"f3":0}),
+        )
+        .unwrap();
+        let missing = crate::data::eastmoney::parse_quote_item(
+            &serde_json::json!({"f12":"600519","f14":"fixture","f2":"-","f3":"-"}),
+        )
+        .unwrap();
+        let missing_tile = stock_heatmap_tile(&missing);
+        assert!(missing_tile.tooltip.contains("现价 — · 涨跌 —"));
+        assert!(!missing_tile.tooltip.contains("现价 0.00"));
+        assert_eq!(stock_heatmap_tile(&flat).change_pct, Some(0.0));
+        assert!(stock_heatmap_tile(&flat).tooltip.contains("涨跌 +0.00%"));
     }
 }

@@ -1,0 +1,5 @@
+{
+  "schema": 1,
+  "payload": "{\"version\":\"99.0.0\",\"notes\":\"Public test fixture only\",\"release_url\":\"https://github.com/csic21/zstock/releases/tag/v99.0.0\",\"platforms\":{\"macos-arm64\":{\"url\":\"https://github.com/csic21/zstock/releases/download/v99.0.0/zstock-macos-arm64.zip\",\"sha256\":\"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\"},\"macos-x64\":{\"url\":\"https://github.com/csic21/zstock/releases/download/v99.0.0/zstock-macos-x64.zip\",\"sha256\":\"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\"},\"windows-x64\":{\"url\":\"https://github.com/csic21/zstock/releases/download/v99.0.0/zstock-windows-x64.zip\",\"sha256\":\"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\"},\"linux-x64\":{\"url\":\"https://github.com/csic21/zstock/releases/download/v99.0.0/zstock-linux-x64.zip\",\"sha256\":\"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\"}}}",
+  "signature": "O/5vVhPqaT57MORElUhzDp4p0jh6r56NZr7AaSmYi3TsoI35ssGqBJQSBedxW0a3ykukrPkfByQDG6sVtSRUAg=="
+}

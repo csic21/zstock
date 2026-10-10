@@ -16,15 +16,35 @@ use crate::data::portfolio::{TradeSide, format_money, format_shares};
 use crate::model::{disguise_label, format_pct, format_price, shared};
 
 impl StockApp {
-    pub(crate) fn render_portfolio_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_portfolio_body(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let work = self.work_mode;
+        if self.portfolio_recovery.is_some() || self.recovery_busy {
+            return v_flex().w_full().gap_2().p_3()
+                .id("portfolio-data-unavailable")
+                .debug_selector(|| "portfolio-data-unavailable".into())
+                .child(self.render_financial_storage_status(crate::storage::Slot::Portfolio, cx))
+                .child(div().text_sm().child(if work { "Holdings and risk unavailable" } else { "持仓与风险暂不可用" }))
+                .child(div().text_xs().child(if work {
+                    "The portfolio could not be validated. Quantity, cash, P&L and concentration are unknown until recovery. Market research remains available."
+                } else {
+                    "持仓文件尚未通过校验，无法确认持股、现金、盈亏及集中度。请先恢复本地数据；行情研究仍可使用。"
+                }))
+                .into_any_element();
+        }
         let selected = self.selected.clone();
         let summary = self.portfolio_summary();
         let risk_view = self.portfolio_risk_view(&summary);
         let form_open = self.trade_form.is_some();
         let currency_groups: Vec<_> = summary.by_currency.values().cloned().collect();
 
-        let mut root = v_flex().flex_1().min_h_0().w_full();
+        let mut root = v_flex()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(self.render_financial_storage_status(crate::storage::Slot::Portfolio, cx))
+            .when(self.journal_recovery.is_some(), |panel| {
+                panel.child(self.render_financial_storage_status(crate::storage::Slot::Journal, cx))
+            });
 
         // 分币种组合汇总；没有 FX 时绝不显示伪精确总计。
         root = root.child(
@@ -767,5 +787,6 @@ impl StockApp {
                         })),
                 ),
         )
+        .into_any_element()
     }
 }

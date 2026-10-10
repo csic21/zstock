@@ -25,11 +25,27 @@ use super::{StockApp, state::PrimaryTask};
 
 impl StockApp {
     pub(crate) fn market_climate_report(&self) -> ClimateReport {
-        assess_market_climate(&self.climate_evidence())
+        let mut report = assess_market_climate(&self.climate_evidence());
+        if self.financial_recovery_required() {
+            // Preserve market-only measurements, but never let a missing
+            // portfolio or plan history yield an Open/100% allocation gate.
+            let note = "本地持仓或日记尚未恢复；组合仓位、风险与新开仓结论不可用";
+            report.stance = NewEntryStance::Freeze;
+            report.risk_scale = 0.0;
+            report.headline = "本地数据待恢复，暂停新仓计划".into();
+            report.detail = format!("{note}。指数与市场宽度仍可用于行情研究。");
+            report.reasons.insert(0, note.into());
+        }
+        report
     }
 
     pub(crate) fn climate_evidence(&self) -> ClimateEvidence {
-        self.climate_evidence_with_open_count(self.portfolio.positions().len())
+        let open_count = if self.portfolio_recovery.is_none() && !self.recovery_busy {
+            self.portfolio.positions().len()
+        } else {
+            0
+        };
+        self.climate_evidence_with_open_count(open_count)
     }
 
     fn climate_evidence_with_open_count(&self, open_positions: usize) -> ClimateEvidence {
@@ -103,7 +119,10 @@ impl StockApp {
         }
     }
 
-    pub(crate) fn today_dashboard_view_model(&self) -> TodayDashboard {
+    pub(crate) fn today_dashboard_view_model(&self) -> Option<TodayDashboard> {
+        if self.financial_recovery_required() {
+            return None;
+        }
         let summary = self.portfolio_summary();
         let risk_view = self.portfolio_risk_view(&summary);
         let now_millis = chrono::Utc::now().timestamp_millis();
@@ -242,24 +261,30 @@ impl StockApp {
             }
         }));
 
-        build_today_dashboard(TodayDashboardInput {
+        Some(build_today_dashboard(TodayDashboardInput {
             alerts,
             risks,
             plans,
             opportunities,
             climate: self.climate_evidence_with_open_count(summary.open_count),
             open_positions: summary.open_count,
-        })
+        }))
     }
 
-    pub(crate) fn rule_ledger_view_model(&self) -> RuleLedgerReport {
-        build_rule_ledger(&self.journal.entries)
+    pub(crate) fn rule_ledger_view_model(&self) -> Option<RuleLedgerReport> {
+        if self.journal_recovery.is_some() || self.recovery_busy {
+            return None;
+        }
+        Some(build_rule_ledger(&self.journal.entries))
     }
 
     pub(crate) fn champion_stock_plans(
         &self,
         cx: &Context<Self>,
     ) -> (Option<String>, Vec<StrategyStockPlan>) {
+        if self.financial_recovery_required() {
+            return (None, Vec::new());
+        }
         let Some((strategy_name, compiled)) = self.strategy_lab_feature.compiled_champion() else {
             return (None, Vec::new());
         };

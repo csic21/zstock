@@ -175,28 +175,25 @@ macOS 的 `Info.plist` 版本会在打包时根据 tag 自动同步。
   `xattr -dr com.apple.quarantine`），Windows 可能提示 SmartScreen。
 - `.pkg` 安装器内置 preinstall 脚本，会先移除旧版本（含更名前的
   `Stock Analysis.app`）再写入新版本。
-- `.zip` 仍保留给应用内自动更新使用（更新时只同步 `.app` 内容，不重装）。
+- `.zip` 供签名验证后的应用内更新使用；macOS 暂存完整 `.app` 后交换目录，并保留旧版本副本。
 - 在 Actions 页面手动运行该 workflow 只上传构建产物（artifacts），不会创建 Release。
-- 每次 tag 发布后会自动生成 `updates/stable.json`（Zed 风格更新清单，含各平台
-  SHA-256）并推送到 `main`，供客户端静默检查更新。
+- 发布工作流先完成四平台原生质量检查，核验九个安装包，再使用维护者配置的 Ed25519 私钥签名更新清单；缺少有效签名时阻止发布。
 
 ## 自动更新
 
-更新检查参考 Zed：客户端**不调用 GitHub API**，而是轮询一个静态更新清单
-`updates/stable.json`（每次发版由 release workflow 自动生成并推送到 `main`）。
-清单只有极小的一段 JSON：版本号、各平台下载直链和 SHA-256。清单源依次尝试
-raw.githubusercontent 与 jsDelivr CDN（国内网络 raw 常被代理/拦截，CDN 兜底）。
+从 0.0.60 起，客户端轮询 `updates/stable-v2.json`，使用编译时嵌入的公钥校验
+Ed25519 签名后，才读取版本号、官方安装包直链和必需的 SHA-256。GitHub raw 与
+jsDelivr 仅提供传输；它们不能通过替换清单中的公钥建立新的信任。
 
-- 有新版本时，标题栏出现「更新 vX」按钮（设置面板里也有「检查更新 / 立即更新」）。
-- 点击后从 GitHub Releases 直链下载当前平台（macOS arm64/x64、Windows x64 或
-  Linux x64）的安装包，**校验 SHA-256** 后安装并重启应用（macOS 用 rsync
-  就地同步 `.app` 内容，避免整体替换目录；Windows/Linux 直接替换二进制）。
-- 检查时机：启动后 + 每 4 小时一次；设置面板可手动触发。
-- 自动检查失败保持静默（离线 / 清单暂缺不打扰用户），手动检查会显示错误。
-- 版本比较基于清单里的 semver 版本，需要与 release workflow 的产物命名一致。
+- 0.0.59 及更早版本必须从 [官方发布页](https://github.com/csic21/zstock/releases) 手动安装安全升级，建立首次签名验证信任。旧 `stable.json` 不再提供自动安装包。
+- 有新版本时，标题栏出现「更新 vX」按钮，设置页也提供「检查更新 / 立即更新 / 官方手动下载」。
+- 更新只接受本仓库当前版本的 HTTPS 安装包及 GitHub 官方资产 CDN 重定向。验证签名和 SHA-256 后再解压，拒绝危险路径、符号链接和超限文件。
+- macOS 暂存完整应用后交换目录；Windows/Linux 替换二进制。待所有已接受的本地写入成功落盘后才重启；保存失败会取消退出并提示。
+- 启动后及每 4 小时检查；未配置有效内置公钥、网络失败或签名校验失败时不安装，设置页保留官方手动下载入口。
+- 更新签名不等于 Apple 公证或 Windows Authenticode；macOS 包仍采用 ad-hoc 签名。
 
-注意：清单与安装包均走 GitHub 静态地址，**仓库需设为 public** 客户端才能匿名访问
-（private 仓库的 raw 文件与安装包下载都需要登录）。
+维护者公钥配置、私钥安全保管和更新格式见 [更新签名与信任引导](docs/security/update-signing.md)。
+仓库需为 public，客户端才能匿名读取公开清单与安装包。
 
 ## Logo
 

@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
+const { verifyManifest } = require('./sign-update.cjs');
 
 const ASSET_NAMES = [
   'zstock-macos-arm64.zip', 'zstock-macos-arm64.dmg', 'zstock-macos-arm64.pkg',
@@ -10,6 +11,8 @@ const ASSET_NAMES = [
   'zstock-windows-x64.zip', 'zstock-windows-x64-setup.exe', 'zstock-linux-x64.zip',
 ];
 const MANIFEST_PATH = 'updates/stable.json';
+const SIGNED_MANIFEST_PATH = 'updates/stable-v2.json';
+const SIGNED_ASSET_NAME = 'zstock-update-manifest.json';
 
 function commitIdentity(tag, overrides, source, parent) {
   const override = overrides[tag];
@@ -77,8 +80,18 @@ async function publishRelease({ github, context, core, tag, sourceSha, publicati
   }
   const repo = context.repo;
   const packages = readPackages(root);
+  const publicHex = fs.readFileSync(path.join(root, 'updates/signing-public-key.hex'), 'utf8');
+  const signedContent = fs.readFileSync(path.join(root, SIGNED_MANIFEST_PATH), 'utf8');
+  const signedManifest = verifyManifest(signedContent, publicHex);
+  validateManifest(JSON.stringify(signedManifest), tag, `${repo.owner}/${repo.repo}`, packages);
+  const signedFilename = path.join(root, 'release-assets', SIGNED_ASSET_NAME);
+  if (fs.readFileSync(signedFilename, 'utf8') !== signedContent) throw new Error('Published signature asset differs from verified manifest');
+  packages.push({ name: SIGNED_ASSET_NAME, filename: signedFilename, size: Buffer.byteLength(signedContent),
+    digest: `sha256:${createHash('sha256').update(signedContent).digest('hex')}` });
   const content = fs.readFileSync(path.join(root, MANIFEST_PATH), 'utf8');
-  validateManifest(content, tag, `${repo.owner}/${repo.repo}`, packages);
+  const legacy = JSON.parse(content);
+  if (legacy.version !== signedManifest.version || legacy.release_url !== signedManifest.release_url
+      || Object.keys(legacy.platforms || {}).length !== 0) throw new Error('Legacy clients must receive a manual-install-only bootstrap notice');
   let target = (await github.rest.git.getRef({ ...repo, ref: `tags/${tag}` })).data.object;
   for (let depth = 0; target.type === 'tag' && depth < 5; depth++) {
     target = (await github.rest.git.getTag({ ...repo, tag_sha: target.sha })).data.object;
@@ -94,7 +107,12 @@ async function publishRelease({ github, context, core, tag, sourceSha, publicati
   } catch (error) {
     if (error.status !== 404) throw error;
   }
-  const unchanged = existingContent === content;
+  let existingSignedContent = '';
+  try {
+    const { data: file } = await github.rest.repos.getContent({ ...repo, path: SIGNED_MANIFEST_PATH, ref: main.object.sha });
+    existingSignedContent = Buffer.from(file.content, 'base64').toString('utf8');
+  } catch (error) { if (error.status !== 404) throw error; }
+  const unchanged = existingContent === content && existingSignedContent === signedContent;
   if (!unchanged && main.object.sha !== publicationHead) {
     throw new Error('main advanced; refusing to publish or overwrite its stable manifest');
   }
@@ -142,7 +160,7 @@ async function publishRelease({ github, context, core, tag, sourceSha, publicati
     }
   }
   const uploaded = await listAssets();
-  if (uploaded.length !== packages.length) throw new Error('Release must contain exactly the nine expected platform packages');
+  if (uploaded.length !== packages.length) throw new Error('Release must contain exactly nine platform packages and the signed update manifest');
   for (const expected of packages) {
     const actual = uploaded.find((asset) => asset.name === expected.name);
     if (!actual) throw new Error(`Release is missing ${expected.name}`);
@@ -160,7 +178,8 @@ async function publishRelease({ github, context, core, tag, sourceSha, publicati
     return;
   }
   const { data: tree } = await github.rest.git.createTree({ ...repo, base_tree: parent.tree.sha,
-    tree: [{ path: MANIFEST_PATH, mode: '100644', type: 'blob', content }] });
+    tree: [{ path: MANIFEST_PATH, mode: '100644', type: 'blob', content },
+      { path: SIGNED_MANIFEST_PATH, mode: '100644', type: 'blob', content: signedContent }] });
   const { data: commit } = await github.rest.git.createCommit({ ...repo,
     message: `chore(update): publish stable manifest for ${tag}`, tree: tree.sha,
     parents: [publicationHead], ...identity });

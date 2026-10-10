@@ -161,6 +161,11 @@ impl StockApp {
         let target = card.target.clone().unwrap_or_else(|| "证据不足".into());
         let position_plan = self.position_sizing_plan(cx);
         let climate = self.market_climate_report();
+        let sizing_note = if self.financial_recovery_required() {
+            Some("本地数据待恢复，仓位与新仓额度暂不可用；行情研究仍可使用".into())
+        } else {
+            climate.sizing_note()
+        };
         let currency = crate::domain::money::Currency::for_code(self.selected.as_ref())
             .unwrap_or(crate::domain::money::Currency::Cny);
         let is_star_market = self.selected.starts_with("688") || self.selected.starts_with("689");
@@ -313,7 +318,7 @@ impl StockApp {
                                     .child("单票仓位上限 20%"),
                             ),
                     )
-                    .when_some(climate.sizing_note(), |column, note| {
+                    .when_some(sizing_note, |column, note| {
                         column.child(
                             div()
                                 .text_xs()
@@ -412,6 +417,8 @@ impl StockApp {
                                     .label("预填买入记录")
                                     .tooltip(if can_prefill {
                                         "只预填本地持仓记录，不会连接券商或自动下单"
+                                    } else if self.financial_recovery_required() {
+                                        "本地持仓或日记需要恢复，暂不计算或预填仓位"
                                     } else if climate.stance == NewEntryStance::Freeze {
                                         "今日市场观望，不预填买入"
                                     } else {
