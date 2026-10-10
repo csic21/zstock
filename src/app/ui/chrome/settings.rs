@@ -1089,7 +1089,7 @@ impl StockApp {
             .child(Button::new("retry-persistence").small().outline().label("重试保存")
                 .on_click(cx.listener(|app, _, _, cx| { app.retry_persistence(); cx.notify(); })))
             .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                .child("恢复模式下停止修改持仓和日记。恢复或重置都会先保留原文件的独立副本；无法读取或备份原文件时会停止。"));
+                .child("恢复模式下受影响数据暂停修改。恢复或重置都会先保留原文件的独立副本；无法读取或备份原文件时会停止。"));
         for (slot, label, recovery) in [
             (
                 crate::storage::Slot::Portfolio,
@@ -1157,6 +1157,43 @@ impl StockApp {
 }
 
 impl StockApp {
+    pub(crate) fn render_financial_recovery_banner(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        h_flex()
+            .id("financial-recovery-banner")
+            .debug_selector(|| "financial-recovery-banner".into())
+            .w_full()
+            .h(self.recovery_banner_height())
+            .flex_shrink_0()
+            .px_3()
+            .gap_3()
+            .items_center()
+            .border_b_1()
+            .border_color(cx.theme().warning)
+            .bg(cx.theme().warning.opacity(0.12))
+            .child(
+                div().flex_1().min_w_0().text_xs().child(if self.work_mode {
+                    "Local data recovery required. Summaries may be incomplete; affected edits are paused."
+                } else {
+                    "本地数据只读恢复模式：原文件已保留，受影响数据暂停修改。持仓、日记和风险汇总可能不完整，不代表没有持仓或风险。"
+                }),
+            )
+            .child(
+                Button::new("global-financial-recovery-settings")
+                    .small()
+                    .outline()
+                    .label(if self.work_mode { "Recover data" } else { "检查与恢复数据" })
+                    .on_click(cx.listener(|app, _, _, cx| {
+                        if !app.settings_open {
+                            app.toggle_settings(cx);
+                        }
+                        app.set_settings_section(crate::app::SettingsSection::General, cx);
+                    })),
+            )
+    }
+
     pub(crate) fn render_financial_storage_status(
         &self,
         slot: crate::storage::Slot,

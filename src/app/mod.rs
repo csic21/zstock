@@ -1104,6 +1104,9 @@ impl Render for StockApp {
                     .overflow_hidden()
                     .child(self.render_title_bar(window, cx)),
             )
+            .when(self.financial_recovery_required(), |this| {
+                this.child(self.render_financial_recovery_banner(cx))
+            })
             .child(if self.settings_open {
                 // Full-page settings: no modal overlay.
                 div()
@@ -1151,7 +1154,10 @@ impl Render for StockApp {
                 // Same definite-height trick as the left sidebar: resizable panels
                 // center their children when height is unresolved, which left a
                 // black band above the chart quote header.
-                let avail_h = (window.bounds().size.height - TITLE_BAR_HEIGHT).max(px(0.));
+                let avail_h = (window.bounds().size.height
+                    - TITLE_BAR_HEIGHT
+                    - self.recovery_banner_height())
+                .max(px(0.));
                 div()
                     .flex_1()
                     .min_h_0()
@@ -2199,3 +2205,6 @@ mod focus_regression_tests;
 
 #[cfg(test)]
 mod quote_freshness_tests;
+
+#[cfg(test)]
+mod financial_recovery_view_tests;

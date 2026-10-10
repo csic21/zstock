@@ -479,8 +479,21 @@ impl StockApp {
     }
 
     /// 决策日记：到价自动记 + 手写观察。
-    pub(crate) fn render_journal_detail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_journal_detail(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let work = self.work_mode;
+        if self.journal_recovery.is_some() || self.recovery_busy {
+            return v_flex().w_full().gap_2().p_3()
+                .id("journal-data-unavailable")
+                .debug_selector(|| "journal-data-unavailable".into())
+                .child(self.render_financial_storage_status(crate::storage::Slot::Journal, cx))
+                .child(div().text_sm().child(if work { "Journal and reviews unavailable" } else { "日记与待复盘情况暂不可用" }))
+                .child(div().text_xs().child(if work {
+                    "Unreadable journal data cannot confirm note counts, due reviews or strategy results. Restore the local data before editing or exporting."
+                } else {
+                    "日记文件尚未通过校验，无法确认记录条数、待复盘计划及策略结果。请先恢复本地数据，再继续记录或导出。"
+                }))
+                .into_any_element();
+        }
         let selected = self.selected.as_ref();
         let entries: Vec<_> = if self.journal_filter_selected {
             self.journal
@@ -711,6 +724,7 @@ impl StockApp {
                     "仅本地复盘素材，不构成任何投资建议。"
                 }),
         )
+        .into_any_element()
     }
 
     /// Multi-leg local alerts: buy zone / take-profit / stop.
@@ -1039,8 +1053,22 @@ impl StockApp {
         }
     }
 
-    pub(crate) fn render_portfolio_detail_col(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_portfolio_detail_col(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let work = self.work_mode;
+        if self.portfolio_recovery.is_some() || self.recovery_busy {
+            return v_flex().w_full().gap_2().p_3()
+                .id("portfolio-detail-unavailable")
+                .debug_selector(|| "portfolio-detail-unavailable".into())
+                .child(self.render_financial_storage_status(crate::storage::Slot::Portfolio, cx))
+                .child(div().text_sm().child(if work { "Position advice unavailable" } else { "持仓与买卖建议暂不可用" }))
+                .child(div().text_xs().child(if work {
+                    "Your holdings, cash and trade history cannot be verified. Recovery is required before position advice or records. Quotes remain available for research."
+                } else {
+                    "无法确认当前持仓、现金及成交流水，暂停仓位分析和买卖建议。请先恢复本地数据；行情仍可用于研究。"
+                }))
+                .into_any_element();
+        }
+        let financial_unavailable = self.financial_recovery_required();
         let code = self.selected.to_string();
         let pos = self.portfolio.position_state_of(&code);
         let mark = pos
@@ -1111,13 +1139,18 @@ impl StockApp {
                                 } else {
                                     "AI 建议"
                                 })
-                                .disabled(busy || !has_signal)
+                                .disabled(busy || !has_signal || financial_unavailable)
                                 .on_click(cx.listener(|this, _, _w, cx| {
                                     this.request_portfolio_ai(cx);
                                 })),
                         ),
                 ),
         );
+
+        if self.journal_recovery.is_some() {
+            col =
+                col.child(self.render_financial_storage_status(crate::storage::Slot::Journal, cx));
+        }
 
         // 持仓数字
         if let Some(m) = &mark {
@@ -1231,9 +1264,9 @@ impl StockApp {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(if work {
-                        "No position on this symbol. Use Buy to open."
+                        "Validated portfolio: no position on this symbol."
                     } else {
-                        "当前标的无持仓。可用「买入」开仓，或先生成 AI 建仓观察建议。"
+                        "已校验持仓文件：当前标的无持仓。"
                     }),
             );
         }
@@ -1247,7 +1280,13 @@ impl StockApp {
             },
             cx,
         ));
-        if shown {
+        if financial_unavailable {
+            col = col.child(div().text_xs().text_color(cx.theme().warning).child(if work {
+                "Journal recovery is required before plan-aware position advice. Valid portfolio balances remain visible above."
+            } else {
+                "日记数据不可用，无法核对原计划，暂不提供持仓建议。上方仅显示已通过校验的持仓数值。"
+            }));
+        } else if shown {
             match &self.portfolio_ai_panel {
                 AiPanelState::Loading { text } => {
                     col = col.child(
@@ -1502,7 +1541,7 @@ impl StockApp {
                     }),
             );
 
-        col
+        col.into_any_element()
     }
 
     pub(crate) fn render_treasure_detail_col(&self, cx: &mut Context<Self>) -> impl IntoElement {

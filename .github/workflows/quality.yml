@@ -103,18 +103,19 @@ jobs:
             --server-args="-screen 0 1600x1000x24 -nolisten tcp" \
             bash scripts/visual-smoke.sh \
             target/${{ matrix.target }}/debug/stock visual-smoke-artifacts
-      - name: Native Linux recovery-mode visual smoke
+      - name: Native Linux recovery-state visual smoke
         if: runner.os == 'Linux'
-        timeout-minutes: 4
-        env:
-          ZSTOCK_SMOKE_RECOVERY: '1'
+        timeout-minutes: 13
         run: |
-          mkdir -p visual-smoke-artifacts/recovery
-          timeout --signal=TERM --kill-after=15s 180s \
-            xvfb-run --auto-servernum --error-file=visual-smoke-artifacts/recovery/xvfb.log \
-            --server-args="-screen 0 1600x1000x24 -nolisten tcp" \
-            bash scripts/visual-smoke.sh \
-            target/${{ matrix.target }}/debug/stock visual-smoke-artifacts/recovery
+          for state in portfolio journal both recovered; do
+            destination="visual-smoke-artifacts/recovery-$state"
+            mkdir -p "$destination"
+            ZSTOCK_SMOKE_RECOVERY="$state" timeout --signal=TERM --kill-after=15s 180s \
+              xvfb-run --auto-servernum --error-file="$destination/xvfb.log" \
+              --server-args="-screen 0 1600x1000x24 -nolisten tcp" \
+              bash scripts/visual-smoke.sh \
+              target/${{ matrix.target }}/debug/stock "$destination"
+          done
       - name: Preserve native visual smoke evidence
         if: always() && runner.os == 'Linux'
         uses: actions/upload-artifact@v4

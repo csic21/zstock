@@ -342,11 +342,29 @@ impl StockApp {
         {
             self.status = shared(format!("{}尚未保存：{error}", persistence_label(*slot)));
         }
+        if self.financial_recovery_required() {
+            self.portfolio_ai_gen = self.portfolio_ai_gen.wrapping_add(1);
+            self.portfolio_ai_key = None;
+            self.portfolio_ai_cache.clear();
+        }
+        self.sync_status_bar();
         cx.notify();
     }
 
+    pub(crate) fn financial_recovery_required(&self) -> bool {
+        self.portfolio_recovery.is_some() || self.journal_recovery.is_some() || self.recovery_busy
+    }
+
+    pub(crate) fn recovery_banner_height(&self) -> gpui::Pixels {
+        gpui::px(if self.financial_recovery_required() {
+            56.0
+        } else {
+            0.0
+        })
+    }
+
     pub(crate) fn persistence_summary(&self) -> String {
-        if self.portfolio_recovery.is_some() || self.journal_recovery.is_some() {
+        if self.financial_recovery_required() {
             return "本地数据只读恢复模式".into();
         }
         if let Some((slot, storage::SaveState::Failed(_, error))) = self
@@ -774,6 +792,9 @@ impl StockApp {
     /// The producer and display use the same daily/quote identity. Intraday
     /// chart selections never participate in a daily position-advice cache key.
     pub(crate) fn portfolio_advice_cache_key(&self) -> Option<String> {
+        if self.financial_recovery_required() {
+            return None;
+        }
         let code = self.selected.as_ref();
         portfolio_advice_key(
             code,
@@ -789,6 +810,16 @@ impl StockApp {
         // Also invalidate an in-flight response when a new request is blocked.
         self.portfolio_ai_gen = self.portfolio_ai_gen.wrapping_add(1);
         let req_id = self.portfolio_ai_gen;
+        if self.financial_recovery_required() {
+            self.portfolio_ai_key = None;
+            self.portfolio_ai_panel = AiPanelState::Ready {
+                text: shared("本地金融数据不可用，恢复前暂停持仓与买卖建议。"),
+                source: AiSource::Local,
+                note: None,
+            };
+            cx.notify();
+            return;
+        }
         let Some(cache_key) = self.portfolio_advice_cache_key() else {
             self.portfolio_ai_key = None;
             self.portfolio_ai_panel = AiPanelState::Ready {
@@ -1019,6 +1050,9 @@ impl StockApp {
             let result = smol::unblock(move || receiver.recv()).await;
             let _ = this.update(cx, |app, cx| {
                 app.recovery_busy = false;
+                app.portfolio_ai_gen = app.portfolio_ai_gen.wrapping_add(1);
+                app.portfolio_ai_key = None;
+                app.portfolio_ai_cache.clear();
                 match result {
                     Ok(Ok(RecoveredDocument::Portfolio(value))) => {
                         storage::persistence_worker()
@@ -1038,6 +1072,7 @@ impl StockApp {
                     Ok(Err(error)) => app.status = shared(format!("恢复失败，仍保持只读：{error}")),
                     Err(_) => app.status = shared("恢复任务未完成，仍保持只读"),
                 }
+                app.sync_status_bar();
                 cx.notify();
             });
         })

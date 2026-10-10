@@ -22,9 +22,28 @@ impl StockApp {
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let dashboard = self.today_dashboard_view_model();
-        let ledger = self.rule_ledger_view_model();
+    ) -> AnyElement {
+        // Unreadable financial files yield inert defaults solely for rendering.
+        // Do not interpret those defaults as zero holdings or a risk all-clear.
+        if self.financial_recovery_required() {
+            return v_flex()
+                .id("today-recovery-unavailable")
+                .debug_selector(|| "today-recovery-unavailable".into())
+                .size_full()
+                .p_5()
+                .gap_3()
+                .child(div().text_lg().child("今日概览暂不可用"))
+                .child(div().text_sm().child(
+                    "无法确认持仓、待复盘数量及风险状态。请先检查与恢复本地数据；空白数据不代表零持仓，也不代表没有待处理事项。",
+                ))
+                .into_any_element();
+        }
+        let dashboard = self
+            .today_dashboard_view_model()
+            .expect("financial data checked");
+        let ledger = self
+            .rule_ledger_view_model()
+            .expect("financial data checked");
         let action_count = dashboard.actions.len();
         let window_width = window.bounds().size.width.as_f32();
         let window_height = window.bounds().size.height.as_f32();
@@ -468,6 +487,7 @@ impl StockApp {
                             ),
                     ),
             )
+            .into_any_element()
     }
 
     fn render_today_climate_card(

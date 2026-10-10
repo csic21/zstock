@@ -56,12 +56,18 @@ chmod 700 "$isolated/runtime"
 # Recovery fixture is synthetic and disposable. Never point this script at an
 # existing profile. Exercise automatic startup/quote activity without allowing
 # unreadable financial documents to turn into empty writable defaults.
-if [[ ${ZSTOCK_SMOKE_RECOVERY:-0} == 1 ]]; then
-  printf 'synthetic broken portfolio fixture\n' > "$isolated/data/portfolio.json"
-  printf 'synthetic broken journal fixture\n' > "$isolated/data/journal.json"
-  cp "$isolated/data/portfolio.json" "$isolated/expected-portfolio"
-  cp "$isolated/data/journal.json" "$isolated/expected-journal"
-fi
+recovery_mode=${ZSTOCK_SMOKE_RECOVERY:-0}
+case "$recovery_mode" in
+  0|portfolio|journal|both|recovered) ;;
+  1) recovery_mode=both ;;
+  *) echo "Unknown synthetic recovery case: $recovery_mode"; exit 2 ;;
+esac
+for document in portfolio journal; do
+  if [[ $recovery_mode == "$document" || $recovery_mode == both || $recovery_mode == recovered ]]; then
+    printf 'synthetic broken %s fixture\n' "$document" > "$isolated/data/$document.json"
+    cp "$isolated/data/$document.json" "$isolated/expected-$document"
+  fi
+done
 
 
 # A brand-new data directory selects the app's built-in defaults. env -i prevents
@@ -128,6 +134,29 @@ key() {
   alive
 }
 
+if [[ $recovery_mode == recovered ]]; then
+  capture before-recovery-today-1320
+  key ctrl+comma
+  capture before-recovery-settings-1320
+  # Only this fresh synthetic profile is reset. Both buttons use the first
+  # recovery row: the remaining journal row moves there after portfolio reset.
+  # Each operation requires two real clicks, just like explicit user recovery.
+  for document in portfolio journal; do
+    xdo mousemove --window "$window" 600 350 click 1
+    sleep 0.3
+    xdo mousemove --window "$window" 600 350 click 1
+    deadline=$((SECONDS + 10))
+    until python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$isolated/data/$document.json" 2>/dev/null; do
+      alive
+      (( SECONDS < deadline )) || { echo "Synthetic $document recovery did not complete"; exit 1; }
+      sleep 0.2
+    done
+    sleep 1
+  done
+  capture after-recovery-settings-1320
+  key Escape
+fi
+
 capture today-1320
 key ctrl+comma
 capture settings-1320
@@ -144,6 +173,10 @@ key ctrl+3
 capture opportunities-1320
 key ctrl+4
 capture portfolio-1320
+key ctrl+shift+w
+xdo windowsize --sync "$window" 1320 860
+capture work-1320
+key ctrl+shift+w
 key ctrl+1
 xdo windowsize --sync "$window" 800 860
 capture today-800
@@ -157,12 +190,29 @@ key Escape
 key ctrl+comma
 key ctrl+comma
 capture returned-today-800
+key ctrl+shift+w
+xdo windowsize --sync "$window" 800 860
+capture work-800
+key ctrl+shift+w
 
 alive
-if [[ ${ZSTOCK_SMOKE_RECOVERY:-0} == 1 ]]; then
-  cmp "$isolated/data/portfolio.json" "$isolated/expected-portfolio"
-  cmp "$isolated/data/journal.json" "$isolated/expected-journal"
-  echo "PASS: unreadable financial fixture bytes remain unchanged"
-fi
+for document in portfolio journal; do
+  if [[ -f $isolated/expected-$document ]]; then
+    if [[ $recovery_mode == recovered ]]; then
+      python3 - "$isolated" "$document" <<'PY'
+import json, sys
+from pathlib import Path
+root, document = Path(sys.argv[1]), sys.argv[2]
+json.loads((root / 'data' / f'{document}.json').read_text())
+original = (root / f'expected-{document}').read_bytes()
+assert any(path.read_bytes() == original for path in (root / 'data').glob(f'{document}.json.recovery.*')), 'missing preserved original bytes'
+PY
+      echo "PASS: explicit synthetic $document recovery preserved the original bytes"
+    else
+      cmp "$isolated/data/$document.json" "$isolated/expected-$document"
+      echo "PASS: unreadable $document fixture bytes remain unchanged"
+    fi
+  fi
+done
 python3 "$script_dir/visual-smoke-check.py" "$artifacts" "$isolated/data/task-metrics.json"
 echo "Native smoke checks passed. Review PNGs for icon visibility and layout correctness."

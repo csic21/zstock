@@ -520,7 +520,21 @@ impl StockApp {
                 .iter()
                 .filter_map(|code| self.symbols.iter().find(|s| s.code == *code))
                 .collect();
-            if syms.is_empty() {
+            let recovery_label = self
+                .financial_recovery_required()
+                .then_some(if self.work_mode {
+                    "data recovery required"
+                } else {
+                    "数据只读恢复"
+                });
+            if let Some(label) = recovery_label {
+                let quotes = if syms.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", self.status_bar_multi_title_for(&syms))
+                };
+                mac_status_bar::set_title(&format!("⚠ {label}{quotes}"));
+            } else if syms.is_empty() {
                 mac_status_bar::set_logo();
             } else {
                 let title = self.status_bar_multi_title_for(&syms);
@@ -528,7 +542,7 @@ impl StockApp {
             }
 
             let selected = self.selected.as_ref();
-            let entries: Vec<MenuEntry> = self
+            let mut entries: Vec<MenuEntry> = self
                 .status_bar_codes
                 .iter()
                 .filter_map(|code| {
@@ -541,6 +555,23 @@ impl StockApp {
                     })
                 })
                 .collect();
+            if let Some(label) = recovery_label {
+                entries.insert(
+                    0,
+                    MenuEntry {
+                        code: String::new(),
+                        label: format!(
+                            "⚠ {label} · {}",
+                            if self.work_mode {
+                                "summaries unavailable"
+                            } else {
+                                "汇总不可用，请恢复数据"
+                            }
+                        ),
+                        active: false,
+                    },
+                );
+            }
             mac_status_bar::rebuild_menu(&entries, self.work_mode);
         }
     }

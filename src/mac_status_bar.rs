@@ -387,7 +387,11 @@ unsafe fn rebuild_menu_items(item: id, target: id, entries: &[MenuEntry], work_m
             menu.addItem_(row);
         } else {
             for e in entries {
-                let row = menu_item_label(&e.label, sel!(selectCode:), target, Some(&e.code));
+                let row = if e.code.is_empty() {
+                    menu_item_label(&e.label, sel!(showWindow:), target, None)
+                } else {
+                    menu_item_label(&e.label, sel!(selectCode:), target, Some(&e.code))
+                };
                 let state: isize = if e.active { 1 } else { 0 };
                 let _: () = msg_send![row, setState: state];
                 menu.addItem_(row);

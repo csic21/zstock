@@ -15,14 +15,20 @@ failure. It covers:
 - the command palette over Settings at both sizes;
 - Research, Opportunities, and Portfolio via their primary-toolbar shortcuts;
 - Escape dismissal and repeated Settings open/close after dismissing the palette;
-- a second `ZSTOCK_SMOKE_RECOVERY=1` pass with synthetic corrupt portfolio/journal
-  files, visible recovery controls, and byte-for-byte checks that automatic activity
-  did not overwrite either file. These fixtures are never real user records.
+- Work Mode at both sizes, including the persistent recovery warning;
+- isolated `ZSTOCK_SMOKE_RECOVERY=portfolio|journal|both` passes with synthetic
+  corrupt files and byte-for-byte checks that automatic activity did not overwrite
+  them. Today must show unavailable financial/risk summaries, not zero/all-clear;
+- a `ZSTOCK_SMOKE_RECOVERY=recovered` pass that performs two real confirmation
+  clicks for each reset, verifies the old bytes remain in independent recovery
+  copies, and captures the resulting healthy views with warnings cleared. The
+  native runner fails if reset did not produce readable JSON. These fixtures are
+  never real user records.
 
 The script discovers only the window belonging to its app PID, bounds external
 commands and window discovery, checks that the app stays alive, and terminates
 its process group on exit. The workflow bounds the whole GUI run to three minutes.
-The evidence checker decodes all ten PNGs, requires the expected dimensions and
+The evidence checker decodes all twelve required PNGs per pass, requires the expected dimensions and
 nonblank content, detects logged asset/renderer failures, and verifies all four
 navigation transitions in the app's own local task metrics.
 

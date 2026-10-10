@@ -357,20 +357,28 @@ impl StockApp {
 
     /// Work-mode status never mentions quotes / vendors / Chinese stock jargon.
     pub(crate) fn work_status_line(&self) -> String {
+        let recovery = if self.financial_recovery_required() {
+            "data recovery required · "
+        } else {
+            ""
+        };
         if self.loading {
-            return "loading series…".into();
+            return format!("{recovery}loading series…");
         }
         if self.treasure_scanning {
-            return format!("job {}/{}", self.treasure_done, self.treasure_total);
+            return format!(
+                "{recovery}job {}/{}",
+                self.treasure_done, self.treasure_total
+            );
         }
         let Some(quote) = self.quote_for_code(self.selected.as_ref()) else {
-            return "sync unavailable · time unknown".into();
+            return format!("{recovery}sync unavailable · time unknown");
         };
         let status = quote.display_status(true, chrono::Utc::now().timestamp_millis());
         if self.quote_fail_streak > 0 {
-            return format!("sync retry · {status}");
+            return format!("{recovery}sync retry · {status}");
         }
-        format!("sync · {status}")
+        format!("{recovery}sync · {status}")
     }
 
     pub(crate) fn max_watchlist_volume(&self) -> u64 {

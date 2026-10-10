@@ -15,10 +15,12 @@ SCREENS = {
     "research-1320": 1320,
     "opportunities-1320": 1320,
     "portfolio-1320": 1320,
+    "work-1320": 1320,
     "today-800": 800,
     "settings-800": 800,
     "settings-palette-800": 800,
     "returned-today-800": 800,
+    "work-800": 800,
 }
 
 
